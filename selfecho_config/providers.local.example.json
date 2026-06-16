@@ -1,0 +1,18 @@
+{
+  "providers": [
+    {
+      "id": "deepseek-default",
+      "label": "DeepSeek",
+      "api_style": "anthropic",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "api_key_env": "MEMORY_AGENT_LLM_API_KEY",
+      "enabled": true,
+      "models": ["deepseek-v4-flash"],
+      "defaults": {
+        "chat": "deepseek-v4-flash",
+        "summary": "deepseek-v4-flash",
+        "memory": "deepseek-v4-flash"
+      }
+    }
+  ]
+}
