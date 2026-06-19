@@ -2,8 +2,8 @@
 mcp_server.py — 记忆代理 MCP 服务器
 
 提供工具：
-- extract_and_save:  手动从文本提取记忆（备用，正常靠 hook 自动触发）
-- search_memories:   BM25 混合搜索
+- extract_and_save:  从对话文本提取记忆并保存
+- search_memories:   BM25 混合搜索（规划中增加向量语义检索）
 - list_memories:     列出记忆，支持按 priority/type 过滤
 - read_memory:       读取单条记忆
 - get_index_stats:   索引统计（记忆数量、类型分布、大小）

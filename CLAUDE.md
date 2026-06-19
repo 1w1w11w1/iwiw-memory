@@ -1,11 +1,11 @@
 # IwIw 项目行为指令
 
-IwIw 是一个记忆驱动的本地个人智能体实验项目。
+IwIw 是一个记忆驱动的本地个人智能体。
 
 ## 当前架构
 
 - `memory/`：Markdown 长期事实记忆，仍是真源。
-- `memory_agent/`：长期记忆读写、搜索、索引重建、MCP 工具和 hook 兼容层。
+- `memory_agent/`：长期记忆读写、搜索、索引重建、MCP 工具和提取引擎。
 - `selfecho_session/`：IwIw 原生会话记忆层，使用 `selfecho_data/sessions.db`。
 - `selfecho_api/`：本地 FastAPI 服务。
 - `web/`：GUI。
@@ -20,7 +20,7 @@ IwIw 是一个记忆驱动的本地个人智能体实验项目。
 3. GUI 会话原始消息必须保留，摘要不能替代原始记录。
 4. 会话整理应服务于长期记忆维护，但写入应可审计、可回滚。
 5. 非工作状态优先接住表达；工作模式优先澄清、规划和推进。
-6. 项目长期目标是成熟 agent harness，而不是纯树洞应用。
+6. 项目长期目标是成熟 agent harness，而不是纯聊天应用。
 
 ## 记忆分级
 

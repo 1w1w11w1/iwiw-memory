@@ -11,7 +11,6 @@ from .config import (
     EXTRACT_MAX_TOKENS,
     EXTRACT_TEMPERATURE,
     EXTRACT_TIMEOUT,
-    HOOK_SKIP_IDE_CONTEXT,
     LOG_FILE,
 )
 from .llm import LLMConfigurationError, complete_text
@@ -198,17 +197,16 @@ def _should_skip(message: str) -> bool:
     if len(stripped) < 8:
         return True
 
-    # Claude Code / VSCode 自动注入的 IDE 上下文，不是用户自然表达
-    if HOOK_SKIP_IDE_CONTEXT:
-        ide_patterns = [
-            r"^<ide_[^>]*>",
-            r"^<command-[^>]*>",
-            r"^<tool_[^>]*>",
-            r"^<[^>]*(?:opened_file|selection|readonly|tool output)[^>]*>",
-        ]
-        for pat in ide_patterns:
-            if re.match(pat, stripped, flags=re.IGNORECASE):
-                return True
+    # IDE 自动注入的上下文（如 VSCode 自动附加的选中文本），不是用户自然表达
+    ide_patterns = [
+        r"^<ide_[^>]*>",
+        r"^<command-[^>]*>",
+        r"^<tool_[^>]*>",
+        r"^<[^>]*(?:opened_file|selection|readonly|tool output)[^>]*>",
+    ]
+    for pat in ide_patterns:
+        if re.match(pat, stripped, flags=re.IGNORECASE):
+            return True
 
     # 纯命令/快捷键
     functional_patterns = [

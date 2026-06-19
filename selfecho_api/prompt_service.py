@@ -7,7 +7,7 @@ from memory_agent.store import list_memories, read_memory
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "selfecho_config" / "prompts"
 ALLOWED_PROMPTS = {
-    "treehole_reply",
+    "conversation_reply",
     "memory_consolidation",
     "memory_editing",
     "session_summary",
@@ -44,9 +44,9 @@ def write_prompt(name: str, content: str) -> str:
 
 
 def preview_prompt(user_message: str = "") -> str:
-    sections = ["# SelfEcho 树洞聊天 Prompt 预览", ""]
-    sections.append("## 树洞回复策略")
-    sections.append(read_prompt("treehole_reply"))
+    sections = ["# IwIw Prompt 预览", ""]
+    sections.append("## 对话策略")
+    sections.append(read_prompt("conversation_reply"))
     sections.append("## L0/L1 长期记忆")
     for priority in ("core", "important"):
         for mem in list_memories(priority=priority):

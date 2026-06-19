@@ -1,4 +1,4 @@
-"""SelfEcho internal session memory layer."""
+"""IwIw internal session memory layer."""
 
 from .service import SessionMemoryService
 

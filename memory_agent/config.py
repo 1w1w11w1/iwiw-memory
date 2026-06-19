@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 def _load_dotenv() -> None:
-    """加载项目根目录的 .env。保持零依赖，避免为 hook 增加启动成本。"""
+    """加载项目根目录的 .env。"""
     project_root = Path(__file__).resolve().parents[1]
     for env_file in (project_root / ".env", project_root / "memory_agent" / ".env"):
         if not env_file.exists():
@@ -29,7 +29,7 @@ def _load_dotenv() -> None:
                 value = value.strip().strip('"').strip("'")
                 os.environ.setdefault(key, value)
         except Exception:
-            # hook 里配置读取失败不应该中断主对话
+            # 配置读取失败不应该中断主流程
             continue
 
 
@@ -81,10 +81,6 @@ LLM_MODEL = _env("MEMORY_AGENT_LLM_MODEL", "deepseek-v4-flash")
 EXTRACT_MAX_TOKENS = _env_int("MEMORY_AGENT_EXTRACT_MAX_TOKENS", 1200)
 EXTRACT_TEMPERATURE = _env_float("MEMORY_AGENT_EXTRACT_TEMPERATURE", 0.2)
 EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 15.0)
-
-# ── Hook 配置 ──
-HOOK_REPORT_STATUS = _env_bool("MEMORY_AGENT_HOOK_REPORT_STATUS", False)
-HOOK_SKIP_IDE_CONTEXT = _env_bool("MEMORY_AGENT_SKIP_IDE_CONTEXT", True)
 
 # ── 记忆分级（来自 MemPalace 分层设计） ──
 PRIORITY_TIERS = {

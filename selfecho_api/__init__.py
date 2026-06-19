@@ -1,1 +1,1 @@
-"""SelfEcho GUI API."""
+"""IwIw local API."""

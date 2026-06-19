@@ -1,11 +1,10 @@
 """
-search.py — 混合搜索（BM25 全文 + 关键词加权）
+search.py — 混合搜索（BM25 全文 + 关键词加权 + 规划中向量语义检索）
 
 设计决策：
 - 纯 Python 实现 BM25（零外部依赖），适配 markdown 记忆文件
-- 不使用向量嵌入（Claude Code 没有持久化向量索引的支持）
 - 双层排序：BM25 初筛 → 时间衰减重排（时间轴概念来自 Zep 设计）
-- 可选 LLM 重排（质量优先模式下）
+- TODO: 接入向量嵌入语义检索（embedding + cosine similarity 混合排序）
 """
 
 import re
