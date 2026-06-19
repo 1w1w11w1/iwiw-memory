@@ -1,5 +1,16 @@
 # 记忆语义检索设计：向量嵌入模块
 
+> **实现状态**（2026-06-20）：Phase 2 已完成。使用 BAAI/bge-small-zh-v1.5（本地部署，512维），
+> 向量存储在 `memory_chunks` 表（`sessions.db`）。`memory_agent/embedding.py` + `memory_agent/db.py` 提供了
+> 嵌入生成和余弦相似度检索。设计文档大部分已实现，保留作为架构参考。
+>
+> 与本设计文档的差异：
+> - 嵌入模型从 OpenAI text-embedding-3-small 改为本地 BGE（离线、免费、中文优化）
+> - 未使用独立的 vector_store.py（功能集成到 db.py 中）
+> - 未实现 QueryBuilder / HybridSearch（Plan 中列为 Phase 3）
+>
+> ---
+
 ## 缘起
 
 当前记忆检索使用 BM25 关键词匹配，存在根本局限：

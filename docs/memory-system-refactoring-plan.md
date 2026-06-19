@@ -1,6 +1,7 @@
 # IwIw 记忆系统重构计划
 
 > 基于 2026-06-20 架构讨论的最终决策。
+> 最后更新：2026-06-20，Phase 0～2 已完成。
 
 ---
 
@@ -21,50 +22,50 @@
 
 ## 分阶段实施路线
 
-### Phase 0：剪枝（当前阶段）
+### Phase 0：剪枝 ✅（已完成）
 
 **目标**：清理项目中所有旧架构残留，为重构铺干净的地基。
 
-| 序号 | 任务 | 说明 |
+| 序号 | 任务 | 状态 |
 |------|------|------|
-| 0.1 | docs/ 目录清理 | 删除无用旧文档，保留当前和未来相关的 |
-| 0.2 | git rm 已删除文件 | 从 git 中移除 `hook_extractor.py`、`hook_heartbeat.py`、`treehole_reply.md` |
-| 0.3 | AGENTS.md 审查 | 决定保留还是删除 |
-| 0.4 | 旧迁移代码清理 | `selfecho_session/db.py` 中旧重命名代码、LEGACY_DB_PATH |
-| 0.5 | memory/ priority 修正 | 不合理的 L0/L1 降级 |
-| 0.6 | SQLite schema 初始化 | 新增 memories/memory_chunks/memory_pending_actions 表 |
+| 0.1 | docs/ 目录清理 | ✅ docs/ 从 12 文件精简到 4 个 |
+| 0.2 | git rm 已删除文件 | ✅ hook_extractor, hook_heartbeat, treehole_reply |
+| 0.3 | AGENTS.md 审查 | ✅ 保留，待合并到 CLAUDE.md |
+| 0.4 | 旧迁移代码清理 | ✅ db.py 中旧重命名代码已移除 |
+| 0.5 | memory/ priority 修正 | ✅ 4 条降级（core→normal ×1, important→normal ×3） |
+| 0.6 | extractor prompt 改进 | ✅ 新增 mem_type 选择规则（feedback/project/reference） |
 
-**产出**：干净的项目根目录，旧架构文档完全清除。
+**产出**：干净的项目根目录，旧架构文档完全清除，提取 prompt 增加分类规则。**7 commits**。
 
 ---
 
-### Phase 1：数据库层
+### Phase 1：数据库层 ✅（已完成）
 
 **目标**：建立新的 SQLite 统一存储层，迁移现有数据。
 
-| 序号 | 任务 | 产出 |
+| 序号 | 任务 | 状态 |
 |------|------|------|
-| 1.1 | 编写 `memory_agent/db.py` | SQLite schema （memories / memory_chunks / memory_pending_actions 表） |
-| 1.2 | 数据迁移脚本 | 将 `memory/*.md` 全量解析并 INSERT 到新表 |
-| 1.3 | 添加 FTS5 索引 | 关键词搜索回退通道 |
-| 1.4 | 停掉 Markdown 同步写入 | 旧 store.py 只读，不再写新 .md 文件 |
+| 1.1 | 编写 `memory_agent/db.py` | ✅ Schema（memories / memory_chunks / memory_pending_actions / memories_fts） |
+| 1.2 | 数据迁移脚本 | ✅ 23 条 .md → SQLite |
+| 1.3 | FTS5 关键词检索 | ✅ 中文/英文前缀查询 |
+| 1.4 | 写入路径切换到 SQLite | ✅ extractor 和 mcp_server 写入目标已切换，store.py 保留读能力 |
 
-**产出**：数据全部在 SQLite，向量嵌入前的就绪状态。
+**产出**：23 条记忆全部在 SQLite，mem_type 按规则分散（user=13, feedback=3, project=3, reference=4）。**2 commits**。
 
 ---
 
-### Phase 2：向量嵌入
+### Phase 2：向量嵌入 ✅（已完成）
 
 **目标**：对所有记忆生成嵌入向量，建立语义检索能力。
 
-| 序号 | 任务 | 产出 |
+| 序号 | 任务 | 状态 |
 |------|------|------|
-| 2.1 | 编写 `memory_agent/embedding.py` | OpenAI embedding API 封装（重试、错误处理、降级） |
-| 2.2 | 编写 `memory_agent/chunker.py` | 长记忆分段逻辑（≤512 tokens/chunk） |
-| 2.3 | 编写 `memory_agent/vector_store.py` | 向量 BLOB 读写 + cosine similarity 检索 |
-| 2.4 | 为所有已有记忆生成嵌入 | 批量调用 API，写入 memory_chunks 表 |
+| 2.1 | 编写 `memory_agent/embedding.py` | ✅ BAAI/bge-small-zh-v1.5（本地，中文优化，512维） |
+| 2.2 | 文本分段 | ✅ `_chunk_text()` 按段落分割，≤500字/块 |
+| 2.3 | 向量存储 + 余弦检索 | ✅ 在 `db.py` 中，含 slug 去重 |
+| 2.4 | 为所有记忆生成嵌入 | ✅ 23 条记忆 → 42 chunk → 全部向量化 |
 
-**产出**：每条记忆至少对应一个向量，语义检索可用。
+**产出**：每条记忆至少对应一个向量，语义检索可用。**1 commit**。
 
 ---
 
@@ -276,11 +277,11 @@ CREATE TABLE memory_pending_actions (
 MEMORY_DB_PATH = PROJECT_ROOT / "selfecho_data" / "sessions.db"  # 与会话层合并
 
 # ── 向量嵌入 ──
-EMBEDDING_PROVIDER = "openai"  # openai | local
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_PROVIDER = "local"  # local | openai
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"  # 本地中文优化，512维
 EMBEDDING_DIMENSIONS = 512
-EMBEDDING_BATCH_SIZE = 20
-EMBEDDING_RETRY = 3
+EMBEDDING_BATCH_SIZE = 16
+EMBEDDING_DEVICE = "cpu"  # cpu | cuda | mps
 
 # ── 检索 ──
 HYBRID_TOP_K = 10
