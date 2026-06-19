@@ -412,6 +412,118 @@ def touch_memory(slug: str) -> None:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 向量存储与检索
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def store_memory_vector(
+    memory_id: str,
+    chunks: list[str],
+    vectors: list[list[float]],
+    model_version: str = "bge-small-zh-v1.5",
+) -> int:
+    """存储记忆的分块文本和向量到 memory_chunks 表。"""
+    conn = connect()
+    conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
+    import numpy as np
+    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
+        conn.execute(
+            "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
+            (memory_id, idx, text, np.array(vec, dtype=np.float32).tobytes(), model_version),
+        )
+    conn.commit()
+    return len(chunks)
+
+
+def search_vectors(
+    query_vector: list[float],
+    top_k: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    向量余弦相似度搜索（全量扫描，适合 <1000 条记忆）。
+    返回按相似度降序排列的记忆片段列表。
+    """
+    conn = connect()
+    import numpy as np
+    rows = conn.execute("""
+        SELECT c.id, c.memory_id, c.chunk_text, c.vector,
+               m.slug, m.description, m.priority, m.mem_type
+        FROM memory_chunks c
+        JOIN memories m ON m.id = c.memory_id
+    """).fetchall()
+    if not rows:
+        return []
+
+    query_arr = np.array(query_vector, dtype=np.float32)
+    scored: list[tuple[float, dict]] = []
+    for r in rows:
+        try:
+            vec = np.frombuffer(r["vector"], dtype=np.float32)
+            sim = float(np.dot(query_arr, vec))
+        except Exception:
+            continue
+        scored.append((sim, {
+            "slug": r["slug"], "description": r["description"],
+            "priority": r["priority"], "mem_type": r["mem_type"],
+            "chunk_text": r["chunk_text"][:200], "similarity": round(sim, 4),
+        }))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # 每个 slug 只保留最高相似度的 chunk
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for _, item in scored:
+        if item["slug"] not in seen:
+            seen.add(item["slug"])
+            deduped.append(item)
+    return deduped[:top_k]
+
+
+def ensure_all_vectors(force: bool = False, model_version: str = "bge-small-zh-v1.5") -> dict:
+    """为所有还没有向量的记忆生成嵌入（幂等）。"""
+    conn = connect()
+    from .embedding import embed_batch
+    memories = conn.execute("SELECT id, slug, content FROM memories ORDER BY updated_at").fetchall()
+    processed = 0; skipped = 0; errors = []
+    for mem in memories:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM memory_chunks WHERE memory_id = ? AND model_version = ?",
+            (mem["id"], model_version),
+        ).fetchone()[0]
+        if existing > 0 and not force:
+            skipped += 1; continue
+
+        chunks = _chunk_text(mem["content"])
+        vectors = embed_batch(chunks)
+        if not vectors:
+            errors.append(f"{mem['slug']}: embedding failed"); continue
+
+        conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (mem["id"],))
+        import numpy as np
+        for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
+            conn.execute(
+                "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
+                (mem["id"], idx, chunk, np.array(vec, dtype=np.float32).tobytes(), model_version),
+            )
+        processed += 1
+    conn.commit()
+    return {"processed": processed, "skipped": skipped, "errors": errors, "total": processed + skipped}
+
+
+def _chunk_text(text: str, max_chars: int = 500) -> list[str]:
+    """按段落分割长文本，每块不超过 max_chars 字符。"""
+    if len(text) <= max_chars:
+        return [text]
+    chunks, current = [], ""
+    for para in text.split("\n\n"):
+        if len(current) + len(para) + 2 > max_chars:
+            if current.strip(): chunks.append(current.strip())
+            current = para
+        else:
+            current = (current + "\n\n" + para) if current else para
+    if current.strip(): chunks.append(current.strip())
+    return chunks or [text]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 迁移：从 Markdown 文件导入
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

@@ -9,7 +9,7 @@
 | 决策点 | 结论 |
 |--------|------|
 | 存储真源 | **SQLite 统一真源** —— 合并到 `selfecho_data/sessions.db` |
-| 向量嵌入 | **OpenAI text-embedding-3-small**，dim=512，BLOB 存同一 DB |
+| 向量嵌入 | **BAAI/bge-small-zh-v1.5**（本地部署，中文优化，33MB，512维） |
 | 检索 | **向量优先 + FTS5 回退**，相关性阈值过滤 |
 | 触发机制 | **混合策略** —— 高信号消息实时提取 + 周期 LLM consolidate |
 | 淘汰策略 | **配置化** —— `llm_judge` / `rules` / `hybrid` / `manual`，支持前端确认 |
