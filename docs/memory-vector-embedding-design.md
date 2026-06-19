@@ -94,12 +94,12 @@ class Vectorizer:
 
 | 方案 | 优点 | 缺点 | 建议场景 |
 |------|------|------|---------|
-| **OpenAI text-embedding-3-small** | 质量高、维度可调(256-1536)、成本低 | 需要 API、有网络依赖 | 默认推荐 |
+| **BGE (bge-small-zh-v1.5)** | 本地部署、中文优化、离线免费、512维 | 需要本地推理（CPU可跑） | **当前选用** |
+| **OpenAI text-embedding-3-small** | 质量高、维度可调(256-1536) | 需要 API key、有网络依赖 | 备选 |
 | **OpenAI text-embedding-3-large** | 质量最高 | 成本更高、维度 3072 | 质量优先场景 |
-| **本地 BGE 模型 (bge-small-zh-v1.5)** | 无 API 依赖、中文友好 | 需要本地推理、质量稍低 | 离线/隐私优先 |
 | **oMLX `/v1/embeddings`** | 本地 Apple Silicon 运行 | 仅限 Mac | 已有 oMLX 用户 |
 
-**建议默认**：`text-embedding-3-small`，维度 512（平衡质量与存储）。
+**当前选用**：`BAAI/bge-small-zh-v1.5`，维度 512（本地、中文优化、零API依赖）。
 
 ### 2. 向量库（`memory_agent/vector_store.py`）
 
@@ -259,11 +259,11 @@ class HybridSearch:
 
 ```python
 # ── 向量嵌入配置 ──
-EMBEDDING_PROVIDER = _env("MEMORY_AGENT_EMBEDDING_PROVIDER", "openai")  # openai | local | omxl
-EMBEDDING_MODEL = _env("MEMORY_AGENT_EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_PROVIDER = _env("MEMORY_AGENT_EMBEDDING_PROVIDER", "local")  # local | openai
+EMBEDDING_MODEL = _env("MEMORY_AGENT_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 EMBEDDING_DIMENSIONS = _env_int("MEMORY_AGENT_EMBEDDING_DIMENSIONS", 512)
-EMBEDDING_BATCH_SIZE = _env_int("MEMORY_AGENT_EMBEDDING_BATCH_SIZE", 20)
-EMBEDDING_RETRY = _env_int("MEMORY_AGENT_EMBEDDING_RETRY", 3)
+EMBEDDING_BATCH_SIZE = _env_int("MEMORY_AGENT_EMBEDDING_BATCH_SIZE", 16)
+EMBEDDING_DEVICE = _env("MEMORY_AGENT_EMBEDDING_DEVICE", "cpu")  # cpu | cuda | mps
 
 # ── 混合搜索配置 ──
 HYBRID_SEARCH_TOP_K = _env_int("MEMORY_AGENT_HYBRID_SEARCH_TOP_K", 10)
@@ -311,7 +311,7 @@ HYBRID_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_RELEVANCE_THRESHOLD
 
 | 决策 | 选项 | 选择 | 理由 |
 |------|------|------|------|
-| 嵌入模型 | OpenAI / 本地 BGE / oMLX | **OpenAI text-embedding-3-small** | 质量高、成本低、成熟 |
+| 嵌入模型 | OpenAI / 本地 BGE / oMLX | **BGE (bge-small-zh-v1.5)** | 本地离线、中文优化、零API依赖 |
 | 向量库 | SQLite+numpy / ChromaDB / Pinecone | **SQLite+numpy 优先** | 零依赖、够用，迁移到 ChromaDB 的接口已预留 |
 | 查询生成 | 启发式 / LLM 生成 | **启发式优先 + LLM 补充** | 零额外 LLM 调用即可启动 |
 | 向量化触发 | 同步 consolidated / 后台 watcher | **consolidate 后同步** | 简单可靠，一期先跑通 |
