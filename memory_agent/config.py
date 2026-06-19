@@ -71,6 +71,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MEMORY_DIR = PROJECT_ROOT / "memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
+# ── 数据库（与会话层合并）──
+MEMORY_DB_PATH = PROJECT_ROOT / "selfecho_data" / "sessions.db"
+
 # ── LLM API 配置 ──
 LLM_API_STYLE = _env("MEMORY_AGENT_LLM_API_STYLE", "anthropic").strip().lower()
 LLM_BASE_URL = _env("MEMORY_AGENT_LLM_BASE_URL", "https://api.deepseek.com/anthropic").rstrip("/")
