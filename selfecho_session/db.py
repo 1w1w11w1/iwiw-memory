@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
@@ -197,20 +197,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("classify_existing_gui_sessions_as_chat", now),
         )
 
-    legacy_label = chr(0x6811) + chr(0x6D1E)
-    conn.execute(
-        "UPDATE sessions SET title = REPLACE(title, ?, ?) WHERE title LIKE ?",
-        (f"{legacy_label}会话", "对话", f"%{legacy_label}%"),
-    )
-    conn.execute(
-        "UPDATE sessions SET title = REPLACE(title, ?, ?) WHERE title LIKE ?",
-        (legacy_label, "对话", f"%{legacy_label}%"),
-    )
-    conn.execute(
-        "UPDATE sessions SET title = REPLACE(title, ?, ?) WHERE title LIKE ?",
-        ("SelfEcho", "IwIw", "%SelfEcho%"),
-    )
-
 
 def connect() -> sqlite3.Connection:
     ensure_data_dirs()
@@ -228,3 +214,4 @@ def connect() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_timeline_run ON agent_timeline(run_id)")
     conn.commit()
     return conn
+
