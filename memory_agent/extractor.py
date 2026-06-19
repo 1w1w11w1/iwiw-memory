@@ -14,7 +14,7 @@ from .config import (
     LOG_FILE,
 )
 from .llm import LLMConfigurationError, complete_text
-from .store import list_memories, save_memory_candidate
+from .db import list_memories, save_memory_candidate
 
 # ── 日志 ──
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def _memory_catalog_text(limit: int = 80) -> str:
             "- {slug} | {priority} | {mem_type} | {description}".format(
                 slug=mem.get("slug", ""),
                 priority=mem.get("priority", "normal"),
-                mem_type=mem.get("type", "unknown"),
+                mem_type=mem.get("mem_type", "unknown"),
                 description=mem.get("description", ""),
             )
         )
@@ -300,9 +300,9 @@ async def extract_and_save(message: str, context: str = "") -> list[str]:
         try:
             result = save_memory_candidate(c)
             if result:
-                action, path = result
-                saved.append(f"{action}:{path.stem}")
-                logger.info("%s: %s (priority=%s)", action, path.stem, c.get("priority"))
+                action, slug = result
+                saved.append(f"{action}:{slug}")
+                logger.info("%s: %s (priority=%s)", action, slug, c.get("priority"))
             else:
                 logger.info(f"Dedup skipped: {c.get('slug')}")
         except Exception as e:

@@ -24,9 +24,9 @@ from mcp.types import Tool, TextContent
 from .config import MEMORY_DIR
 from .extractor import extract_and_save
 from .search import search_memories, _get_index
+from .db import list_memories
 from .store import (
     read_memory,
-    list_memories,
     rebuild_index,
     get_all_content_for_search,
 )

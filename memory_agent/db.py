@@ -310,6 +310,37 @@ def delete_memory(slug: str) -> bool:
     return cur.rowcount > 0
 
 
+def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
+    """
+    保存 LLM 返回的一条 create/update 动作到 SQLite。
+
+    与旧 store.py 的 save_memory_candidate 接口兼容，但返回
+    (action, slug) 而非 (action, Path)。供 extractor.py 调用。
+
+    Returns:
+        (action, slug) 或 None（跳过/忽略）
+    """
+    action = (candidate.get("action") or "create").strip().lower()
+    if action == "ignore":
+        return None
+
+    slug = candidate.get("target_slug") or candidate.get("slug") or "memory"
+
+    try:
+        record = upsert_memory(
+            slug=slug,
+            description=candidate.get("description", ""),
+            content=candidate.get("content", ""),
+            mem_type=candidate.get("mem_type", "user"),
+            priority=candidate.get("priority", "normal"),
+            event_date=candidate.get("event_date"),
+            content_hash="",
+        )
+        return (action, record["slug"])
+    except Exception:
+        return None
+
+
 def get_stats() -> dict[str, Any]:
     """记忆库统计。"""
     conn = connect()
