@@ -112,7 +112,7 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
     "target_slug": "仅 update 时填写已有记忆 slug",
     "description": "一句话描述（用于索引）",
     "content": "用中文自然语言写成的完整记忆内容。create 时写完整正文；update 时只需写新增内容，系统会追加到末尾，不要复述已有内容。",
-    "mem_type": "user|feedback|project|reference",
+    "mem_type": "user|feedback|project|reference"（见下方 mem_type 选择规则）,
     "priority": "core|important|normal|archive",
     "event_date": "YYYY-MM-DD（事实发生日期，如未明确则用 null）",
     "reason": "一句话说明为什么创建或更新"
@@ -126,6 +126,32 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 - 信息含糊、只是临时情绪、或和现有内容无新增：返回 []。
 - 不要把不同的人合并到同一条记忆；同学/朋友等人物不确定时宁可 create 或 ignore，不要猜测合并。
 - update 时 content 只需提供新增内容（不要复述或总结已有内容），系统会自动追加到正文末尾。
+
+## mem_type 选择规则
+根据信息类型选择最合适的 mem_type：
+
+- **user**：用户的身份、经历、偏好、习惯、困扰、计划、对他人的评价
+  — 这是默认值。AI 的倾听和记录对象是用户，因此大部分记忆属于此类
+  - 示例："我今年大三，学计算机" → user
+  - 示例："我最近压力很大" → user
+  - 示例："我觉得我同学是个幻想型人格" → user（对他人性格的分析）
+
+- **feedback**：用户对 AI 行为的批评、纠正、要求改变
+  - 示例："你写得太学术了，我看不懂" → feedback
+  - 示例："不要用这种语气跟我说话" → feedback
+  - 示例："以后别给我推荐动漫周边了" → feedback
+
+- **project**：项目、代码、架构级别的决策和偏好
+  - 示例："我决定把数据库从 Markdown 迁到 SQLite" → project
+  - 示例："以后不要用 xxx 库，换 yyy" → project
+  - 示例："这个功能先不做" → project
+
+- **reference**：用户提到的外部资料、引用、第三方信息，不直接关于用户自身
+  - 示例："有一篇论文说..." → reference
+  - 示例："xxx 工具的文档里写着..." → reference
+
+当信息同时符合多个类型时，优先级：feedback > project > user > reference。
+
 
 ## Priority 分级标准
 - **core**：身份标识、核心偏好、认知模式 — 每次会话必须加载
