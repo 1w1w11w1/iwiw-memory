@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memory_agent.store import list_memories, read_memory
+from memory_agent.db import list_memories, get_memory
+from memory_agent.retrieval import hybrid_search, format_memory_context
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "selfecho_config" / "prompts"
@@ -43,17 +44,43 @@ def write_prompt(name: str, content: str) -> str:
     return content
 
 
-def preview_prompt(user_message: str = "") -> str:
+def preview_prompt(user_message: str = "", context_messages: list[str] | None = None) -> str:
+    """
+    组装完整 system prompt，包含对话策略 + L0/L1 始终加载 + L2/L3 语义检索注入。
+
+    L2/L3 不全文加载，通过 hybrid_search 按用户消息检索相关结果，
+    减少上下文噪声，避免 LLM 幻觉。
+    """
     sections = ["# IwIw Prompt 预览", ""]
     sections.append("## 对话策略")
     sections.append(read_prompt("conversation_reply"))
-    sections.append("## L0/L1 长期记忆")
+
+    # ── L0/L1 始终加载 ──
+    sections.append("## 长期记忆（始终加载）")
+    l0_l1_slugs: set[str] = set()
     for priority in ("core", "important"):
         for mem in list_memories(priority=priority):
-            body = read_memory(mem["slug"]) or ""
+            l0_l1_slugs.add(mem["slug"])
+            body = get_memory(mem["slug"])
+            content = (body.get("content", "") if body else "")[:1600]
             sections.append(f"### {mem['slug']} ({priority})")
-            sections.append(body[:1600])
+            sections.append(content)
+
+    # ── L2/L3 按需检索 ──
+    if user_message:
+        retrieved = hybrid_search(
+            user_message=user_message,
+            context_messages=context_messages,
+            top_k=5,
+            relevance_threshold=0.35,
+            exclude_slugs=l0_l1_slugs,
+        )
+        context_block = format_memory_context(retrieved, max_total_chars=2000)
+        if context_block:
+            sections.append(context_block)
+
     if user_message:
         sections.append("## 当前用户消息")
         sections.append(user_message)
+
     return "\n\n".join(sections)
