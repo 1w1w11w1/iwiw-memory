@@ -13,6 +13,8 @@ from memory_agent.extractor import extract_and_save
 
 from .config import LEGACY_DB_PATH
 from .db import connect, now_iso
+from memory_agent.triggers import should_trigger
+from memory_agent.extractor import extract_and_save
 
 
 def _rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -221,6 +223,14 @@ class SessionMemoryService:
         if session.get("scope") == "project":
             self.conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, session["project_id"]))
         self.conn.commit()
+
+        # 高信号消息 → 实时提取
+        if role == "user" and should_trigger(content):
+            import threading
+            sess_id = session["id"]
+            msg = content
+            threading.Thread(target=_trigger_extract, args=(sess_id, msg), daemon=True).start()
+
         return {
             "id": cursor.lastrowid,
             "session_id": session["id"],
@@ -708,6 +718,18 @@ class SessionMemoryService:
                 (limit,),
             )
         ]
+
+def _trigger_extract(session_id: str, message: str) -> None:
+    """后台线程执行实时提取。"""
+    import asyncio
+    import logging
+    logger = logging.getLogger("selfecho_session.trigger")
+    try:
+        asyncio.run(extract_and_save(message, context=f"source_session_id={session_id}"))
+        logger.info("Real-time extraction triggered: %s", message[:60])
+    except Exception as e:
+        logger.warning("Trigger extraction failed: %s", e)
+
 
     def migrate_legacy(self, legacy_path: Path | None = None) -> dict[str, Any]:
         legacy = legacy_path or LEGACY_DB_PATH

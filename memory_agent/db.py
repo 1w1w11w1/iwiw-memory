@@ -312,13 +312,14 @@ def delete_memory(slug: str) -> bool:
 
 def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
     """
-    保存 LLM 返回的一条 create/update 动作到 SQLite。
+    保存 LLM 返回的一条记忆维护动作到 SQLite。
 
+    支持动作：create / update / archive / merge / ignore。
     与旧 store.py 的 save_memory_candidate 接口兼容，但返回
     (action, slug) 而非 (action, Path)。供 extractor.py 调用。
 
     Returns:
-        (action, slug) 或 None（跳过/忽略）
+        (action, slug) 或 None（跳过/失败）
     """
     action = (candidate.get("action") or "create").strip().lower()
     if action == "ignore":
@@ -327,6 +328,31 @@ def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
     slug = candidate.get("target_slug") or candidate.get("slug") or "memory"
 
     try:
+        if action == "archive":
+            conn = connect()
+            conn.execute(
+                "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
+                (_now(), slug),
+            )
+            conn.commit()
+            return ("archive", slug)
+
+        if action == "merge":
+            target = candidate.get("target_slug") or slug
+            content = candidate.get("content", "")
+            if not content:
+                return None
+            record = upsert_memory(
+                slug=target,
+                description=candidate.get("description", ""),
+                content=content,
+                mem_type=candidate.get("mem_type", "user"),
+                priority=candidate.get("priority", "normal"),
+                event_date=candidate.get("event_date"),
+                content_hash="",
+            )
+            return ("merge", record["slug"])
+
         record = upsert_memory(
             slug=slug,
             description=candidate.get("description", ""),

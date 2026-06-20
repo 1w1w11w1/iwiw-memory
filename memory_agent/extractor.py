@@ -107,15 +107,15 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 ```json
 [
   {
-    "action": "create|update|ignore",
+    "action": "create|update|ignore|archive|merge",
     "slug": "短英文slug",
-    "target_slug": "仅 update 时填写已有记忆 slug",
+    "target_slug": "仅 update/merge 时填写已有记忆 slug",
     "description": "一句话描述（用于索引）",
     "content": "用中文自然语言写成的完整记忆内容。create 时写完整正文；update 时只需写新增内容，系统会追加到末尾，不要复述已有内容。",
     "mem_type": "user|feedback|project|reference"（见下方 mem_type 选择规则）,
     "priority": "core|important|normal|archive",
-    "event_date": "YYYY-MM-DD（事实发生日期，如未明确则用 null）",
-    "reason": "一句话说明为什么创建或更新"
+    "event_date": "YYYY-MM-DD（事实发生日期，从上下文推算；实在无法推算则用 null）",
+    "reason": "一句话说明为什么执行此动作"
   }
 ]
 ```
@@ -159,7 +159,9 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 - **normal**：日常信息、计划、一般偏好 — 按话题触发加载
 - **archive**：已完成的历史事件、过时的偏好 — 深度搜索按需获取
 
-如果没有值得保存的信息，返回空数组 []。不要编造、不要过度解读、不要保存聊天中已明显重复的信息。"""
+如果没有值得保存的信息，返回空数组 []。不要编造、不要过度解读、不要保存聊天中已明显重复的信息。
+
+注意：当前日期是 {current_date}。event_date 应根据对话上下文中提到的时间线索来推算（如"昨天""上周""上个月"），不要默认用当前日期。"""
 
 
 async def extract_from_message(message: str, context: str = "") -> list[dict[str, Any]]:
