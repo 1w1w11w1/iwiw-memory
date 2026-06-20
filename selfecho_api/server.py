@@ -31,6 +31,14 @@ from memory_agent.store import (
     rebuild_index,
     replace_memory,
 )
+from memory_agent.db import (
+    get_memory,
+    list_memories as db_list_memories,
+    list_pending_actions,
+    approve_pending_action,
+    reject_pending_action,
+    get_stats,
+)
 from selfecho_agent import AgentResponse, AgentRunner
 from selfecho_session import SessionMemoryService
 from selfecho_session.config import DB_PATH, LEGACY_DB_PATH
@@ -1082,6 +1090,28 @@ def prompt_write(name: str, req: PromptWriteRequest):
 @app.post("/api/prompts/preview")
 def prompt_preview(req: PromptPreviewRequest):
     return {"preview": preview_prompt(req.user_message)}
+
+
+@app.get("/api/memory/pending-actions")
+def memory_pending():
+    return list_pending_actions()
+
+
+@app.post("/api/memory/pending-actions/{pending_id}/approve")
+def memory_pending_approve(pending_id: str):
+    ok = approve_pending_action(pending_id)
+    return {"ok": ok}
+
+
+@app.post("/api/memory/pending-actions/{pending_id}/reject")
+def memory_pending_reject(pending_id: str):
+    ok = reject_pending_action(pending_id)
+    return {"ok": ok}
+
+
+@app.get("/api/memory/stats")
+def memory_stats():
+    return get_stats()
 
 
 @app.get("/api/models/providers")

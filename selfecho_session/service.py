@@ -606,6 +606,8 @@ class SessionMemoryService:
         cycle_no = int(session["cycle_count"]) + 1
         summary = self._build_summary(session.get("rolling_summary", ""), pending)
         memory_result = self._extract_memories_sync(session["id"], cycle_no, summary, pending)
+        if cycle_no % 3 == 0:
+            self._maintain_memories_sync(session["id"], cycle_no, summary)
         now = now_iso()
 
         self.conn.execute(
@@ -646,6 +648,43 @@ class SessionMemoryService:
                 text = " ".join(str(m["content"]).split())
                 lines.append(f"- {role}: {text[:220]}")
         return "\n".join(lines).strip()[:6000]
+
+    def _maintain_memories_sync(self, session_id, cycle_no, summary):
+        """审查已有记忆，输出 archive/merge 候选到 pending_actions。"""
+        from memory_agent.db import get_maintenance_candidates, create_pending_action
+        try:
+            candidates = get_maintenance_candidates(limit=20)
+            if not candidates:
+                return
+            cat = []
+            for m in candidates[:15]:
+                cat.append("- {} ({}) -- {}".format(m["slug"], m.get("priority", "normal"), m.get("description", "")))
+            catalog = "\n".join(cat)
+            prompt = (
+                "以下是用户的记忆目录和会话摘要。\n"
+                "判断哪些记忆需要归档(archive)或合并(merge)。保守为主。\n\n"
+                "## 记忆目录\n" + catalog + "\n\n"
+                "## 会话摘要\n" + (summary or "")[:2000] + "\n\n"
+                "## 输出\n返回JSON列表，每个元素包含action(archive/merge/keep)、slug、reason。没有则返回[]。"
+            )
+            async def _run():
+                from memory_agent.llm import complete_text
+                return await complete_text(
+                    system_prompt="你是一个记忆维护器。仅对明确过时或冗余的记忆做操作。",
+                    user_prompt=prompt, max_tokens=1200, temperature=0.1, timeout=15)
+            import asyncio
+            text = asyncio.run(asyncio.wait_for(_run(), timeout=20))
+            import json, re
+            m = re.search(r"\[[\s\S]*?\]", text)
+            if not m:
+                return
+            for act in json.loads(m.group(0)):
+                if act.get("action") in ("archive", "merge"):
+                    create_pending_action(action=act["action"], target_memory_slug=act.get("slug"),
+                        session_id=session_id, cycle_no=cycle_no, reason=act.get("reason", ""))
+        except Exception as e:
+            import logging
+            logging.getLogger("selfecho_session.maintenance").warning("Maintenance failed: %s", e)
 
     def _extract_memories_sync(
         self,

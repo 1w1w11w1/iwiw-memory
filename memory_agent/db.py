@@ -367,6 +367,101 @@ def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
         return None
 
 
+def create_pending_action(
+    action: str,
+    target_memory_slug: str | None = None,
+    *,
+    session_id: str | None = None,
+    cycle_no: int | None = None,
+    reason: str = "",
+    source_memory_ids: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """写入一条待确认的淘汰/合并动作。"""
+    import uuid
+    conn = connect()
+    now = _now()
+    mem = None
+    if target_memory_slug:
+        mem = get_memory(target_memory_slug)
+    pending_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO memory_pending_actions
+            (id, ts, session_id, cycle_no, action, target_memory_id, source_memory_ids, reason, status, details)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}')""",
+        (
+            pending_id, now, session_id, cycle_no, action,
+            mem['id'] if mem else None,
+            json.dumps(source_memory_ids or [], ensure_ascii=False) if source_memory_ids else None,
+            reason,
+        ),
+    )
+    conn.commit()
+    return {'id': pending_id, 'action': action, 'target_slug': target_memory_slug, 'reason': reason, 'status': 'pending'}
+
+
+def list_pending_actions(status: str = 'pending') -> list[dict[str, Any]]:
+    """列出待确认的淘汰动作。"""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT pa.id, pa.ts, pa.action, pa.reason, pa.status, pa.source_memory_ids,
+                   m.slug AS target_slug, m.description AS target_description, m.priority AS target_priority
+            FROM memory_pending_actions pa
+            LEFT JOIN memories m ON m.id = pa.target_memory_id
+            WHERE pa.status = ?
+            ORDER BY pa.ts DESC""",
+        (status,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def approve_pending_action(pending_id: str) -> bool:
+    """确认执行待确认动作。"""
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM memory_pending_actions WHERE id = ? AND status = 'pending'",
+        (pending_id,),
+    ).fetchone()
+    if not row:
+        return False
+
+    action = row['action']
+    target_id = row['target_memory_id']
+
+    if action == 'archive' and target_id:
+        conn.execute('UPDATE memories SET priority = "archive", updated_at = ? WHERE id = ?', (_now(), target_id))
+    elif action == 'delete' and target_id:
+        conn.execute('DELETE FROM memories WHERE id = ?', (target_id,))
+
+    conn.execute('UPDATE memory_pending_actions SET status = "executed" WHERE id = ?', (pending_id,))
+    conn.commit()
+    return True
+
+
+def reject_pending_action(pending_id: str) -> bool:
+    """拒绝待确认动作。"""
+    conn = connect()
+    cur = conn.execute(
+        "UPDATE memory_pending_actions SET status = 'rejected' WHERE id = ? AND status = 'pending'",
+        (pending_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
+    """获取适合维护审查的记忆候选（访问最少、更新最早的 normal/important）。"""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT slug, description, priority, access_count, updated_at, content
+            FROM memories
+            WHERE priority IN ('normal', 'important')
+            ORDER BY access_count ASC, updated_at ASC
+            LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_stats() -> dict[str, Any]:
     """记忆库统计。"""
     conn = connect()
