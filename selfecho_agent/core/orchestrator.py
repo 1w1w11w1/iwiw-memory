@@ -75,7 +75,12 @@ class AgentOrchestrator:
         policy = self.policy_engine.assess(request.message, decision)
         plan = self.planner.plan(request, decision, policy)
         base_prompt = self.prompt_reader("conversation_reply")
-        bundle = self.context_builder.build(request.session_id, decision, base_prompt)
+        bundle = self.context_builder.build(
+            request.session_id,
+            decision,
+            base_prompt,
+            user_message=request.message,
+        )
         context_sections = [self._section_title(section) for section in bundle.sections]
         context_budget_report = self.context_budget.measure(bundle.sections)
         model_config = self._model_config(decision.path)

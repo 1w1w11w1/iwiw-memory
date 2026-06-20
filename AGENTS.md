@@ -10,11 +10,12 @@ IwIw 当前是一个记忆驱动的本地个人智能体。“陪我想想 / 非
 
 本项目采用两套互补记忆：
 
-1. Markdown 长期事实记忆
-   - 真源目录：`memory/`
-   - 索引：`memory/MEMORY.md`
-   - 历史备份：`memory/.history/`
+1. SQLite 长期事实记忆
+   - 真源数据库：`selfecho_data/sessions.db`
+   - 维护模块：`memory_agent/db.py`
+   - 主要表：`memories`、`memory_chunks`、`memories_fts`、`memory_pending_actions`、`memory_versions`
    - 分级：`core / important / normal / archive`
+   - `memory/` 仅可视为历史遗留或可读导出缓存，不再是写入真源。
 
 2. IwIw 会话记忆层
    - 数据库：`selfecho_data/sessions.db`
@@ -25,25 +26,37 @@ IwIw 当前是一个记忆驱动的本地个人智能体。“陪我想想 / 非
 
 ## 启动时
 
-读取 `memory/MEMORY.md` 获取记忆索引，然后加载 L0（core）和 L1（important）记忆的完整内容。
+从 SQLite 长期记忆表加载 L0（core）和 L1（important）记忆完整内容。
 
-如果 `memory/MEMORY.md` 缺失、损坏或不可读，应继续运行，但标记记忆检索不可用。禁止编造记忆事实。
+如果 SQLite 记忆库缺失、损坏或不可读，应继续运行，但标记记忆检索不可用。禁止编造记忆事实。`memory/MEMORY.md` 如存在，只能作为人工可读索引缓存。
 
 ## 检索策略
 
 1. 启动时仅加载 L0（core）和 L1（important）记忆。
-2. 当前话题涉及个人事实、长期计划、健康、关系、偏好或历史决策时，优先检索 `memory/` 长期记忆。
+2. 当前话题涉及个人事实、长期计划、健康、关系、偏好或历史决策时，优先检索 SQLite 长期记忆。
 3. 当前话题涉及过去对话、时间上下文、某段 GUI 会话或导入历史时，使用 IwIw 会话记忆层检索。
 4. L2（normal）和 L3（archive）按话题触发，不应默认全文注入。
 5. 长期事实优先由 `memory_agent` 维护；会话背景优先由 `selfecho_session` 提供。
+6. 语义检索必须进入真实 agent 上下文链路，不能只接到 prompt preview。
 
 ## 记忆写入与维护
 
 - GUI 会话保存完整原始消息。
 - 会话整理应在会话周期结束、固定轮数、阈值触发或用户手动触发时进行。
-- 长期记忆写入、编辑、合并、归档、删除都必须保留 `.history/` 备份和审计记录。
+- 长期记忆写入、编辑、合并、归档、删除和回滚都必须保存修改前版本到 `memory_versions`，并写入 `memory_audit` 审计记录。
+- 删除操作不能导致历史版本一起丢失；当前 schema 若不能保证，应先修 schema 或 tombstone 方案。
+- 内容变更后必须刷新或标记 dirty：FTS、向量 chunk、Markdown 缓存如存在也要同步。
 - 不确定是否属于稳定事实时，优先生成候选或保持观察，不要急着写入。
 - 用户明确要求删除、纠正或更新记忆时，优先采用用户最近一次明确更正。
+
+## 开发工作流护栏
+
+1. 不允许只更新文档状态来宣布 phase 完成；必须附带命令、测试、API 调用或真实链路 smoke test。
+2. 每个跨模块改动先做 tracer bullet：从真实入口到真实输出的最小闭环。
+3. 删除旧模块前必须列替代矩阵：旧能力、新能力、调用方、行为差异、验证方式。
+4. 数据破坏性操作必须经过统一 mutation 入口，返回 `version_id`、`audit_id`、`changed_rows`；`changed_rows == 0` 不能写成功状态。
+5. 引入依赖必须同步 `requirements.txt` / `package.json` / lock 文件，并说明 clean environment 验证方式。
+6. WS、工具执行、记忆删除等能力默认按高风险处理，不能因为本地运行就跳过权限与来源校验。
 
 ## 对话策略
 

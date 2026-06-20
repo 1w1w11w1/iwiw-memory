@@ -1,7 +1,7 @@
 # IwIw 记忆系统重构计划
 
 > 基于 2026-06-20 架构讨论的最终决策。
-> 最后更新：2026-06-20，Phase 0～5 已完成。
+> 最后更新：2026-06-20，Phase 0～5 + Phase 7 已实现；审查修复正在收敛数据安全与真实链路验收。
 
 ---
 
@@ -14,7 +14,7 @@
 | 检索 | **向量优先 + FTS5 回退**，相关性阈值过滤 |
 | 触发机制 | **混合策略** —— 高信号消息实时提取 + 周期 LLM consolidate |
 | 淘汰策略 | **配置化** —— `llm_judge` / `rules` / `hybrid` / `manual`，支持前端确认 |
-| 通信 | **JSON-RPC 2.0 over WebSocket**（控制通道）+ **REST**（CRUD）+ SSE（可选高吞吐流） |
+| 通信 | **JSON-RPC 2.0 over WebSocket**（待实现控制通道，位于 API/transport 层）+ **REST**（CRUD）+ SSE（过渡期流式回复） |
 | Markdown | 迁移后停掉同步写入，保留文件作为可读缓存 |
 | 前端确认 | 淘汰/删除操作前可在前端展示确认信息，配置可开关 |
 
@@ -48,7 +48,7 @@
 | 1.1 | 编写 `memory_agent/db.py` | ✅ Schema（memories / memory_chunks / memory_pending_actions / memories_fts） |
 | 1.2 | 数据迁移脚本 | ✅ 23 条 .md → SQLite |
 | 1.3 | FTS5 关键词检索 | ✅ 中文/英文前缀查询 |
-| 1.4 | 写入路径切换到 SQLite | ✅ extractor 和 mcp_server 写入目标已切换，store.py 保留读能力 |
+| 1.4 | 写入路径切换到 SQLite | ✅ extractor、mcp_server、GUI API 已切换；旧 store/search 能力由 `db.py`/`retrieval.py` 兼容替代 |
 
 **产出**：23 条记忆全部在 SQLite，mem_type 按规则分散（user=13, feedback=3, project=3, reference=4）。**2 commits**。
 
@@ -77,8 +77,8 @@
 |------|------|------|
 | 3.1 | 编写 `memory_agent/query_builder.py` | ✅ 从对话上下文生成 2-5 条检索 query（启发式） |
 | 3.2 | 编写 `memory_agent/retrieval.py` | ✅ 向量 + FTS5 + RRF + 时间衰减 + priority 加权 |
-| 3.3 | L0/L1 始终加载逻辑 | ✅ 在 `prompt_service.preview_prompt()` 中实现 |
-| 3.4 | L2/L3 按需检索注入 | ✅ hybrid_search → format_memory_context → 注入 system prompt |
+| 3.3 | L0/L1 始终加载逻辑 | ✅ 在 `prompt_service.preview_prompt()` 与真实 `ContextBuilder` 中实现 |
+| 3.4 | L2/L3 按需检索注入 | ✅ `hybrid_search` → `format_memory_context` → 真实 agent system prompt |
 
 **产出**：对话过程中自动检索相关记忆并注入上下文，标记来源。**1 commit**。
 
@@ -105,40 +105,40 @@
 
 | 序号 | 任务 | 状态 |
 |------|------|------|
-| 5.1 | 记忆维护 LLM 审查 | ✅ consolidate 每 3 次触发生成 archive/merge 候选 |
+| 5.1 | 记忆维护 LLM 审查 | ✅ consolidate 每 3 次触发；当前仅生成保守 archive 候选，merge 不自动执行 |
 | 5.2 | 新增 REST 端点 | ✅ pending-actions CRUD + approve/reject 已上线 |
 | 5.3 | pending_actions 入库 | ✅ 候选写入 memory_pending_actions 表（status=pending） |
-| 5.4 | 淘汰审计 | ✅ 批准/拒绝操作写入 memory_audit 表联动 |
+| 5.4 | 淘汰审计 | ✅ 批准/拒绝操作写入 `memory_audit`；修改前快照写入 `memory_versions` |
 
 **产出**：记忆不会无限膨胀，过时信息有序降级/归档。
 
 ---
 
-### Phase 6：WebSocket 统一通道
+### Phase 6：WebSocket 统一通道 ⏳（设计完成，待实现）
 
 **目标**：建立 JSON-RPC 2.0 over WebSocket 作为主要控制通道。
 
-| 序号 | 任务 | 产出 |
+| 序号 | 任务 | 状态 |
 |------|------|------|
-| 6.1 | 后端 WSManager | 连接管理、消息路由、心跳、JSON-RPC 2.0 协议实现 |
-| 6.2 | 前端 WSManager | 连接管理、重连、事件分发 |
-| 6.3 | 逐步迁移 chat 流 | 从 SSE 迁移到 WS 通道（过渡期两者并行） |
-| 6.4 | agent.runner 接入 WS | 运行状态推送、审批、取消 |
+| 6.1 | 后端 WSManager | 📝 设计完成（见 [phase6-websocket-design.md](phase6-websocket-design.md)） |
+| 6.2 | 前端 WSManager | 📝 设计完成 |
+| 6.3 | 逐步迁移 chat 流 | ⏳ 待实现（过渡期两者并行） |
+| 6.4 | agent.runner 接入 WS | ⏳ 待实现 |
 
 **产出**：一条 WS 连接走所有控制通信，REST 仅保留 CRUD。
 
 ---
 
-### Phase 7：清理收尾
+### Phase 7：清理收尾 ✅（已完成）
 
-| 序号 | 任务 | 说明 |
+| 序号 | 任务 | 状态 |
 |------|------|------|
-| 7.1 | 删除旧 store.py / search.py | 功能已完全被新模块替代 |
-| 7.2 | 删除 memory/.history | 历史版本已迁移到 SQLite |
-| 7.3 | 更新 CLAUDE.md | 同步最新架构描述 |
-| 7.4 | 更新设计文档 | memory-vector-embedding-design.md 状态更新 |
+| 7.1 | 删除旧 store.py / search.py | ✅ 功能已完全被新模块替代，已 git rm |
+| 7.2 | 删除 memory/.history | ✅ 历史版本迁移到 SQLite memory_versions 表 |
+| 7.3 | 更新 CLAUDE.md | ✅ 同步 SQLite 真源、向量检索、混合触发等最新架构 |
+| 7.4 | 更新设计文档 | ✅ 状态同步 |
 
-**产出**：最终状态——无旧架构残留，所有文档反映当前架构。
+**产出**：无旧架构残留，所有文档反映当前架构。**3 commits**。
 
 ---
 
@@ -165,22 +165,24 @@ selfecho_config/prompts/memory_consolidation.md  — 更新提取指令
 .gitignore                       — 增加 .venv/
 ```
 
-### 已删除文件
+### 已删除的旧文件（Phase 0/7）
 ```
 docs/ 8 个旧文件（见 Phase 0）
 memory_agent/hook_extractor.py
 memory_agent/hook_heartbeat.py
+memory_agent/store.py          — 旧 Markdown 文件操作，功能已由 db.py 替代
+memory_agent/search.py         — 旧 BM25 搜索，功能已由 retrieval.py 替代
+memory/.history/               — 历史版本已迁移到 SQLite memory_versions 表
 selfecho_config/prompts/treehole_reply.md
 .venv/（从 git 跟踪移除，保留磁盘文件）
 ```
 
-### 未实施的计划文件（Phase 6/7）
+### 未实施的计划文件（Phase 6）
 ```
-memory_agent/ws_manager.py      — WebSocket 连接管理（Phase 6）
-memory_agent/session_manager.py — WS 会话状态（Phase 6）
-web/src/api.ts WSManager        — 前端 WS 管理器（Phase 6）
-web/src/App.vue pending 组件     — 前端确认区域（Phase 5/6）
-selfecho_session/db.py 旧迁移代码 — 已清理
+selfecho_api/ws.py              — WebSocket 连接管理与 JSON-RPC 传输层
+selfecho_api/ws_handlers.py     — WS 方法路由，委托 memory/session/agent 模块
+web/src/api.ts WSManager        — 前端 WS 管理器
+web/src/App.vue pending 组件     — 前端确认区域
 ```
 
 ---
@@ -229,6 +231,20 @@ CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, content, description)
     VALUES (new.rowid, new.content, new.description);
 END;
+
+-- 版本历史（替代旧的 memory/.history 文件）
+CREATE TABLE memory_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id       TEXT,
+    slug            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    mem_type        TEXT NOT NULL DEFAULT 'user',
+    priority        TEXT NOT NULL DEFAULT 'normal',
+    event_date      TEXT,
+    saved_at        TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
 
 -- 待确认动作（淘汰/删除前需人工审批）
 CREATE TABLE memory_pending_actions (
@@ -294,7 +310,7 @@ WS_HEARTBEAT_INTERVAL = 30
 | Phase 3：检索层 | ~4 小时 | ✅ 已完成 |
 | Phase 4：触发 + 提取 | ~3 小时 | ✅ 已完成 |
 | Phase 5：淘汰机制 | ~4 小时 | ✅ 已完成 |
-| Phase 6：WS 通道 | ~6 小时 | ⏳ 未开始 |
-| Phase 7：清理收尾 | ~2 小时 | ⏳ 未开始 |
+| Phase 6：WS 通道 | ~6 小时 | ⏳ 设计文档已完成，待实现 |
+| Phase 7：清理收尾 | ~2 小时 | ✅ 已完成 |
 
-**已完成**：~20 小时开发工作量（Phase 0～5）。
+**已实现**：~22 小时开发工作量（Phase 0～5 + Phase 7）。当前以审查修复项作为验收补强：版本快照、rollback、真实上下文注入、依赖声明和文档契约一致性。

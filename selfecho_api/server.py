@@ -18,18 +18,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import FileResponse, StreamingResponse
 
-from memory_agent.store import (
-    MEMORY_DIR,
-    archive_memory,
-    delete_memory_file,
+from memory_agent.db import (
+    archive_memory_by_slug as archive_memory,
+    delete_memory_compat as delete_memory_file,
     list_history,
-    list_memories,
-    merge_memory_files,
+    list_memories_compat as list_memories,
+    merge_memories as merge_memory_files,
     read_history,
     read_memory,
     read_memory_full,
     rebuild_index,
     replace_memory,
+    restore_memory_from_history,
+    upsert_memory,
 )
 from memory_agent.db import (
     get_memory,
@@ -936,8 +937,9 @@ def memories(priority: str | None = None):
 
 @app.get("/api/memories/search")
 def search_memories_api(q: str, limit: int = 20):
-    from memory_agent.search import search_memories
-    return {"results": search_memories(q, top_k=limit)}
+    from memory_agent.retrieval import hybrid_search
+    results = hybrid_search(q, top_k=limit)
+    return {"results": results}
 
 
 @app.get("/api/memories/{slug}")
@@ -1041,29 +1043,56 @@ def rollback_audit(audit_id: str):
     event = dict(row)
     slug = event.get("target_slug")
     backup = event.get("backup_path")
-    if not slug or not backup:
-        raise HTTPException(status_code=400, detail="audit event has no restorable backup")
-    backup_path = Path(backup)
-    if not backup_path.exists():
-        raise HTTPException(status_code=404, detail="backup file not found")
-    target = MEMORY_DIR / f"{Path(slug).stem}.md"
-    if target.exists():
-        current = target.read_text(encoding="utf-8")
-        archive_dir = MEMORY_DIR / ".history" / target.stem
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        from datetime import datetime
-        archive_path = archive_dir / f"rollback-current-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
-        archive_path.write_text(current, encoding="utf-8")
-    target.write_text(backup_path.read_text(encoding="utf-8"), encoding="utf-8")
-    rebuild_index()
-    _audit(
-        action="rollback",
-        target_slug=slug,
-        reason=f"Rollback audit event {audit_id}",
-        backup_path=str(backup_path),
-        details={"rolled_back_event": audit_id},
-    )
-    return {"ok": True, "memory": read_memory_full(slug)}
+    if not slug:
+        raise HTTPException(status_code=400, detail="audit event has no target slug")
+
+    # 优先从 memory_versions 表恢复
+    if backup and backup.startswith("version://"):
+        version_id = backup.replace("version://", "")
+        restored = restore_memory_from_history(
+            slug,
+            version_id,
+            reason=f"rollback audit {audit_id}",
+        )
+        if restored:
+            _audit(
+                action="rollback",
+                target_slug=restored,
+                reason=f"Rollback audit event {audit_id}",
+                backup_path=backup,
+                details={"rolled_back_event": audit_id},
+            )
+            return {"ok": True, "memory": read_memory_full(restored)}
+    elif backup:
+        # 旧格式：从 .history 文件恢复（兼容遗留数据）
+        backup_path = Path(backup)
+        if backup_path.exists():
+            content = backup_path.read_text(encoding="utf-8")
+            import re
+            content = re.sub(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", content).strip()
+            restored = replace_memory(
+                slug=slug,
+                description=f"rollback from audit {audit_id}",
+                body=content,
+                reason=f"rollback audit {audit_id} from file",
+            )
+            if not restored:
+                restored_record = upsert_memory(
+                    slug=slug,
+                    description=f"rollback from audit {audit_id}",
+                    content=content,
+                )
+                restored = restored_record["slug"]
+            _audit(
+                action="rollback",
+                target_slug=restored,
+                reason=f"Rollback audit event {audit_id}",
+                backup_path=str(backup_path),
+                details={"rolled_back_event": audit_id},
+            )
+            return {"ok": True, "memory": read_memory_full(restored)}
+
+    raise HTTPException(status_code=400, detail="no restorable backup found")
 
 
 @app.get("/api/prompts")

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from memory_agent.store import list_memories, read_memory
+from memory_agent.db import list_memories, read_memory
 from memory_agent.config import LLM_MODEL
 
 from selfecho_session import SessionMemoryService
@@ -53,12 +53,20 @@ class ContextBuilder:
     def __init__(self, session_service: SessionMemoryService) -> None:
         self.session_service = session_service
 
-    def build(self, session_id: str, decision: IntentDecision, base_prompt: str) -> ContextBundle:
+    def build(
+        self,
+        session_id: str,
+        decision: IntentDecision,
+        base_prompt: str,
+        user_message: str = "",
+    ) -> ContextBundle:
+        core_context, loaded_memory_slugs = self._core_important_context()
         sections = [
             self._identity_section(),
             self._mode_section(decision),
             base_prompt.strip(),
-            self._core_important_context(),
+            core_context,
+            self._related_memory_context(session_id, user_message, loaded_memory_slugs),
             self._project_context(session_id),
             self._session_context(session_id),
         ]
@@ -97,15 +105,53 @@ class ContextBuilder:
             f"- guidance: {guidance}",
         ])
 
-    def _core_important_context(self) -> str:
+    def _core_important_context(self) -> tuple[str, set[str]]:
         parts: list[str] = []
+        loaded_slugs: set[str] = set()
         for priority in ("core", "important"):
             for mem in list_memories(priority=priority):
+                loaded_slugs.add(mem["slug"])
                 body = read_memory(mem["slug"]) or ""
                 parts.append(f"### {mem['slug']} ({priority})\n{body[:1800]}")
         if not parts:
+            return "", loaded_slugs
+        return "## L0/L1 长期记忆\n" + "\n\n".join(parts), loaded_slugs
+
+    def _related_memory_context(
+        self,
+        session_id: str,
+        user_message: str,
+        loaded_slugs: set[str],
+    ) -> str:
+        if not user_message.strip():
             return ""
-        return "## L0/L1 长期记忆\n" + "\n\n".join(parts)
+        try:
+            from memory_agent.retrieval import format_memory_context, hybrid_search
+
+            results = hybrid_search(
+                user_message=user_message,
+                context_messages=self._recent_message_texts(session_id),
+                top_k=5,
+                relevance_threshold=0.35,
+                exclude_slugs=loaded_slugs,
+            )
+            return format_memory_context(results, max_total_chars=2000)
+        except Exception:
+            return ""
+
+    def _recent_message_texts(self, session_id: str, limit: int = 6) -> list[str]:
+        if not hasattr(self.session_service, "get_messages"):
+            return []
+        try:
+            messages = self.session_service.get_messages(session_id, limit=limit)
+        except Exception:
+            return []
+        texts: list[str] = []
+        for message in messages:
+            content = str(message.get("content") or "").strip()
+            if content:
+                texts.append(content)
+        return texts
 
     def _project_context(self, session_id: str) -> str:
         session = self.session_service.get_session(session_id)

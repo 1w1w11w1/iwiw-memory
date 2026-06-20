@@ -1,13 +1,18 @@
 # 记忆语义检索设计：向量嵌入模块
 
-> **实现状态**（2026-06-20）：Phase 2 已完成。使用 BAAI/bge-small-zh-v1.5（本地部署，512维），
+> **实现状态**（2026-06-20）：Phase 0～5 + Phase 7 已完成。使用 BAAI/bge-small-zh-v1.5（本地部署，512维），
 > 向量存储在 `memory_chunks` 表（`sessions.db`）。`memory_agent/embedding.py` + `memory_agent/db.py` 提供了
-> 嵌入生成和余弦相似度检索。设计文档大部分已实现，保留作为架构参考。
+> 嵌入生成和余弦相似度检索。混合检索（向量 + FTS5 + RRF + 时间衰减 + Priority 加权）在
+> `memory_agent/retrieval.py` 中，查询生成在 `memory_agent/query_builder.py` 中。
+> 旧 store.py / search.py 已删除，所有功能由 db.py + retrieval.py + triggers.py 替代。
+> 旧 .history 文件已删除，版本历史由 SQLite memory_versions 表管理。
 >
 > 与本设计文档的差异：
 > - 嵌入模型从 OpenAI text-embedding-3-small 改为本地 BGE（离线、免费、中文优化）
 > - 未使用独立的 vector_store.py（功能集成到 db.py 中）
-> - 未实现 QueryBuilder / HybridSearch（Plan 中列为 Phase 3）
+> - QueryBuilder / HybridSearch 实现为 query_builder.py + retrieval.py（Phase 3）
+> - 触发机制实现为 triggers.py + extractor.py（Phase 4）
+> - 淘汰机制实现为 db.py 中 pending_actions + consolidate（Phase 5）
 >
 > ---
 
@@ -181,7 +186,7 @@ class QueryBuilder:
 
 **建议**：先做启发式（零额外成本），复杂不够时加 LLM 生成作为补充。
 
-### 4. 混合排序引擎（`memory_agent/hybrid_search.py`）
+### 4. 混合排序引擎（`memory_agent/retrieval.py`）
 
 ```python
 class HybridSearch:
@@ -288,7 +293,7 @@ HYBRID_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_RELEVANCE_THRESHOLD
 ### Phase 2：混合搜索（预计 1-2 天）
 
 1. 创建 `memory_agent/query_builder.py` — 启发式检索 query 生成
-2. 创建 `memory_agent/hybrid_search.py` — 合并 BM25 + 语义 + 时间衰减
+2. 创建 `memory_agent/retrieval.py` — 合并 FTS5 + 语义 + 时间衰减
 3. 在 MCP 中提供 `hybrid_search` 工具
 
 **产出**：`search_memories` 工具支持语义检索，用户可对比 BM25 和混合检索效果。

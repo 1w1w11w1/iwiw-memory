@@ -21,15 +21,14 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from .config import MEMORY_DIR
 from .extractor import extract_and_save
-from .search import search_memories, _get_index
-from .db import list_memories
-from .store import (
+from .db import (
+    get_memory,
+    list_memories_compat as list_memories,
     read_memory,
     rebuild_index,
-    get_all_content_for_search,
 )
+from .retrieval import hybrid_search
 
 server = Server("memory-agent")
 
@@ -61,7 +60,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_memories",
-            description="混合搜索记忆库（BM25 全文检索 + 时间衰减 + Priority 加权）。",
+            description="混合搜索记忆库（向量语义 + FTS5 关键词 + 时间衰减 + Priority 加权）。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -143,14 +142,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     elif name == "search_memories":
         query = arguments.get("query", "")
         top_k = arguments.get("top_k", 10)
-        results = search_memories(query, top_k=top_k)
-        # 简化输出：不返回全文
+        results = hybrid_search(query, top_k=top_k)
         simplified = [
             {
                 "slug": r["slug"],
                 "description": r.get("description", ""),
                 "priority": r.get("priority", "normal"),
-                "hybrid_score": r.get("hybrid_score", 0),
+                "score": r.get("score", 0),
+                "source": r.get("source", "hybrid"),
             }
             for r in results
         ]

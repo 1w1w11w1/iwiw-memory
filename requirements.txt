@@ -2,3 +2,5 @@ httpx>=0.27
 mcp>=1.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
+numpy>=1.26
+sentence-transformers>=3.0

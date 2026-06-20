@@ -10,11 +10,10 @@ from typing import Any
 
 from memory_agent.config import EXTRACT_TIMEOUT
 from memory_agent.extractor import extract_and_save
+from memory_agent.triggers import should_trigger
 
 from .config import LEGACY_DB_PATH
 from .db import connect, now_iso
-from memory_agent.triggers import should_trigger
-from memory_agent.extractor import extract_and_save
 
 
 def _rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -650,7 +649,7 @@ class SessionMemoryService:
         return "\n".join(lines).strip()[:6000]
 
     def _maintain_memories_sync(self, session_id, cycle_no, summary):
-        """审查已有记忆，输出 archive/merge 候选到 pending_actions。"""
+        """审查已有记忆，输出 archive 候选到 pending_actions。"""
         from memory_agent.db import get_maintenance_candidates, create_pending_action
         try:
             candidates = get_maintenance_candidates(limit=20)
@@ -662,10 +661,10 @@ class SessionMemoryService:
             catalog = "\n".join(cat)
             prompt = (
                 "以下是用户的记忆目录和会话摘要。\n"
-                "判断哪些记忆需要归档(archive)或合并(merge)。保守为主。\n\n"
+                "判断哪些记忆需要归档(archive)。保守为主，不要自动合并记忆。\n\n"
                 "## 记忆目录\n" + catalog + "\n\n"
                 "## 会话摘要\n" + (summary or "")[:2000] + "\n\n"
-                "## 输出\n返回JSON列表，每个元素包含action(archive/merge/keep)、slug、reason。没有则返回[]。"
+                "## 输出\n返回JSON列表，每个元素包含action(archive/keep)、slug、reason。没有则返回[]。"
             )
             async def _run():
                 from memory_agent.llm import complete_text
@@ -679,7 +678,7 @@ class SessionMemoryService:
             if not m:
                 return
             for act in json.loads(m.group(0)):
-                if act.get("action") in ("archive", "merge"):
+                if act.get("action") == "archive":
                     create_pending_action(action=act["action"], target_memory_slug=act.get("slug"),
                         session_id=session_id, cycle_no=cycle_no, reason=act.get("reason", ""))
         except Exception as e:
@@ -758,18 +757,6 @@ class SessionMemoryService:
             )
         ]
 
-def _trigger_extract(session_id: str, message: str) -> None:
-    """后台线程执行实时提取。"""
-    import asyncio
-    import logging
-    logger = logging.getLogger("selfecho_session.trigger")
-    try:
-        asyncio.run(extract_and_save(message, context=f"source_session_id={session_id}"))
-        logger.info("Real-time extraction triggered: %s", message[:60])
-    except Exception as e:
-        logger.warning("Trigger extraction failed: %s", e)
-
-
     def migrate_legacy(self, legacy_path: Path | None = None) -> dict[str, Any]:
         legacy = legacy_path or LEGACY_DB_PATH
         if not legacy.exists():
@@ -788,13 +775,15 @@ def _trigger_extract(session_id: str, message: str) -> None:
                 self.conn.execute(
                     """
                     INSERT INTO sessions
-                        (id, title, source, started_at, updated_at, turn_count, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (id, project_id, title, source, scope, started_at, updated_at, turn_count, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         sid,
+                        self.default_project_id(),
                         s["ai_title"] or "(导入历史)",
                         "legacy_claude_code",
+                        "chat",
                         s["started_at"] or now_iso(),
                         s["ended_at"] or s["started_at"] or now_iso(),
                         0,
@@ -809,7 +798,10 @@ def _trigger_extract(session_id: str, message: str) -> None:
             ).fetchone()[0]
             if existing_count:
                 continue
-            rows = list(old.execute("SELECT turn_idx, ts, role, text FROM turns WHERE session_id = ? ORDER BY turn_idx", (sid,)))
+            rows = list(old.execute(
+                "SELECT turn_idx, ts, role, text FROM turns WHERE session_id = ? ORDER BY turn_idx",
+                (sid,),
+            ))
             for r in rows:
                 self.conn.execute(
                     """
@@ -834,3 +826,14 @@ def _trigger_extract(session_id: str, message: str) -> None:
         )
         self.conn.commit()
         return {"ok": True, "sessions": imported_sessions, "messages": imported_messages}
+
+def _trigger_extract(session_id: str, message: str) -> None:
+    """后台线程执行实时提取。"""
+    import asyncio
+    import logging
+    logger = logging.getLogger("selfecho_session.trigger")
+    try:
+        asyncio.run(extract_and_save(message, context=f"source_session_id={session_id}"))
+        logger.info("Real-time extraction triggered: %s", message[:60])
+    except Exception as e:
+        logger.warning("Trigger extraction failed: %s", e)
