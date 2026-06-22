@@ -29,7 +29,6 @@ from memory_agent.db import (
     rebuild_index,
     replace_memory_result,
     restore_memory_from_history_result,
-    upsert_memory,
 )
 from memory_agent.db import (
     get_memory,
@@ -453,26 +452,6 @@ def _diff(old: str, new: str) -> str:
         tofile="new",
         lineterm="",
     ))
-
-
-def _audit(
-    *,
-    action: str,
-    target_slug: str | None,
-    reason: str,
-    backup_path: str | None = None,
-    details: dict[str, Any] | None = None,
-) -> None:
-    session_service._record_audit(
-        action=action,
-        target_slug=target_slug,
-        source_session_id=None,
-        cycle_no=None,
-        reason=reason,
-        backup_path=backup_path,
-        details=details or {},
-    )
-    session_service.conn.commit()
 
 
 async def _reply(session_id: str, message: str) -> AgentResponse:
@@ -1054,39 +1033,8 @@ def rollback_audit(audit_id: str):
             mutation = result.to_dict()
             mutation["details"]["rolled_back_event"] = audit_id
             return {"ok": True, "mutation": mutation, "memory": read_memory_full(result.target_slug)}
-    elif backup:
-        # 旧格式：从 .history 文件恢复（兼容遗留数据）
-        backup_path = Path(backup)
-        if backup_path.exists():
-            content = backup_path.read_text(encoding="utf-8")
-            import re
-            content = re.sub(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", content).strip()
-            result = replace_memory_result(
-                slug=slug,
-                description=f"rollback from audit {audit_id}",
-                body=content,
-                reason=f"rollback audit {audit_id} from file",
-                audit_action="rollback_restore",
-                details={"rolled_back_event": audit_id, "restored_from": str(backup_path)},
-            )
-            if not result.ok:
-                restored_record = upsert_memory(
-                    slug=slug,
-                    description=f"rollback from audit {audit_id}",
-                    content=content,
-                )
-                restored = restored_record["slug"]
-                _audit(
-                    action="rollback_restore",
-                    target_slug=restored,
-                    reason=f"Rollback audit event {audit_id}",
-                    backup_path=str(backup_path),
-                    details={"rolled_back_event": audit_id, "restored_from": str(backup_path)},
-                )
-                return {"ok": True, "memory": read_memory_full(restored)}
-            return {"ok": True, "mutation": result.to_dict(), "memory": read_memory_full(slug)}
 
-    raise HTTPException(status_code=400, detail="no restorable backup found")
+    raise HTTPException(status_code=400, detail="no restorable version snapshot found")
 
 
 @app.get("/api/prompts")

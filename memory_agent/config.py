@@ -109,19 +109,6 @@ PRIORITY_TIERS = {
     },
 }
 
-# ── 前端模板 ──
-MEMORY_FRONTMATTER_TEMPLATE = """---
-name: {slug}
-description: {description}
-metadata:
-  type: {mem_type}
-  priority: {priority}
-  event_date: {event_date}
-  recorded_date: {recorded_date}
-  hash: {content_hash}
----
-"""
-
 # ── Hash 去重 ──
 HASH_ALGORITHM = "md5"  # 速度优先，不涉及安全场景
 

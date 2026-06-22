@@ -1,16 +1,9 @@
 """
-memory_agent/db.py — SQLite 统一存储层（与会话层共用 sessions.db）
+SQLite storage for long-term memory.
 
-Schema 包含：
-- memories        — 记忆主表（取代 memory/*.md 作为真源）
-- memory_chunks   — 分块文本 + 向量 BLOB（为 Phase 2 预留）
-- memories_fts    — FTS5 关键词检索（回退通道）
-- memory_pending_actions — 待确认淘汰动作（为 Phase 5 预留）
-
-数据流：
-  写入：extract_and_save / consolidate → db.upsert_memory()
-  读取：db.get_memory() / db.search_memories()
-  检索：Phase 3 前用 FTS5 回退；Phase 3 后用向量混合检索
+The source of truth is selfecho_data/sessions.db. Markdown files under
+memory/ are legacy/export caches only; runtime writes must go through this
+module so versions, audit events, FTS, and vector chunks stay in sync.
 """
 
 from __future__ import annotations
@@ -1066,103 +1059,13 @@ def _chunk_text(text: str, max_chars: int = 500) -> list[str]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 迁移：从 Markdown 文件导入
+# Hash helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _simple_hash(text: str) -> str:
     """轻量 hash（非加密，仅去重）。"""
     import hashlib
     return hashlib.md5(text.encode("utf-8")).hexdigest()
-
-
-def _parse_frontmatter(text: str) -> dict[str, str]:
-    """解析 YAML frontmatter（仅 key: value 行，不处理嵌套）。"""
-    import re
-    result: dict[str, str] = {}
-    match = re.match(r"^---\r?\n([\s\S]*?)\r?\n---\r?\n?", text)
-    if not match:
-        return result
-    fm = match.group(1)
-    for line in fm.splitlines():
-        m = re.match(r"^\s*(\w+)\s*:\s*(.+)$", line)
-        if m:
-            result[m.group(1)] = m.group(2).strip()
-    return result
-
-
-def _strip_frontmatter(text: str) -> str:
-    """去掉 YAML frontmatter，只返回正文。"""
-    import re
-    return re.sub(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", text).strip()
-
-
-def migrate_from_markdown() -> dict[str, Any]:
-    """
-    将 memory/*.md 中所有记忆一次性迁移到 SQLite。
-
-    幂等：已存在相同 hash 的记录跳过，不会重复导入。
-    迁移完成后可安全停掉 Markdown 同步写入。
-    """
-    from pathlib import Path as _Path
-    from .config import MEMORY_DIR as _MEMORY_DIR
-
-    conn = connect()
-    imported = 0
-    skipped = 0
-    errors: list[str] = []
-
-    for f in sorted(_MEMORY_DIR.glob("*.md")):
-        if f.name == "MEMORY.md":
-            continue
-
-        try:
-            text = f.read_text(encoding="utf-8")
-        except Exception as e:
-            errors.append(f"{f.name}: read error: {e}")
-            continue
-
-        fm = _parse_frontmatter(text)
-        body = _strip_frontmatter(text)
-        if not body:
-            continue
-
-        slug = fm.get("name", f.stem)
-        content_hash = _simple_hash(body)
-
-        # 检查是否已导入（按 hash 去重）
-        existing = conn.execute(
-            "SELECT id FROM memories WHERE content_hash = ?", (content_hash,)
-        ).fetchone()
-        if existing:
-            skipped += 1
-            continue
-
-        try:
-            upsert_memory(
-                slug=slug,
-                description=fm.get("description", slug)[:200],
-                content=body,
-                mem_type=_valid_type(fm.get("type", "user")),
-                priority=_valid_priority(fm.get("priority", "normal")),
-                event_date=fm.get("event_date", None),
-                content_hash=content_hash,
-            )
-            imported += 1
-        except Exception as e:
-            errors.append(f"{f.name}: import error: {e}")
-
-    if errors:
-        import logging
-        logging.getLogger("memory_agent.db").warning(
-            "Migration errors: %s", "; ".join(errors)
-        )
-
-    return {
-        "imported": imported,
-        "skipped": skipped,
-        "errors": errors,
-        "total": imported + skipped,
-    }
 
 
 def count_memories_by_priority() -> dict[str, int]:
@@ -1680,8 +1583,8 @@ def read_history(slug: str, version: str) -> str | None:
 
 
 def rebuild_index() -> None:
-    """重建 MEMORY.md 索引缓存（写 Markdown 文件，保持兼容）。"""
-    from .config import MEMORY_DIR, MEMORY_INDEX
+    """Export a readable MEMORY.md cache from the SQLite memory store."""
+    from .config import MEMORY_INDEX
 
     MEMORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
     memories = list_memories_compat()

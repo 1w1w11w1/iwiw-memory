@@ -109,12 +109,12 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_index_stats",
-            description="获取记忆库统计信息：文件数量、类型分布、总大小。",
+            description="获取 SQLite 记忆库统计信息：条目数量、类型分布、总大小。",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="rebuild_memory_index",
-            description="根据 memory/*.md frontmatter 重建 MEMORY.md 分层索引。",
+            description="从 SQLite 记忆库导出 memory/MEMORY.md 可读索引缓存。",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
@@ -196,6 +196,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(
             type="text",
             text=json.dumps({
+                "total_memories": len(mems),
                 "total_files": len(mems),
                 "total_size_bytes": total_size,
                 "total_size_kb": round(total_size / 1024, 1),
@@ -206,7 +207,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     elif name == "rebuild_memory_index":
         rebuild_index()
-        return [TextContent(type="text", text="MEMORY.md rebuilt.")]
+        return [TextContent(type="text", text="MEMORY.md cache exported from SQLite.")]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
