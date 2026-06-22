@@ -116,8 +116,9 @@ def hybrid_search(
                 continue
             if slug not in fts_scores:
                 fts_scores[slug] = []
-            # FTS5 不返回分数，使用 rank 倒数作为近似分数
-            fts_scores[slug].append(1.0)
+            # FTS5 不返回稳定分数。substring fallback 是明确词面命中，
+            # 在中文分词缺失时应略强于普通 FTS 兜底。
+            fts_scores[slug].append(1.8 if r.get("fallback") == "like" else 1.0)
 
     if not vector_scores and not fts_scores:
         return []

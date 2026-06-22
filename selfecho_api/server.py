@@ -19,24 +19,22 @@ from pydantic import BaseModel
 from starlette.responses import FileResponse, StreamingResponse
 
 from memory_agent.db import (
-    archive_memory_by_slug as archive_memory,
-    delete_memory_compat as delete_memory_file,
+    archive_memory_result,
+    delete_memory_result,
     list_history,
     list_memories_compat as list_memories,
-    merge_memories as merge_memory_files,
+    merge_memories_result,
     read_history,
-    read_memory,
     read_memory_full,
     rebuild_index,
-    replace_memory,
-    restore_memory_from_history,
+    replace_memory_result,
+    restore_memory_from_history_result,
     upsert_memory,
 )
 from memory_agent.db import (
     get_memory,
-    list_memories as db_list_memories,
     list_pending_actions,
-    approve_pending_action,
+    approve_pending_action_result,
     reject_pending_action,
     get_stats,
 )
@@ -455,11 +453,6 @@ def _diff(old: str, new: str) -> str:
         tofile="new",
         lineterm="",
     ))
-
-
-def _latest_backup(slug: str) -> str | None:
-    history = list_history(slug)
-    return history[0]["path"] if history else None
 
 
 def _audit(
@@ -956,7 +949,7 @@ def edit_memory(slug: str, req: MemoryEditRequest):
     old = read_memory_full(slug)
     if not old:
         raise HTTPException(status_code=404, detail="memory not found")
-    path = replace_memory(
+    result = replace_memory_result(
         slug=slug,
         description=req.description,
         body=req.body,
@@ -964,35 +957,39 @@ def edit_memory(slug: str, req: MemoryEditRequest):
         priority=req.priority,
         event_date=req.event_date,
         reason=req.reason,
-    )
-    _audit(
-        action="manual_edit",
-        target_slug=slug,
-        reason=req.reason,
-        backup_path=_latest_backup(slug),
+        audit_action="manual_edit",
         details={"priority": req.priority, "type": req.mem_type},
     )
-    return {"ok": True, "path": str(path) if path else None, "diff": _diff(old["body"], req.body), "memory": read_memory_full(slug)}
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {
+        "ok": True,
+        "mutation": result.to_dict(),
+        "diff": _diff(old["body"], req.body),
+        "memory": read_memory_full(slug),
+    }
 
 
 @app.post("/api/memories/{slug}/archive")
 def archive_memory_api(slug: str):
-    path = archive_memory(slug)
-    _audit(action="archive", target_slug=slug, reason="GUI archive", backup_path=_latest_backup(slug))
-    return {"ok": bool(path), "memory": read_memory_full(slug)}
+    result = archive_memory_result(slug, reason="GUI archive", audit_action="archive")
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"ok": True, "mutation": result.to_dict(), "memory": read_memory_full(slug)}
 
 
 @app.delete("/api/memories/{slug}")
 def delete_memory_api(slug: str):
-    path = delete_memory_file(slug)
-    _audit(action="delete", target_slug=slug, reason="GUI delete", backup_path=_latest_backup(slug))
-    return {"ok": bool(path), "deleted": slug}
+    result = delete_memory_result(slug, reason="GUI delete", audit_action="delete")
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"ok": True, "mutation": result.to_dict(), "deleted": slug}
 
 
 @app.post("/api/memories/merge")
 def merge_memory_api(req: MemoryMergeRequest):
     old_target = read_memory_full(req.target_slug)
-    path = merge_memory_files(
+    result = merge_memories_result(
         target_slug=req.target_slug,
         source_slug=req.source_slug,
         merged_body=req.merged_body,
@@ -1000,17 +997,16 @@ def merge_memory_api(req: MemoryMergeRequest):
         priority=req.priority,
         mem_type=req.mem_type,
     )
-    _audit(
-        action="merge",
-        target_slug=req.target_slug,
-        reason=f"GUI merge from {req.source_slug}",
-        backup_path=_latest_backup(req.target_slug),
-        details={
-            "source_slug": req.source_slug,
-            "target_diff": _diff(old_target["body"], req.merged_body) if old_target else "",
-        },
-    )
-    return {"ok": bool(path), "target": read_memory_full(req.target_slug), "source": read_memory_full(req.source_slug)}
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    mutation = result.to_dict()
+    mutation["details"]["target_diff"] = _diff(old_target["body"], req.merged_body) if old_target else ""
+    return {
+        "ok": True,
+        "mutation": mutation,
+        "target": read_memory_full(req.target_slug),
+        "source": read_memory_full(req.source_slug),
+    }
 
 
 @app.post("/api/memories/rebuild-index")
@@ -1049,20 +1045,15 @@ def rollback_audit(audit_id: str):
     # 优先从 memory_versions 表恢复
     if backup and backup.startswith("version://"):
         version_id = backup.replace("version://", "")
-        restored = restore_memory_from_history(
+        result = restore_memory_from_history_result(
             slug,
             version_id,
             reason=f"rollback audit {audit_id}",
         )
-        if restored:
-            _audit(
-                action="rollback",
-                target_slug=restored,
-                reason=f"Rollback audit event {audit_id}",
-                backup_path=backup,
-                details={"rolled_back_event": audit_id},
-            )
-            return {"ok": True, "memory": read_memory_full(restored)}
+        if result.ok and result.target_slug:
+            mutation = result.to_dict()
+            mutation["details"]["rolled_back_event"] = audit_id
+            return {"ok": True, "mutation": mutation, "memory": read_memory_full(result.target_slug)}
     elif backup:
         # 旧格式：从 .history 文件恢复（兼容遗留数据）
         backup_path = Path(backup)
@@ -1070,27 +1061,30 @@ def rollback_audit(audit_id: str):
             content = backup_path.read_text(encoding="utf-8")
             import re
             content = re.sub(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", content).strip()
-            restored = replace_memory(
+            result = replace_memory_result(
                 slug=slug,
                 description=f"rollback from audit {audit_id}",
                 body=content,
                 reason=f"rollback audit {audit_id} from file",
+                audit_action="rollback_restore",
+                details={"rolled_back_event": audit_id, "restored_from": str(backup_path)},
             )
-            if not restored:
+            if not result.ok:
                 restored_record = upsert_memory(
                     slug=slug,
                     description=f"rollback from audit {audit_id}",
                     content=content,
                 )
                 restored = restored_record["slug"]
-            _audit(
-                action="rollback",
-                target_slug=restored,
-                reason=f"Rollback audit event {audit_id}",
-                backup_path=str(backup_path),
-                details={"rolled_back_event": audit_id},
-            )
-            return {"ok": True, "memory": read_memory_full(restored)}
+                _audit(
+                    action="rollback_restore",
+                    target_slug=restored,
+                    reason=f"Rollback audit event {audit_id}",
+                    backup_path=str(backup_path),
+                    details={"rolled_back_event": audit_id, "restored_from": str(backup_path)},
+                )
+                return {"ok": True, "memory": read_memory_full(restored)}
+            return {"ok": True, "mutation": result.to_dict(), "memory": read_memory_full(slug)}
 
     raise HTTPException(status_code=400, detail="no restorable backup found")
 
@@ -1128,8 +1122,10 @@ def memory_pending():
 
 @app.post("/api/memory/pending-actions/{pending_id}/approve")
 def memory_pending_approve(pending_id: str):
-    ok = approve_pending_action(pending_id)
-    return {"ok": ok}
+    result = approve_pending_action_result(pending_id)
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"ok": True, "mutation": result.to_dict()}
 
 
 @app.post("/api/memory/pending-actions/{pending_id}/reject")

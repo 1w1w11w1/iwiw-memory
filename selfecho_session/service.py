@@ -827,13 +827,30 @@ class SessionMemoryService:
         self.conn.commit()
         return {"ok": True, "sessions": imported_sessions, "messages": imported_messages}
 
+def _trigger_context(session_id: str, limit: int = 8) -> str:
+    try:
+        service = SessionMemoryService()
+        messages = service.get_messages(session_id, limit=limit)
+    except Exception:
+        return f"source_session_id={session_id}"
+    lines = [f"source_session_id={session_id}", "## 最近会话上下文"]
+    for item in messages:
+        if item.get("private"):
+            continue
+        role = item.get("role", "unknown")
+        content = " ".join(str(item.get("content") or "").split())
+        if content:
+            lines.append(f"[{role}]: {content[:500]}")
+    return "\n".join(lines)
+
+
 def _trigger_extract(session_id: str, message: str) -> None:
     """后台线程执行实时提取。"""
     import asyncio
     import logging
     logger = logging.getLogger("selfecho_session.trigger")
     try:
-        asyncio.run(extract_and_save(message, context=f"source_session_id={session_id}"))
+        asyncio.run(extract_and_save(message, context=_trigger_context(session_id)))
         logger.info("Real-time extraction triggered: %s", message[:60])
     except Exception as e:
         logger.warning("Trigger extraction failed: %s", e)

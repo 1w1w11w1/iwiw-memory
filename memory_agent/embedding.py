@@ -18,8 +18,11 @@ import os
 import numpy as np
 from typing import Any
 
-os.environ.setdefault('HF_HUB_DISABLE_SSL_VERIFICATION', '1')
-os.environ.setdefault('HF_HUB_OFFLINE', '1')
+if os.environ.get("MEMORY_AGENT_HF_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+if os.environ.get("MEMORY_AGENT_HF_DISABLE_SSL_VERIFICATION", "").strip().lower() in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
 
 from .config import EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, EMBEDDING_DEVICE, EMBEDDING_BATCH_SIZE
 
@@ -34,6 +37,7 @@ def _load_model() -> Any:
     加载 sentence-transformers 模型。
 
     首次加载会下载模型（~33MB），之后从缓存读取。
+    如需强制离线，设置 MEMORY_AGENT_HF_OFFLINE=1。
     缓存目录：~/.cache/huggingface/hub/
     """
     global _model

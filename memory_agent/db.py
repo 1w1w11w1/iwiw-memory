@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,18 @@ CREATE TABLE IF NOT EXISTS memory_versions (
     event_date      TEXT,
     saved_at        TEXT NOT NULL,
     reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS memory_audit (
+    id                TEXT PRIMARY KEY,
+    ts                TEXT NOT NULL,
+    action            TEXT NOT NULL,
+    target_slug       TEXT,
+    source_session_id TEXT,
+    cycle_no          INTEGER,
+    reason            TEXT,
+    backup_path       TEXT,
+    details           TEXT NOT NULL DEFAULT '{}'
 );
 
 """
@@ -231,6 +244,32 @@ def _rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+@dataclass
+class MemoryMutationResult:
+    ok: bool
+    action: str
+    target_slug: str | None = None
+    changed_rows: int = 0
+    version_id: str | None = None
+    audit_id: str | None = None
+    backup_path: str | None = None
+    error: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "action": self.action,
+            "target_slug": self.target_slug,
+            "changed_rows": self.changed_rows,
+            "version_id": self.version_id,
+            "audit_id": self.audit_id,
+            "backup_path": self.backup_path,
+            "error": self.error,
+            "details": self.details,
+        }
+
+
 def _valid_priority(p: str) -> str:
     return p if p in {"core", "important", "normal", "archive"} else "normal"
 
@@ -275,8 +314,8 @@ def upsert_memory(
             # 内容无变化，跳过
             return dict(existing)
 
-        _save_version(existing["id"], reason="upsert append")
-        conn.execute(
+        backup_path = _save_version(existing["id"], reason="upsert append", commit=False)
+        cur = conn.execute(
             """
             UPDATE memories
             SET content = ?, content_hash = ?, description = ?,
@@ -287,6 +326,17 @@ def upsert_memory(
             (new_body, new_hash, description.strip()[:200],
              priority, mem_type, event_date, now, existing["id"]),
         )
+        audit_id = _record_audit(
+            action="upsert_append",
+            target_slug=slug,
+            reason="append extracted memory",
+            backup_path=backup_path,
+            details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
+            commit=False,
+        )
+        if not backup_path or not audit_id or cur.rowcount <= 0:
+            conn.rollback()
+            return dict(existing)
         conn.commit()
         refresh_memory_vectors(existing["id"])
         # 获取更新后的记录
@@ -299,7 +349,7 @@ def upsert_memory(
     mem_id = str(uuid.uuid4())
     new_hash = content_hash or _simple_hash(content)
 
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO memories
             (id, slug, description, content, mem_type, priority,
@@ -311,6 +361,16 @@ def upsert_memory(
          event_date, now, new_hash,
          now, now, json.dumps(metadata or {}, ensure_ascii=False)),
     )
+    audit_id = _record_audit(
+        action="create",
+        target_slug=slug,
+        reason="create extracted memory",
+        details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
+        commit=False,
+    )
+    if not audit_id or cur.rowcount <= 0:
+        conn.rollback()
+        raise RuntimeError("memory create audit failed")
     conn.commit()
     refresh_memory_vectors(mem_id)
 
@@ -361,18 +421,66 @@ def list_memories(
     return [dict(r) for r in conn.execute(sql, params)]
 
 
+def delete_memory_result(
+    slug: str,
+    *,
+    save_version: bool = True,
+    reason: str = "delete",
+    audit_action: str = "delete",
+    session_id: str | None = None,
+    cycle_no: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> MemoryMutationResult:
+    """Delete a memory through the audited mutation path."""
+    conn = connect()
+    old = get_memory(slug)
+    if not old:
+        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
+    try:
+        backup_path = None
+        if save_version:
+            backup_path = _save_version(old["id"], reason=reason, commit=False)
+            if not backup_path:
+                conn.rollback()
+                return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
+        cur = conn.execute("DELETE FROM memories WHERE slug = ?", (slug,))
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, error="no rows changed")
+        audit_details = {"changed_rows": changed_rows, **(details or {})}
+        audit_id = _record_audit(
+            action=audit_action,
+            target_slug=slug,
+            reason=reason,
+            backup_path=backup_path,
+            session_id=session_id,
+            cycle_no=cycle_no,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
+        conn.commit()
+        return MemoryMutationResult(
+            True,
+            audit_action,
+            slug,
+            changed_rows=changed_rows,
+            version_id=backup_path,
+            audit_id=audit_id,
+            backup_path=backup_path,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
+
+
 def delete_memory(slug: str, *, save_version: bool = True) -> bool:
     """删除一条记忆，默认先保存可恢复快照。"""
-    conn = connect()
-    if save_version:
-        old = get_memory(slug)
-        if not old:
-            return False
-        if not _save_version(old["id"], reason="delete"):
-            return False
-    cur = conn.execute("DELETE FROM memories WHERE slug = ?", (slug,))
-    conn.commit()
-    return cur.rowcount > 0
+    return delete_memory_result(slug, save_version=save_version).ok
 
 
 def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
@@ -483,8 +591,9 @@ def _record_audit(
     session_id: str | None = None,
     cycle_no: int | None = None,
     details: dict[str, Any] | None = None,
+    commit: bool = True,
 ) -> str | None:
-    """Best-effort audit write into the shared session DB."""
+    """Write an audit event and return its id."""
     audit_id = str(uuid.uuid4())
     try:
         conn = connect()
@@ -506,32 +615,33 @@ def _record_audit(
                 json.dumps(details or {}, ensure_ascii=False),
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     except sqlite3.OperationalError:
         return None
     return audit_id
 
 
-def approve_pending_action(pending_id: str) -> bool:
-    """确认执行待确认动作。"""
+def approve_pending_action_result(pending_id: str) -> MemoryMutationResult:
+    """确认执行待确认动作，并返回版本、审计和改动行数。"""
     conn = connect()
     row = conn.execute(
         "SELECT * FROM memory_pending_actions WHERE id = ? AND status = 'pending'",
         (pending_id,),
     ).fetchone()
     if not row:
-        return False
+        return MemoryMutationResult(False, "pending_approve", error="pending action not found")
 
     action = row['action']
     target_id = row['target_memory_id']
     if action == "merge":
-        return False
+        return MemoryMutationResult(False, "pending_merge", error="pending merge is not executable")
     if not target_id:
-        return False
+        return MemoryMutationResult(False, f"pending_{action}", error="pending action has no target")
 
     target = conn.execute("SELECT * FROM memories WHERE id = ?", (target_id,)).fetchone()
     if not target:
-        return False
+        return MemoryMutationResult(False, f"pending_{action}", error="target memory not found")
 
     details = {}
     try:
@@ -539,54 +649,82 @@ def approve_pending_action(pending_id: str) -> bool:
     except json.JSONDecodeError:
         details = {}
 
-    backup_path = _save_version(target_id, reason=f"pending {action}: {row['reason'] or ''}".strip())
-    if not backup_path:
-        return False
+    mutation_action = f"pending_{action}"
+    try:
+        backup_path = _save_version(target_id, reason=f"pending {action}: {row['reason'] or ''}".strip(), commit=False)
+        if not backup_path:
+            conn.rollback()
+            return MemoryMutationResult(False, mutation_action, target["slug"], error="version snapshot failed")
 
-    changed_rows = 0
-    if action == 'archive':
-        cur = conn.execute(
-            'UPDATE memories SET priority = "archive", updated_at = ? WHERE id = ?',
-            (_now(), target_id),
+        changed_rows = 0
+        if action == 'archive':
+            cur = conn.execute(
+                'UPDATE memories SET priority = "archive", updated_at = ? WHERE id = ?',
+                (_now(), target_id),
+            )
+            changed_rows = cur.rowcount
+        elif action == 'delete':
+            cur = conn.execute('DELETE FROM memories WHERE id = ?', (target_id,))
+            changed_rows = cur.rowcount
+        elif action == 'downgrade':
+            next_priority = _valid_priority(str(details.get("priority") or "normal"))
+            if next_priority == "archive":
+                next_priority = "normal"
+            cur = conn.execute(
+                'UPDATE memories SET priority = ?, updated_at = ? WHERE id = ?',
+                (next_priority, _now(), target_id),
+            )
+            changed_rows = cur.rowcount
+        else:
+            conn.rollback()
+            return MemoryMutationResult(False, mutation_action, target["slug"], backup_path=backup_path, error="unsupported pending action")
+
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, mutation_action, target["slug"], changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
+
+        audit_details = {"pending_id": pending_id, "changed_rows": changed_rows, "details": details}
+        audit_id = _record_audit(
+            action=mutation_action,
+            target_slug=target["slug"],
+            reason=row["reason"] or f"approve pending {action}",
+            backup_path=backup_path,
+            session_id=row["session_id"],
+            cycle_no=row["cycle_no"],
+            details=audit_details,
+            commit=False,
         )
-        changed_rows = cur.rowcount
-    elif action == 'delete':
-        cur = conn.execute('DELETE FROM memories WHERE id = ?', (target_id,))
-        changed_rows = cur.rowcount
-    elif action == 'downgrade':
-        next_priority = _valid_priority(str(details.get("priority") or "normal"))
-        if next_priority == "archive":
-            next_priority = "normal"
-        cur = conn.execute(
-            'UPDATE memories SET priority = ?, updated_at = ? WHERE id = ?',
-            (next_priority, _now(), target_id),
-        )
-        changed_rows = cur.rowcount
-    else:
-        return False
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, mutation_action, target["slug"], changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
 
-    if changed_rows <= 0:
-        return False
-
-    audit_id = _record_audit(
-        action=f"pending_{action}",
-        target_slug=target["slug"],
-        reason=row["reason"] or f"approve pending {action}",
-        backup_path=backup_path,
-        session_id=row["session_id"],
-        cycle_no=row["cycle_no"],
-        details={"pending_id": pending_id, "changed_rows": changed_rows, "details": details},
-    )
-    details["backup_path"] = backup_path
-    if audit_id:
+        details["backup_path"] = backup_path
+        details["version_id"] = backup_path
         details["audit_id"] = audit_id
+        details["changed_rows"] = changed_rows
+        conn.execute(
+            'UPDATE memory_pending_actions SET status = "executed", details = ? WHERE id = ?',
+            (json.dumps(details, ensure_ascii=False), pending_id),
+        )
+        conn.commit()
+        return MemoryMutationResult(
+            True,
+            mutation_action,
+            target["slug"],
+            changed_rows=changed_rows,
+            version_id=backup_path,
+            audit_id=audit_id,
+            backup_path=backup_path,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, mutation_action, target["slug"], error=str(exc))
 
-    conn.execute(
-        'UPDATE memory_pending_actions SET status = "executed", details = ? WHERE id = ?',
-        (json.dumps(details, ensure_ascii=False), pending_id),
-    )
-    conn.commit()
-    return True
+
+def approve_pending_action(pending_id: str) -> bool:
+    """确认执行待确认动作。"""
+    return approve_pending_action_result(pending_id).ok
 
 
 def reject_pending_action(pending_id: str) -> bool:
@@ -668,10 +806,92 @@ def search_fts(query: str, limit: int = 10) -> list[dict[str, Any]]:
             LIMIT ?
             """,
             (fts_query, limit),
-        )
-        return [dict(r) for r in rows]
-    except sqlite3.OperationalError as e:
-        return [{"error": f"FTS query error: {e}"}]
+        ).fetchall()
+        results = [dict(r) for r in rows]
+        if results:
+            return results
+    except sqlite3.OperationalError:
+        pass
+    return _search_like(query, limit=limit)
+
+
+def _search_like(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Substring fallback for CJK terms when FTS tokenization misses them."""
+    tokens = _fallback_query_tokens(query)
+    if not tokens:
+        return []
+    conn = connect()
+    rows = conn.execute(
+        "SELECT id, slug, description, priority, mem_type, content, updated_at FROM memories"
+    ).fetchall()
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for row in rows:
+        content = row["content"] or ""
+        description = row["description"] or ""
+        haystack = f"{description}\n{content}".lower()
+        score = sum(1 for token in tokens if token.lower() in haystack)
+        if score <= 0:
+            continue
+        scored.append((
+            score,
+            row["updated_at"] or "",
+            {
+                "id": row["id"],
+                "slug": row["slug"],
+                "description": description,
+                "priority": row["priority"],
+                "mem_type": row["mem_type"],
+                "snippet": _make_snippet(content, tokens),
+                "fallback": "like",
+            },
+        ))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item for _, __, item in scored[:limit]]
+
+
+def _fallback_query_tokens(query: str) -> list[str]:
+    stop_tokens = {
+        "什么", "是什", "怎么", "如何", "为什", "为什么", "这个", "那个",
+        "这些", "那些", "我们", "你们", "他们", "用户", "最近", "之前",
+        "觉得", "知道", "记得", "有没有",
+    }
+    tokens: list[str] = []
+    for raw in query.replace('"', " ").replace("*", " ").split():
+        token = raw.strip().strip("，。！？；：,.!?;:")
+        if len(token) < 2 or token in stop_tokens:
+            continue
+        tokens.append(token)
+        if any("一" <= c <= "鿿" for c in token) and len(token) >= 4:
+            tokens.extend(
+                token[i:i + 2]
+                for i in range(len(token) - 1)
+                if token[i:i + 2] not in stop_tokens
+            )
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            deduped.append(token)
+    return deduped[:12]
+
+
+def _make_snippet(content: str, tokens: list[str], radius: int = 80) -> str:
+    lower = content.lower()
+    hit_at = -1
+    hit_token = ""
+    for token in tokens:
+        hit_at = lower.find(token.lower())
+        if hit_at >= 0:
+            hit_token = token
+            break
+    if hit_at < 0:
+        return content[: radius * 2]
+    start = max(hit_at - radius, 0)
+    end = min(hit_at + len(hit_token) + radius, len(content))
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(content) else ""
+    return f"{prefix}{content[start:end]}{suffix}"
 
 
 def touch_memory(slug: str) -> None:
@@ -803,6 +1023,10 @@ def ensure_all_vectors(force: bool = False, model_version: str = "bge-small-zh-v
             (mem["id"], model_version),
         ).fetchone()[0]
         if existing > 0 and not force:
+            conn.execute(
+                "UPDATE memories SET embedding_model = COALESCE(embedding_model, ?) WHERE id = ?",
+                (model_version, mem["id"]),
+            )
             skipped += 1; continue
 
         chunks = _chunk_text(mem["content"])
@@ -817,6 +1041,10 @@ def ensure_all_vectors(force: bool = False, model_version: str = "bge-small-zh-v
                 "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
                 (mem["id"], idx, chunk, np.array(vec, dtype=np.float32).tobytes(), model_version),
             )
+        conn.execute(
+            "UPDATE memories SET embedding_model = ? WHERE id = ?",
+            (model_version, mem["id"]),
+        )
         processed += 1
     conn.commit()
     return {"processed": processed, "skipped": skipped, "errors": errors, "total": processed + skipped}
@@ -955,7 +1183,7 @@ def count_memories_by_priority() -> dict[str, int]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _save_version(memory_id: str, reason: str = "") -> str | None:
+def _save_version(memory_id: str, reason: str = "", *, commit: bool = True) -> str | None:
     """保存记忆当前快照到 memory_versions 表。"""
     conn = connect()
     row = conn.execute(
@@ -972,7 +1200,8 @@ def _save_version(memory_id: str, reason: str = "") -> str | None:
          row["mem_type"], row["priority"], row["event_date"],
          _now(), reason),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return f"version://{cursor.lastrowid}"
 
 
@@ -1028,6 +1257,76 @@ def list_memories_compat(
     ]
 
 
+def replace_memory_result(
+    *,
+    slug: str,
+    description: str,
+    body: str,
+    mem_type: str = "user",
+    priority: str = "normal",
+    event_date: str | None = None,
+    reason: str = "",
+    audit_action: str = "manual_edit",
+    details: dict[str, Any] | None = None,
+) -> MemoryMutationResult:
+    """覆盖写入记忆，并返回审计结果。"""
+    old = get_memory(slug)
+    if not old:
+        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
+
+    conn = connect()
+    now = _now()
+    priority = _valid_priority(priority)
+    mem_type = _valid_type(mem_type)
+    content_hash = _simple_hash(body)
+
+    try:
+        backup_path = _save_version(old["id"], reason=reason or "edit", commit=False)
+        if not backup_path:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
+        cur = conn.execute(
+            """UPDATE memories
+               SET content = ?, description = ?, mem_type = ?, priority = ?,
+                   event_date = COALESCE(?, event_date),
+                   content_hash = ?, updated_at = ?
+               WHERE slug = ?""",
+            (body, description.strip()[:200], mem_type, priority,
+             event_date, content_hash, now, slug),
+        )
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
+        audit_details = {"changed_rows": changed_rows, **(details or {})}
+        audit_id = _record_audit(
+            action=audit_action,
+            target_slug=slug,
+            reason=reason or audit_action,
+            backup_path=backup_path,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
+        conn.commit()
+        refresh_memory_vectors(old["id"])
+        return MemoryMutationResult(
+            True,
+            audit_action,
+            slug,
+            changed_rows=changed_rows,
+            version_id=backup_path,
+            audit_id=audit_id,
+            backup_path=backup_path,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
+
+
 def replace_memory(
     *,
     slug: str,
@@ -1039,50 +1338,154 @@ def replace_memory(
     reason: str = "",
 ) -> str | None:
     """覆盖写入记忆（替换 content，非追加），匹配 store.replace_memory。"""
+    result = replace_memory_result(
+        slug=slug,
+        description=description,
+        body=body,
+        mem_type=mem_type,
+        priority=priority,
+        event_date=event_date,
+        reason=reason,
+    )
+    return slug if result.ok else None
+
+
+def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: str = "archive") -> MemoryMutationResult:
+    """设置 priority = 'archive'，并返回审计结果。"""
     old = get_memory(slug)
     if not old:
-        return None
-
-    _save_version(old["id"], reason=reason or "edit")
-
+        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
     conn = connect()
-    now = _now()
-    priority = _valid_priority(priority)
-    mem_type = _valid_type(mem_type)
-    content_hash = _simple_hash(body)
-
-    conn.execute(
-        """UPDATE memories
-           SET content = ?, description = ?, mem_type = ?, priority = ?,
-               event_date = COALESCE(?, event_date),
-               content_hash = ?, updated_at = ?
-           WHERE slug = ?""",
-        (body, description.strip()[:200], mem_type, priority,
-         event_date, content_hash, now, slug),
-    )
-    conn.commit()
-    refresh_memory_vectors(old["id"])
-    return slug
+    try:
+        backup_path = _save_version(old["id"], reason=reason, commit=False)
+        if not backup_path:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
+        cur = conn.execute(
+            "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
+            (_now(), slug),
+        )
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
+        audit_details = {"changed_rows": changed_rows}
+        audit_id = _record_audit(
+            action=audit_action,
+            target_slug=slug,
+            reason=reason,
+            backup_path=backup_path,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
+        conn.commit()
+        return MemoryMutationResult(
+            True,
+            audit_action,
+            slug,
+            changed_rows=changed_rows,
+            version_id=backup_path,
+            audit_id=audit_id,
+            backup_path=backup_path,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
 
 
 def archive_memory_by_slug(slug: str) -> str | None:
     """设置 priority = 'archive'，匹配 store.archive_memory。"""
-    old = get_memory(slug)
-    if not old:
-        return None
-    _save_version(old["id"], reason="archive")
-    conn = connect()
-    cur = conn.execute(
-        "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
-        (_now(), slug),
-    )
-    conn.commit()
-    return slug if cur.rowcount > 0 else None
+    return slug if archive_memory_result(slug).ok else None
 
 
 def delete_memory_compat(slug: str) -> str | None:
     """删除记忆，保存快照后删除，匹配 store.delete_memory_file。"""
     return slug if delete_memory(slug) else None
+
+
+def merge_memories_result(
+    target_slug: str,
+    source_slug: str,
+    merged_body: str,
+    description: str,
+    priority: str | None = None,
+    mem_type: str | None = None,
+    archive_source: bool = True,
+) -> MemoryMutationResult:
+    """合并两条记忆，并返回审计结果。"""
+    target = get_memory(target_slug)
+    source = get_memory(source_slug)
+    if not target or not source:
+        return MemoryMutationResult(False, "merge", target_slug, error="target or source memory not found")
+
+    new_priority = _valid_priority(priority or target.get("priority", "normal"))
+    new_type = _valid_type(mem_type or target.get("mem_type", "user"))
+    conn = connect()
+    now = _now()
+    content_hash = _simple_hash(merged_body)
+    try:
+        target_backup = _save_version(target["id"], reason=f"merge from {source_slug}", commit=False)
+        source_backup = _save_version(source["id"], reason=f"merge into {target_slug}", commit=False)
+        if not target_backup or not source_backup:
+            conn.rollback()
+            return MemoryMutationResult(False, "merge", target_slug, error="version snapshot failed")
+        target_cur = conn.execute(
+            """UPDATE memories
+               SET content = ?, description = ?, mem_type = ?, priority = ?,
+                   content_hash = ?, updated_at = ?
+               WHERE slug = ?""",
+            (merged_body, description.strip()[:200], new_type, new_priority,
+             content_hash, now, target_slug),
+        )
+        changed_rows = target_cur.rowcount
+        source_rows = 0
+        if archive_source:
+            source_cur = conn.execute(
+                "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
+                (now, source_slug),
+            )
+            source_rows = source_cur.rowcount
+        changed_rows += source_rows
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, "merge", target_slug, changed_rows=changed_rows, backup_path=target_backup, error="no rows changed")
+        audit_details = {
+            "changed_rows": changed_rows,
+            "source_slug": source_slug,
+            "target_version_id": target_backup,
+            "source_version_id": source_backup,
+            "source_archived": archive_source,
+        }
+        audit_id = _record_audit(
+            action="merge",
+            target_slug=target_slug,
+            reason=f"merge from {source_slug}",
+            backup_path=target_backup,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, "merge", target_slug, changed_rows=changed_rows, backup_path=target_backup, error="audit write failed")
+        conn.commit()
+        refresh_memory_vectors(target["id"])
+        return MemoryMutationResult(
+            True,
+            "merge",
+            target_slug,
+            changed_rows=changed_rows,
+            version_id=target_backup,
+            audit_id=audit_id,
+            backup_path=target_backup,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, "merge", target_slug, error=str(exc))
 
 
 def merge_memories(
@@ -1095,35 +1498,16 @@ def merge_memories(
     archive_source: bool = True,
 ) -> str | None:
     """合并两条记忆，匹配 store.merge_memory_files。"""
-    target = get_memory(target_slug)
-    source = get_memory(source_slug)
-    if not target or not source:
-        return None
-
-    _save_version(target["id"], reason=f"merge from {source_slug}")
-    _save_version(source["id"], reason=f"merge into {target_slug}")
-
-    new_priority = _valid_priority(priority or target.get("priority", "normal"))
-    new_type = _valid_type(mem_type or target.get("mem_type", "user"))
-    conn = connect()
-    now = _now()
-    content_hash = _simple_hash(merged_body)
-    conn.execute(
-        """UPDATE memories
-           SET content = ?, description = ?, mem_type = ?, priority = ?,
-               content_hash = ?, updated_at = ?
-           WHERE slug = ?""",
-        (merged_body, description.strip()[:200], new_type, new_priority,
-         content_hash, now, target_slug),
+    result = merge_memories_result(
+        target_slug,
+        source_slug,
+        merged_body,
+        description,
+        priority=priority,
+        mem_type=mem_type,
+        archive_source=archive_source,
     )
-    if archive_source:
-        conn.execute(
-            "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
-            (now, source_slug),
-        )
-    conn.commit()
-    refresh_memory_vectors(target["id"])
-    return target_slug
+    return target_slug if result.ok else None
 
 
 def list_history(slug: str) -> list[dict[str, Any]]:
@@ -1185,11 +1569,11 @@ def read_history_record(slug: str, version: str) -> dict[str, Any] | None:
     return dict(row)
 
 
-def restore_memory_from_history(slug: str, version: str, reason: str = "") -> str | None:
+def restore_memory_from_history_result(slug: str, version: str, reason: str = "") -> MemoryMutationResult:
     """Restore a memory snapshot from memory_versions, recreating deleted rows."""
     record = read_history_record(slug, version)
     if not record:
-        return None
+        return MemoryMutationResult(False, "rollback_restore", slug, error="history version not found")
 
     target_slug = str(record.get("slug") or slug).strip().lower().replace(" ", "-")[:50] or "memory"
     body = record.get("content") or ""
@@ -1199,7 +1583,7 @@ def restore_memory_from_history(slug: str, version: str, reason: str = "") -> st
     event_date = record.get("event_date")
 
     if get_memory(target_slug):
-        return replace_memory(
+        return replace_memory_result(
             slug=target_slug,
             description=description,
             body=body,
@@ -1207,6 +1591,8 @@ def restore_memory_from_history(slug: str, version: str, reason: str = "") -> st
             priority=priority,
             event_date=event_date,
             reason=reason or f"restore version {version}",
+            audit_action="rollback_restore",
+            details={"restored_from": f"version://{version}"},
         )
 
     conn = connect()
@@ -1215,35 +1601,67 @@ def restore_memory_from_history(slug: str, version: str, reason: str = "") -> st
     if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
         memory_id = str(uuid.uuid4())
 
-    conn.execute(
-        """
-        INSERT INTO memories
-            (id, slug, description, content, mem_type, priority,
-             event_date, recorded_date, content_hash,
-             created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            memory_id,
-            target_slug,
-            description.strip()[:200],
-            body,
-            mem_type,
-            priority,
-            event_date,
-            now,
-            _simple_hash(body),
-            now,
-            now,
-            json.dumps(
-                {"restored_from": f"version://{version}", "restore_reason": reason},
-                ensure_ascii=False,
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO memories
+                (id, slug, description, content, mem_type, priority,
+                 event_date, recorded_date, content_hash,
+                 created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                target_slug,
+                description.strip()[:200],
+                body,
+                mem_type,
+                priority,
+                event_date,
+                now,
+                _simple_hash(body),
+                now,
+                now,
+                json.dumps(
+                    {"restored_from": f"version://{version}", "restore_reason": reason},
+                    ensure_ascii=False,
+                ),
             ),
-        ),
-    )
-    conn.commit()
-    refresh_memory_vectors(memory_id)
-    return target_slug
+        )
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, "rollback_restore", target_slug, changed_rows=changed_rows, error="no rows changed")
+        audit_details = {"changed_rows": changed_rows, "restored_from": f"version://{version}"}
+        audit_id = _record_audit(
+            action="rollback_restore",
+            target_slug=target_slug,
+            reason=reason or f"restore version {version}",
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, "rollback_restore", target_slug, changed_rows=changed_rows, error="audit write failed")
+        conn.commit()
+        refresh_memory_vectors(memory_id)
+        return MemoryMutationResult(
+            True,
+            "rollback_restore",
+            target_slug,
+            changed_rows=changed_rows,
+            audit_id=audit_id,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, "rollback_restore", target_slug, error=str(exc))
+
+
+def restore_memory_from_history(slug: str, version: str, reason: str = "") -> str | None:
+    """Restore a memory snapshot from memory_versions, recreating deleted rows."""
+    result = restore_memory_from_history_result(slug, version, reason=reason)
+    return result.target_slug if result.ok else None
 
 
 def read_history(slug: str, version: str) -> str | None:
