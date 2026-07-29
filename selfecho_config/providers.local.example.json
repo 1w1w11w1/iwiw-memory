@@ -1,4 +1,18 @@
 {
+  "role_defaults": {
+    "chat": {
+      "provider_id": "deepseek-default",
+      "model": "deepseek-v4-flash"
+    },
+    "summary": {
+      "provider_id": "deepseek-default",
+      "model": "deepseek-v4-flash"
+    },
+    "memory": {
+      "provider_id": "deepseek-default",
+      "model": "deepseek-v4-flash"
+    }
+  },
   "providers": [
     {
       "id": "deepseek-default",
@@ -8,11 +22,7 @@
       "api_key_env": "MEMORY_AGENT_LLM_API_KEY",
       "enabled": true,
       "models": ["deepseek-v4-flash"],
-      "defaults": {
-        "chat": "deepseek-v4-flash",
-        "summary": "deepseek-v4-flash",
-        "memory": "deepseek-v4-flash"
-      }
+      "streaming": true
     }
   ]
 }

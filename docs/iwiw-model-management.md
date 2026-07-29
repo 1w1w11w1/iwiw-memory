@@ -1,39 +1,52 @@
-# IwIw 模型管理设计
+# IwIw 模型管理
 
-## 定位
+模型管理服务于 IwIw 本地个人智能体本身。它只负责让 harness 获得稳定、可追踪、可流式的模型调用配置。
 
-IwIw 的模型管理服务于本地个人智能体本身，而不是服务于 CLI、多工具代理或 API 中转。
+模型管理不是模型运行时。真实调用、流式回退、结构化输出、usage、latency、retry 和 cancellation 由 `selfecho_model` 中的 `ModelGateway` 承担，设计见 [智能体 Harness 架构](agent-harness-architecture.md)。
 
-参考 `cc-switch` 时，只吸收它在模型档案管理上的方法：
+## 职责
 
-- 常用 provider 模板。
-- 自定义 provider 档案。
-- 当前启用 provider。
-- 按用途区分默认模型：聊天、摘要、记忆整理。
+- 管理常用 provider 模板。
+- 管理本地自定义 provider 档案。
+- 管理全局模型设置：按 IwIw 行为选择实际使用的 AI。
+- 管理模型配置：新建、修改和停用可调用的 provider/model 档案。
 - 标记 provider 是否支持流式事件。
-- 连接测试、延迟展示和后续健康状态记录。
-- 本地配置持久化，避免用户反复编辑 JSON。
+- 提供连接测试、延迟展示和健康状态记录。
+- 持久化本地配置，避免用户反复编辑 JSON。
 
-## 明确不做
-
-第一阶段不实现以下能力：
+## 不负责
 
 - 本地代理服务。
 - 请求转发。
 - 多 provider 自动路由。
-- 失败后的自动切换上游。
-- 面向 Claude Code、Codex、Gemini CLI 等外部工具的配置接管。
-- 将 IwIw 伪装成任意 CLI 或 vibing code 工具。
+- 失败后自动切换上游。
+- 外部工具配置接管。
 
-这些能力属于跨工具流量管理，不是 IwIw 当前的产品边界。IwIw 的重点是：让用户选择一个可用模型，并让智能体 harness 用稳定、可追踪、可流式的方式调用它。
+这些能力属于跨工具流量管理，不是 IwIw 当前产品边界。
 
-## Provider 档案
+## 配置结构
 
-当前本地配置位于 `selfecho_config/providers.local.json`，由 `selfecho_config/model_profiles.py` 读取和保存。结构应保持简单：
+本地配置位于 `selfecho_config/providers.local.json`，由模型配置模块读取和保存。结构分成两层：
+
+- `role_defaults`：页面上半部分“模型设置”，描述不同 IwIw 行为使用哪个已保存模型。
+- `providers`：页面下半部分“模型配置”，只描述服务连接、接口风格、环境变量和可用模型 ID。
 
 ```json
 {
-  "active_provider_id": "deepseek-main",
+  "role_defaults": {
+    "chat": {
+      "provider_id": "deepseek-main",
+      "model": "deepseek-v4-flash"
+    },
+    "summary": {
+      "provider_id": "deepseek-main",
+      "model": "deepseek-v4-flash"
+    },
+    "memory": {
+      "provider_id": "deepseek-main",
+      "model": "deepseek-v4-pro"
+    }
+  },
   "providers": [
     {
       "id": "deepseek-main",
@@ -43,32 +56,39 @@ IwIw 的模型管理服务于本地个人智能体本身，而不是服务于 CL
       "api_key_env": "MEMORY_AGENT_LLM_API_KEY",
       "enabled": true,
       "streaming": true,
-      "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-      "defaults": {
-        "chat": "deepseek-v4-flash",
-        "summary": "deepseek-v4-flash",
-        "memory": "deepseek-v4-flash"
-      }
+      "models": ["deepseek-v4-flash", "deepseek-v4-pro"]
     }
   ]
 }
 ```
 
-`api_key` 不应默认写入仓库。开源默认使用环境变量名，用户本机可在本地配置中保存自己的 provider 档案。
+`api_key` 不应写入仓库。默认使用环境变量名，用户本机可保存自己的 provider 档案。
+
+`providers[*]` 不保存行为默认值。停用的 provider 不进入全局模型设置的可选项，也不应继续被运行时选中。
 
 ## Harness 接入
 
-模型管理只向 harness 暴露“当前 provider 档案”和“指定用途的默认模型”：
+模型管理向 harness 暴露两类信息：
 
-- 聊天：`defaults.chat`
-- 会话摘要：`defaults.summary`
-- 记忆整理：`defaults.memory`
+- Provider/model 档案。
+- 指定行为用途的全局模型设置。
 
-如果 provider 标记 `streaming: true`，聊天优先走流式事件；否则降级为普通完成请求。降级只改变交互体验，不改变智能体工作流。
+用途：
 
-## 后续推进
+- 对话回复模型：`role_defaults.chat`
+- 会话整理模型：`role_defaults.summary`
+- 记忆整理模型：`role_defaults.memory`
 
-1. 为 provider 测试记录最近一次结果、延迟和错误摘要。
-2. 在 GUI 中继续完善当前模型、流式能力和连接状态展示。
-3. 在设置中提供 provider 档案导入、导出和一键恢复默认模板。
-4. 在请求追踪中记录实际使用的 provider、model、耗时、估算 token 和是否流式。
+`api_style` 取值：`"anthropic"` | `"openai"`。控制 provider adapter 的请求体格式和 endpoint 拼接规则。
+
+如果 provider 标记 `streaming: true`，聊天优先走流式事件；否则降级为普通完成请求。降级只改变交互体验，不改变 agent 工作流。
+
+### Provider 错误处理
+
+- 环境变量缺失：启动时不阻塞，首次调用时返回明确错误并提示缺失的变量名。
+- Provider 不可达（超时/503）：`ModelGateway` 按 harness doc 的重试策略处理，模型管理本身不做重试。
+- 健康检查：`ModelProviderAdapter.health_check()` 的定义见 [智能体 Harness 架构](agent-harness-architecture.md) 的 Provider Adapter 章节。
+
+## 运行追踪
+
+模型调用的 trace 字段（provider、model、耗时、token、流式标志、错误摘要）由 [智能体 Harness 架构](agent-harness-architecture.md) 的 `TraceRecorder` 统一管理。本文不重复定义。

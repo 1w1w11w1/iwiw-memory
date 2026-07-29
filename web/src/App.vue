@@ -103,7 +103,6 @@
         <template v-else-if="tab === 'memory'">
           <div class="panel-title">
             <span>记忆</span>
-            <button class="ghost-btn" @click="rebuildIndex">重建</button>
           </div>
           <div class="segmented">
             <button :class="{ active: memoryMode === 'long' }" @click="memoryMode = 'long'">长期</button>
@@ -112,24 +111,24 @@
 
           <template v-if="memoryMode === 'long'">
             <form class="search-row" @submit.prevent="searchMemories">
-              <input v-model="memoryQuery" placeholder="搜索长期记忆" />
+              <input v-model="memoryQuery" placeholder="搜索全量记忆库" />
             </form>
-            <div class="memory-tier-list">
-              <section v-for="tier in tiers" :key="tier.id" class="tier-group" :class="tier.id">
+            <div class="memory-source-list">
+              <section v-for="group in memorySourceGroups" :key="group.id" class="source-group" :class="group.id">
                 <header>
-                  <span class="tier-code">{{ tier.level }}</span>
-                  <span>{{ tier.name }}</span>
-                  <em>{{ groupedMemories[tier.id]?.length || 0 }}</em>
+                  <span class="source-code">{{ group.code }}</span>
+                  <span>{{ group.name }}</span>
+                  <em>{{ groupedMemories[group.id]?.length || 0 }}</em>
                 </header>
                 <button
-                  v-for="memory in groupedMemories[tier.id]"
-                  :key="memory.slug"
+                  v-for="memory in groupedMemories[group.id]"
+                  :key="memoryRecordId(memory)"
                   class="list-item memory-item"
-                  :class="{ selected: memoryDetail?.slug === memory.slug }"
-                  @click="openMemory(memory.slug)"
+                  :class="{ selected: memoryRecordId(memoryDetail) === memoryRecordId(memory) }"
+                  @click="openMemory(memoryRecordId(memory))"
                 >
-                  <span class="item-title">{{ memory.slug }}</span>
-                  <span class="item-meta">{{ memory.description || '无描述' }}</span>
+                  <span class="item-title">{{ memoryRecordTitle(memory) }}</span>
+                  <span class="item-meta">{{ memoryDescription(memory) }}</span>
                 </button>
               </section>
             </div>
@@ -139,7 +138,6 @@
             <form class="search-row" @submit.prevent="searchHistory">
               <input v-model="historyQuery" placeholder="搜索会话记忆" />
             </form>
-            <button class="quiet-wide" @click="migrateLegacy">导入旧历史</button>
             <div class="session-list">
               <button
                 v-for="result in historyResults"
@@ -158,27 +156,16 @@
         <template v-else>
           <div class="panel-title">
             <span>模型</span>
-            <button class="ghost-btn" @click="saveProviders">保存</button>
           </div>
-          <div class="context-label">常用模板</div>
-          <div class="session-list tight">
-            <button v-for="template in modelTemplates" :key="template.id" class="list-item" @click="applyTemplate(template)">
-              <span class="item-title">{{ template.label }}</span>
-              <span class="item-meta">{{ template.api_style }} · 事件流 · {{ template.models?.[0] || '自定义' }}</span>
+          <div class="model-page-nav">
+            <button :class="{ active: modelPage === 'management' }" @click="setModelPage('management')">
+              <strong>模型管理</strong>
+              <span>添加、复制、编辑、测试和删除模型配置</span>
             </button>
-          </div>
-          <div class="context-label">已配置</div>
-          <div class="session-list">
-            <button
-              v-for="provider in providers.providers"
-              :key="provider.id"
-              class="list-item"
-              :class="{ selected: activeProviderId === provider.id, current: providers.active_provider_id === provider.id }"
-              @click="editProvider(provider)"
-            >
-              <span class="item-title">{{ provider.label || provider.id }}</span>
-              <span class="item-meta">{{ provider.enabled ? '启用' : '停用' }} · {{ provider.streaming === false ? '非流式' : '事件流' }} · {{ provider.base_url || '未设置地址' }}</span>
-              <span v-if="providers.active_provider_id === provider.id" class="item-badge">当前</span>
+            <button :class="{ active: modelPage === 'settings' }" @click="setModelPage('settings')">
+              <strong>模型设置</strong>
+              <span>选择每类行为交给哪个模型接管</span>
+              <em v-if="modelSettingsDirty">未保存</em>
             </button>
           </div>
         </template>
@@ -288,7 +275,7 @@
                 :key="option.id"
                 type="button"
                 :class="{ active: approvalMode === option.id }"
-                @click="approvalMode = option.id"
+                @click="selectApprovalMode(option.id)"
               >
                 <strong>{{ option.label }}</strong>
                 <span>{{ option.description }}</span>
@@ -361,17 +348,13 @@
             <div class="settings-choice-grid">
               <button type="button" :class="{ active: memoryMode === 'long' }" @click="memoryMode = 'long'">
                 <strong>长期记忆</strong>
-                <span>默认显示 L0 / L1 / L2 / L3 的事实记忆。</span>
+                <span>默认显示全量记忆库记录。</span>
               </button>
               <button type="button" :class="{ active: memoryMode === 'session' }" @click="memoryMode = 'session'">
                 <strong>会话记忆</strong>
                 <span>默认进入搜索与历史回放。</span>
               </button>
             </div>
-          </div>
-          <div class="settings-card">
-            <h2>维护</h2>
-            <button type="button" class="primary-action" @click="rebuildIndex">重建长期记忆索引</button>
           </div>
         </section>
 
@@ -380,7 +363,6 @@
             <h2>本地数据</h2>
             <div class="settings-path-list">
               <div><span>会话库</span><code>{{ health?.session_memory?.db_path || '等待连接' }}</code></div>
-              <div><span>旧库迁移</span><code>{{ health?.legacy_import?.available ? '可用' : '未检测到旧库' }}</code></div>
             </div>
           </div>
           <div class="settings-card">
@@ -765,23 +747,57 @@
       <section v-else-if="tab === 'memory'" :key="`memory-${memoryMode}`" class="tool-page">
         <header class="page-head">
           <div>
-            <p class="eyebrow">{{ memoryMode === 'long' ? 'L0 / L1 / L2 / L3' : 'Search / Replay' }}</p>
+            <p class="eyebrow">{{ memoryMode === 'long' ? 'Corpus / Profiles' : 'Search / Replay' }}</p>
             <h1>{{ memoryMode === 'long' ? '长期记忆' : '会话记忆' }}</h1>
           </div>
           <div v-if="memoryMode === 'long' && memoryDetail" class="head-actions">
             <button @click="saveMemory">保存</button>
-            <button @click="archiveMemory">归档</button>
             <button class="danger" @click="deleteMemory">删除</button>
           </div>
         </header>
 
         <section v-if="memoryMode === 'long'" class="memory-stage">
+          <div class="tendency-panel">
+            <section class="tendency-card">
+              <header>
+                <span>全局倾向</span>
+                <em>{{ tendencyObservationCount('agent_global') }} 待编译</em>
+              </header>
+              <pre>{{ tendencyProfileText(tendencyOverview?.agent_global_profile) }}</pre>
+              <div class="tendency-actions">
+                <button :disabled="Boolean(tendencyBusy)" @click="compileTendency('agent_global', 'compile')">编译</button>
+                <button :disabled="Boolean(tendencyBusy)" @click="compileTendency('agent_global', 'rebuild')">重建</button>
+              </div>
+            </section>
+            <section class="tendency-card">
+              <header>
+                <span>工作目录倾向</span>
+                <em>{{ tendencyObservationCount('workspace') }} 待编译</em>
+              </header>
+              <pre>{{ tendencyProfileText(tendencyOverview?.workspace_profile) }}</pre>
+              <div class="tendency-actions">
+                <button :disabled="Boolean(tendencyBusy) || !activeWorkspaceProjectId" @click="compileTendency('workspace', 'compile')">编译</button>
+                <button :disabled="Boolean(tendencyBusy) || !activeWorkspaceProjectId" @click="compileTendency('workspace', 'rebuild')">重建</button>
+              </div>
+            </section>
+            <section class="tendency-card">
+              <header>
+                <span>当前会话倾向</span>
+                <em>{{ tendencyObservationCount('session') }} 待编译</em>
+              </header>
+              <pre>{{ tendencyProfileText(tendencyOverview?.session_profile) }}</pre>
+              <div class="tendency-actions">
+                <button :disabled="Boolean(tendencyBusy) || !activeSession" @click="compileTendency('session', 'compile')">编译</button>
+                <button :disabled="Boolean(tendencyBusy) || !activeSession" @click="compileTendency('session', 'rebuild')">重建</button>
+              </div>
+            </section>
+          </div>
           <div v-if="memoryDetail" class="editor-panel">
             <div class="memory-heading">
-              <span class="priority-chip" :class="memoryEdit.priority">{{ tierLabel(memoryEdit.priority) }}</span>
+              <span class="record-chip">{{ sourceTypeLabel(memoryDetail.source_type) }}</span>
               <div>
-                <h2>{{ memoryDetail.slug }}</h2>
-                <p>{{ memoryDetail.path }}</p>
+                <h2>{{ memoryRecordTitle(memoryDetail) }}</h2>
+                <p>{{ memoryDetail.id }}</p>
               </div>
             </div>
 
@@ -791,31 +807,18 @@
             </label>
             <div class="field-grid">
               <label>
-                权重
-                <select v-model="memoryEdit.priority">
-                  <option value="core">L0 core</option>
-                  <option value="important">L1 important</option>
-                  <option value="normal">L2 normal</option>
-                  <option value="archive">L3 archive</option>
-                </select>
+                来源
+                <input :value="sourceTypeLabel(memoryDetail.source_type)" disabled />
               </label>
               <label>
-                类型
-                <input v-model="memoryEdit.mem_type" />
+                作用域
+                <input :value="scopeTypeLabel(memoryDetail.scope_type)" disabled />
               </label>
             </div>
             <label>
               内容
               <textarea v-model="memoryEdit.body" rows="18"></textarea>
             </label>
-
-            <div class="merge-row">
-              <label>
-                合并来源 slug
-                <input v-model="mergeSourceSlug" placeholder="来源记忆会被归档" />
-              </label>
-              <button :disabled="!mergeSourceSlug.trim()" @click="mergeMemory">合并</button>
-            </div>
 
             <details class="history-box">
               <summary>历史备份 {{ memoryDetail.history?.length || 0 }}</summary>
@@ -828,7 +831,7 @@
 
           <div v-else class="empty-state">
             <strong>从左侧选择一条长期记忆。</strong>
-            <span>四级权重已经放到左下列表里，编辑区只保留当前任务。</span>
+            <span>这里显示全量记忆库中的原始材料记录。</span>
           </div>
         </section>
 
@@ -845,7 +848,7 @@
           </div>
           <div v-else class="empty-state">
             <strong>搜索并回放一段会话。</strong>
-            <span>旧历史会进入导入历史筛选，不再改变新会话的生命周期。</span>
+            <span>会话回放只展示当前 IwIw 会话库中的原始消息。</span>
           </div>
         </section>
       </section>
@@ -853,99 +856,178 @@
       <section v-else key="models" class="tool-page">
         <header class="page-head">
           <div>
-            <p class="eyebrow">Providers</p>
-            <h1>模型</h1>
+            <p class="eyebrow">Models</p>
+            <h1>{{ modelPageTitle }}</h1>
           </div>
           <div class="head-actions">
             <span v-if="modelTestResult" class="model-test-status" :class="modelTestResult.status">
               {{ modelTestResult.text }}
             </span>
-            <button :disabled="modelTesting || !providerForm.id" @click="testProvider">
-              {{ modelTesting ? '测试中' : '测试连接' }}
+            <button v-if="modelPage === 'management'" class="primary-action" @click="openAddModelDialog">添加模型</button>
+            <button
+              v-else
+              class="primary-action"
+              :class="{ active: modelSettingsDirty }"
+              :disabled="!modelSettingsDirty"
+              @click="saveModelSettings"
+            >
+              保存模型设置
             </button>
-            <button @click="saveProviders">保存配置</button>
           </div>
         </header>
 
-        <Transition name="model-content" mode="out-in">
-          <section :key="modelViewKey" class="model-panel">
-            <div class="model-intro">
-              <h2>{{ providerForm.id ? '模型配置' : '选择左侧模板开始' }}</h2>
-              <p>优先使用预设模板；需要非标准服务时，再从自定义模型入口补充。当前使用：{{ currentProviderLabel }}</p>
+        <section v-if="modelPage === 'settings'" class="model-stack">
+          <section class="model-role-panel model-settings-page">
+            <div class="model-section-heading">
+              <div>
+                <h2>模型设置</h2>
+                <p>管理不同 IwIw 行为由哪个模型接管。这里是跨项目生效的全局设置，只从已保存且启用的模型配置中选择。</p>
+              </div>
+              <span>{{ savedModelOptions.length }} 个可选模型</span>
             </div>
-
-            <div class="field-grid">
-              <label>
-                ID
-                <input v-model="providerForm.id" placeholder="deepseek-main" />
-              </label>
-              <label>
-                名称
-                <input v-model="providerForm.label" placeholder="DeepSeek" />
-              </label>
-            </div>
-            <div class="field-grid">
-              <label>
-                接口风格
-                <select v-model="providerForm.api_style">
-                  <option value="anthropic">Anthropic</option>
-                  <option value="openai">OpenAI Compatible</option>
+            <div class="model-role-grid">
+              <label v-for="role in modelRoles" :key="role.id">
+                <span>{{ role.label }}</span>
+                <select
+                  v-model="roleDefaultSelections[role.id]"
+                  :disabled="!savedModelOptions.length"
+                  @change="updateRoleDefault(role.id)"
+                >
+                  <option value="">{{ savedModelOptions.length ? '未选择' : '先保存一个模型' }}</option>
+                  <option
+                    v-for="option in savedModelOptions"
+                    :key="`${role.id}-${option.value}`"
+                    :value="option.value"
+                    :disabled="option.disabled"
+                  >
+                    {{ option.label }}
+                  </option>
                 </select>
+                <em>{{ role.description }}</em>
               </label>
-              <label class="check-field">
-                <input type="checkbox" v-model="providerForm.enabled" />
-                启用这个 provider
-              </label>
-              <label class="check-field">
-                <input type="checkbox" v-model="providerForm.streaming" />
-                使用流式事件
-              </label>
-            </div>
-            <label>
-              Base URL
-              <input v-model="providerForm.base_url" placeholder="https://api.example.com/v1" />
-            </label>
-            <label>
-              API Key 环境变量
-              <input v-model="providerForm.api_key_env" placeholder="MEMORY_AGENT_LLM_API_KEY" />
-            </label>
-            <label>
-              可用模型，使用逗号分隔
-              <input v-model="providerModelsText" placeholder="model-a, model-b" />
-            </label>
-            <div class="field-grid three">
-              <label>
-                聊天默认
-                <input v-model="providerForm.defaults.chat" />
-              </label>
-              <label>
-                摘要默认
-                <input v-model="providerForm.defaults.summary" />
-              </label>
-              <label>
-                记忆默认
-                <input v-model="providerForm.defaults.memory" />
-              </label>
-            </div>
-            <div class="model-actions">
-              <button class="primary-action" @click="upsertProvider">加入或更新配置</button>
-              <button
-                type="button"
-                class="secondary-action"
-                :class="{ active: providers.active_provider_id === providerForm.id }"
-                :disabled="!providerForm.id"
-                @click="setActiveProvider(providerForm.id)"
-              >
-                {{ providers.active_provider_id === providerForm.id ? '当前使用' : '设为当前模型' }}
-              </button>
             </div>
           </section>
-        </Transition>
+        </section>
+
+        <section v-else class="model-stack">
+          <section class="model-management-panel">
+            <div class="model-section-heading">
+              <div>
+                <h2>已设置模型</h2>
+                <p>一行一个模型配置，常用操作直接在标签卡上完成。</p>
+              </div>
+              <span>{{ providers.providers.length }} 个配置</span>
+            </div>
+            <div class="provider-list">
+              <article
+                v-for="provider in providers.providers"
+                :key="provider.id"
+                class="provider-row-card"
+                :class="{ selected: activeProviderId === provider.id }"
+              >
+                <div class="provider-row-main">
+                  <strong>{{ provider.label || provider.id }}</strong>
+                  <span>{{ provider.id }}</span>
+                  <em>{{ provider.enabled ? '启用' : '停用' }} · {{ provider.api_style }} · {{ provider.streaming === false ? '非流式' : '事件流' }}</em>
+                </div>
+                <div class="provider-row-models">{{ providerModelSummary(provider) }}</div>
+                <div class="provider-row-actions" aria-label="模型配置操作">
+                  <button type="button" @click="duplicateProvider(provider)">复制</button>
+                  <button type="button" @click="editProvider(provider)">编辑</button>
+                  <button type="button" @click="testProvider(provider)">测试连接</button>
+                  <button type="button" class="danger-link" @click="deleteProvider(provider)">删除</button>
+                </div>
+              </article>
+              <div v-if="!providers.providers.length" class="provider-empty">
+                还没有模型配置。点击右上角“添加模型”从预设模板开始。
+              </div>
+            </div>
+          </section>
+        </section>
       </section>
       </Transition>
 
       <button v-if="error" class="toast" @click="error = ''">{{ error }}</button>
     </main>
+
+    <div v-if="modelTemplateDialogOpen" class="dialog-backdrop" @click.self="closeAddModelDialog">
+      <section class="model-dialog">
+        <header>
+          <div>
+            <p class="eyebrow">Template</p>
+            <h2>添加模型</h2>
+          </div>
+          <button type="button" class="icon-btn" title="关闭" @click="closeAddModelDialog">×</button>
+        </header>
+        <div class="model-template-list" aria-label="预设模型模板">
+          <button v-for="template in modelTemplates" :key="template.id" @click="applyTemplate(template)">
+            <strong>{{ template.label }}</strong>
+            <span>{{ template.api_style }} · {{ template.models?.[0] || '自定义模型' }}</span>
+            <em>{{ template.base_url || '手动填写服务地址' }}</em>
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="modelEditorOpen" class="dialog-backdrop" @click.self="closeModelEditor">
+      <section class="model-dialog wide">
+        <header>
+          <div>
+            <p class="eyebrow">Model Config</p>
+            <h2>{{ providerEditorMode === 'edit' ? '编辑模型配置' : '添加模型配置' }}</h2>
+          </div>
+          <button type="button" class="icon-btn" title="关闭" @click="closeModelEditor">×</button>
+        </header>
+        <form class="model-config-form" @submit.prevent="saveProviderConfig">
+          <div class="field-grid">
+            <label>
+              ID
+              <input v-model="providerForm.id" placeholder="deepseek-main" />
+            </label>
+            <label>
+              名称
+              <input v-model="providerForm.label" placeholder="DeepSeek" />
+            </label>
+          </div>
+          <div class="field-grid">
+            <label>
+              接口风格
+              <select v-model="providerForm.api_style">
+                <option value="anthropic">Anthropic</option>
+                <option value="openai">OpenAI Compatible</option>
+              </select>
+            </label>
+            <label class="check-field">
+              <input type="checkbox" v-model="providerForm.enabled" />
+              启用这个配置
+            </label>
+            <label class="check-field">
+              <input type="checkbox" v-model="providerForm.streaming" />
+              使用流式事件
+            </label>
+          </div>
+          <label>
+            Base URL
+            <input v-model="providerForm.base_url" placeholder="https://api.example.com/v1" />
+          </label>
+          <label>
+            API Key 环境变量
+            <input v-model="providerForm.api_key_env" placeholder="MEMORY_AGENT_LLM_API_KEY" />
+          </label>
+          <label>
+            模型 ID 列表，使用逗号分隔
+            <input v-model="providerModelsText" placeholder="model-a, model-b" />
+          </label>
+          <footer>
+            <button type="button" class="secondary-action" @click="closeModelEditor">取消</button>
+            <button type="button" class="secondary-action" :disabled="modelTesting || !providerForm.id" @click="testProvider()">
+              {{ modelTesting ? '测试中' : '测试连接' }}
+            </button>
+            <button type="submit" class="primary-action">保存模型配置</button>
+          </footer>
+        </form>
+      </section>
+    </div>
 
     <div v-if="projectDialogOpen" class="dialog-backdrop" @click.self="closeProjectDialog">
       <section class="project-dialog">
@@ -1049,7 +1131,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { request, streamRequest } from './api'
+import { request, setPermissionProfile, streamRequest } from './api'
 
 type Tab = 'chat' | 'memory' | 'models'
 type MemoryMode = 'long' | 'session'
@@ -1148,6 +1230,8 @@ type ApprovalMode = 'ask' | 'auto' | 'full'
 type SendShortcut = 'enter' | 'mod-enter'
 type EditorView = 'edit' | 'preview'
 type EditorTheme = 'light' | 'dark' | 'paper'
+type ModelRole = 'chat' | 'summary' | 'memory'
+type ModelPage = 'management' | 'settings'
 type ComposerAttachment = {
   id: string
   name: string
@@ -1163,10 +1247,13 @@ type Provider = {
   enabled: boolean
   streaming?: boolean
   models: string[]
-  defaults: { chat: string; summary: string; memory: string }
+}
+type ModelRoleDefault = {
+  provider_id: string
+  model: string
 }
 type ProvidersState = {
-  active_provider_id: string
+  role_defaults: Record<ModelRole, ModelRoleDefault>
   providers: Provider[]
 }
 type ModelTestResult = {
@@ -1190,6 +1277,21 @@ const tabs = [
   { id: 'models', label: '模型' },
 ] as const
 
+const modelRoleIds: ModelRole[] = ['chat', 'summary', 'memory']
+const modelRoles: Array<{ id: ModelRole; shortLabel: string; label: string; description: string }> = [
+  { id: 'chat', shortLabel: '对话', label: '对话回复模型', description: '用于日常对话、陪我想想和工作模式下的回复生成。' },
+  { id: 'summary', shortLabel: '整理', label: '会话整理模型', description: '用于会话摘要、阶段复盘和上下文压缩。' },
+  { id: 'memory', shortLabel: '记忆', label: '记忆整理模型', description: '用于长期记忆整理、倾向观察和 profile 编译。' },
+]
+
+function emptyModelRoleDefaults(): Record<ModelRole, ModelRoleDefault> {
+  return {
+    chat: { provider_id: '', model: '' },
+    summary: { provider_id: '', model: '' },
+    memory: { provider_id: '', model: '' },
+  }
+}
+
 const settingsGroups: Array<{
   id: string
   label: string
@@ -1209,7 +1311,7 @@ const settingsGroups: Array<{
     label: '智能体',
     items: [
       { id: 'agent', label: '行为与权限', description: '对话策略和操作批准' },
-      { id: 'memory', label: '记忆', description: '默认入口和索引维护' },
+      { id: 'memory', label: '记忆', description: '默认入口和维护方式' },
     ],
   },
   {
@@ -1221,11 +1323,13 @@ const settingsGroups: Array<{
   },
 ]
 
-const tiers = [
-  { id: 'core', level: 'L0', name: '核心' },
-  { id: 'important', level: 'L1', name: '重要' },
-  { id: 'normal', level: 'L2', name: '日常' },
-  { id: 'archive', level: 'L3', name: '归档' },
+const memorySourceGroups = [
+  { id: 'message', code: 'MSG', name: '会话消息' },
+  { id: 'tool', code: 'TOOL', name: '工具结果' },
+  { id: 'manual', code: 'MAN', name: '手动记录' },
+  { id: 'file', code: 'FILE', name: '文件材料' },
+  { id: 'system_event', code: 'SYS', name: '系统事件' },
+  { id: 'search', code: 'HIT', name: '检索结果' },
 ] as const
 
 const tab = ref<Tab>('chat')
@@ -1339,21 +1443,28 @@ const approvalOptions: Array<{ id: ApprovalMode; label: string; description: str
 const memories = ref<any[]>([])
 const memoryQuery = ref('')
 const memoryDetail = ref<any>(null)
-const memoryEdit = ref({ description: '', body: '', priority: 'normal', mem_type: 'user' })
-const mergeSourceSlug = ref('')
+const memoryEdit = ref({ description: '', body: '' })
+const tendencyOverview = ref<any>(null)
+const tendencyBusy = ref('')
 
 const historyQuery = ref('')
 const historyResults = ref<any[]>([])
 const historySessionId = ref('')
 const historyReplay = ref<any>(null)
 
-const providers = ref<ProvidersState>({ active_provider_id: '', providers: [] })
+const providers = ref<ProvidersState>({ role_defaults: emptyModelRoleDefaults(), providers: [] })
 const modelTemplates = ref<any[]>([])
+const modelPage = ref<ModelPage>('management')
+const modelTemplateDialogOpen = ref(false)
+const modelEditorOpen = ref(false)
+const providerEditorMode = ref<'create' | 'edit'>('create')
 const activeProviderId = ref('')
 const providerModelsText = ref('')
 const modelViewKey = ref('model-empty')
 const modelTesting = ref(false)
 const modelTestResult = ref<ModelTestResult | null>(null)
+const roleDefaultSelections = reactive<Record<ModelRole, string>>({ chat: '', summary: '', memory: '' })
+const savedRoleDefaultsSnapshot = ref('')
 const providerForm = reactive<Provider>({
   id: '',
   label: '',
@@ -1363,13 +1474,19 @@ const providerForm = reactive<Provider>({
   enabled: true,
   streaming: true,
   models: [],
-  defaults: { chat: '', summary: '', memory: '' },
 })
 
 const groupedMemories = computed<Record<string, any[]>>(() => {
-  const groups: Record<string, any[]> = { core: [], important: [], normal: [], archive: [] }
+  const groups: Record<string, any[]> = {
+    message: [],
+    tool: [],
+    manual: [],
+    file: [],
+    system_event: [],
+    search: [],
+  }
   for (const memory of memories.value) {
-    const key = groups[memory.priority] ? memory.priority : 'normal'
+    const key = groups[memory.source_type] ? memory.source_type : 'search'
     groups[key].push(memory)
   }
   return groups
@@ -1417,7 +1534,7 @@ const chatSessions = computed(() => orderedSessions.value.filter((session) => se
 const navHint = computed(() => {
   if (tab.value === 'chat') return '默认入口，承接当前表达'
   if (tab.value === 'memory') return '长期事实与会话回放'
-  return '模型模板与本地 provider'
+  return '模型设置与配置'
 })
 
 const activeTabIndex = computed(() => tabs.findIndex((item) => item.id === tab.value))
@@ -1453,10 +1570,20 @@ const historyReplayTitle = computed(() => historyReplay.value?.session?.title ||
 const activeReviewPane = computed(() => {
   return reviewPanes.value.find((pane) => pane.id === activeReviewPaneId.value) || reviewPanes.value[0]
 })
-const currentProviderLabel = computed(() => {
-  const current = providers.value.providers.find((item) => item.id === providers.value.active_provider_id)
-  if (current) return current.label || current.id
-  return providers.value.active_provider_id || '未选择'
+const modelPageTitle = computed(() => modelPage.value === 'settings' ? '模型设置' : '模型管理')
+const savedModelOptions = computed(() => {
+  return providers.value.providers
+    .filter((provider) => provider.enabled !== false)
+    .flatMap((provider) => normalizeModels(provider.models).map((model) => ({
+      provider_id: provider.id,
+      model,
+      value: encodeModelSelection(provider.id, model),
+      label: `${provider.label || provider.id} (${provider.id}) / ${model}`,
+      disabled: false,
+    })))
+})
+const modelSettingsDirty = computed(() => {
+  return roleDefaultsSignature(providers.value.role_defaults) !== savedRoleDefaultsSnapshot.value
 })
 const openWorkspaceFileFullPath = computed(() => openWorkspaceFile.value?.full_path || openWorkspaceFile.value?.path || '')
 const isMarkdownFile = computed(() => {
@@ -1563,8 +1690,23 @@ async function guard(fn: () => Promise<void>) {
   }
 }
 
-function switchTab(next: Tab) {
+async function confirmModelSettingsLeave() {
+  if (!(tab.value === 'models' && modelPage.value === 'settings' && modelSettingsDirty.value)) return true
+  const shouldSave = confirm('当前有未保存配置，是否保存？')
+  if (!shouldSave) return false
+  return await saveModelSettings()
+}
+
+async function switchTab(next: Tab) {
+  if (next !== tab.value && !(await confirmModelSettingsLeave())) return
   tab.value = next
+  if (next === 'memory') void loadTendency()
+}
+
+async function setModelPage(next: ModelPage) {
+  if (next === modelPage.value) return
+  if (!(await confirmModelSettingsLeave())) return
+  modelPage.value = next
 }
 
 function setChatListMode(next: ChatListMode) {
@@ -1573,7 +1715,8 @@ function setChatListMode(next: ChatListMode) {
   chatListMode.value = next
 }
 
-function openSettings() {
+async function openSettings() {
+  if (!(await confirmModelSettingsLeave())) return
   settingsOpen.value = true
   attachmentMenuOpen.value = false
   approvalMenuOpen.value = false
@@ -1744,9 +1887,65 @@ function formatDuration(ms: number) {
   return minutesRest ? `${hours} 小时 ${minutesRest} 分` : `${hours} 小时`
 }
 
-function tierLabel(priority: string) {
-  const tier = tiers.find((item) => item.id === priority)
-  return tier ? `${tier.level} ${tier.name}` : 'L2 日常'
+function sourceTypeLabel(sourceType: string) {
+  const labels: Record<string, string> = {
+    message: '会话消息',
+    tool: '工具结果',
+    manual: '手动记录',
+    file: '文件材料',
+    system_event: '系统事件',
+  }
+  return labels[sourceType] || '检索结果'
+}
+
+function scopeTypeLabel(scopeType: string) {
+  const labels: Record<string, string> = {
+    global: '全局',
+    project: '项目',
+    session: '会话',
+  }
+  return labels[scopeType] || '未指定'
+}
+
+function memoryRecordId(memory: any) {
+  if (!memory) return ''
+  return String(memory.id || memory.record_id || '')
+}
+
+function memoryMetadata(memory: any) {
+  const raw = memory?.metadata
+  if (!raw) return {}
+  if (typeof raw === 'object') return raw
+  try {
+    return JSON.parse(String(raw))
+  } catch {
+    return {}
+  }
+}
+
+function memoryDescription(memory: any) {
+  const meta = memoryMetadata(memory)
+  const description = String(meta.description || memory?.description || '').trim()
+  if (description) return description
+  const content = String(memory?.content || '').trim()
+  return content ? content.slice(0, 80) : '无描述'
+}
+
+function memoryRecordTitle(memory: any) {
+  const id = memoryRecordId(memory)
+  return id ? id.slice(0, 8) : '未选择记录'
+}
+
+function tendencyProfileText(profile: any) {
+  const content = String(profile?.content || '').trim()
+  return content || '暂无'
+}
+
+type TendencyScopeKind = 'agent_global' | 'workspace' | 'session'
+
+function tendencyObservationCount(scope: TendencyScopeKind) {
+  const rows = tendencyOverview.value?.observations?.[scope]
+  return Array.isArray(rows) ? rows.length : 0
 }
 
 function riskLabel(level: string) {
@@ -1769,6 +1968,73 @@ function normalizeModels(models: unknown): string[] {
   if (Array.isArray(models)) return models.map(String).filter(Boolean)
   if (typeof models === 'string') return models.split(',').map((model) => model.trim()).filter(Boolean)
   return []
+}
+
+function roleDefaultsSignature(defaults: Record<ModelRole, ModelRoleDefault>) {
+  return JSON.stringify(modelRoleIds.map((role) => [
+    role,
+    defaults[role]?.provider_id || '',
+    defaults[role]?.model || '',
+  ]))
+}
+
+function encodeModelSelection(providerId: string, model: string) {
+  return `${encodeURIComponent(providerId)}::${encodeURIComponent(model)}`
+}
+
+function decodeModelSelection(value: string): ModelRoleDefault {
+  const [providerId = '', model = ''] = String(value || '').split('::')
+  return {
+    provider_id: decodeURIComponent(providerId),
+    model: decodeURIComponent(model),
+  }
+}
+
+function firstAvailableModelRef(providerList = providers.value.providers): ModelRoleDefault {
+  const provider = providerList.find((item) => item.enabled !== false && normalizeModels(item.models).length)
+  return provider ? { provider_id: provider.id, model: normalizeModels(provider.models)[0] } : { provider_id: '', model: '' }
+}
+
+function providerHasModel(ref: ModelRoleDefault) {
+  const provider = providers.value.providers.find((item) => item.id === ref.provider_id && item.enabled !== false)
+  return Boolean(provider && normalizeModels(provider.models).includes(ref.model))
+}
+
+function reconcileRoleDefaults() {
+  const fallback = firstAvailableModelRef()
+  for (const role of modelRoleIds) {
+    const current = providers.value.role_defaults[role]
+    providers.value.role_defaults[role] = providerHasModel(current) ? current : { ...fallback }
+  }
+  syncRoleDefaultSelections()
+}
+
+function syncRoleDefaultSelections() {
+  for (const role of modelRoleIds) {
+    const current = providers.value.role_defaults[role]
+    roleDefaultSelections[role] = current?.provider_id && current?.model
+      ? encodeModelSelection(current.provider_id, current.model)
+      : ''
+  }
+}
+
+function updateRoleDefault(role: ModelRole) {
+  const next = roleDefaultSelections[role] ? decodeModelSelection(roleDefaultSelections[role]) : { provider_id: '', model: '' }
+  providers.value.role_defaults[role] = next
+}
+
+function roleDefaultLabel(role: ModelRole) {
+  const current = providers.value.role_defaults[role]
+  if (!current?.provider_id || !current?.model) return '未选择'
+  const provider = providers.value.providers.find((item) => item.id === current.provider_id)
+  return `${provider?.label || current.provider_id} (${current.provider_id}) / ${current.model}`
+}
+
+function providerModelSummary(provider: Provider) {
+  const models = normalizeModels(provider.models)
+  if (!models.length) return '未填写模型 ID'
+  const summary = models.slice(0, 3).join(', ')
+  return models.length > 3 ? `${summary} 等 ${models.length} 个` : summary
 }
 
 function projectSessions(projectId: string) {
@@ -1908,7 +2174,7 @@ async function createDirectoryForProject() {
   await guard(async () => {
     const dir: any = await request('/filesystem/directory', {
       method: 'POST',
-      body: JSON.stringify({ parent: projectPickerPath.value }),
+      body: JSON.stringify({ parent: projectPickerPath.value, confirmed: true }),
     })
     await loadProjectPicker(projectPickerPath.value)
     selectedProjectPath.value = dir.path
@@ -1929,10 +2195,14 @@ async function commitProjectRename() {
     projectRenameName.value = ''
     return
   }
+  if (!confirm(`将目录重命名为「${name}」？`)) {
+    projectRenameName.value = ''
+    return
+  }
   await guard(async () => {
     const renamed: any = await request('/filesystem/directory', {
       method: 'PATCH',
-      body: JSON.stringify({ path: oldPath, name }),
+      body: JSON.stringify({ path: oldPath, name, confirmed: true }),
     })
     projectRenameName.value = ''
     await loadProjectPicker(projectPickerPath.value)
@@ -1962,7 +2232,7 @@ async function deleteProjectDirectory() {
   await guard(async () => {
     await request('/filesystem/directory', {
       method: 'DELETE',
-      body: JSON.stringify({ path: target.path }),
+      body: JSON.stringify({ path: target.path, confirmed: true }),
     })
     if (selectedProjectPath.value === target.path) selectedProjectPath.value = ''
     projectDeleteTarget.value = null
@@ -1982,6 +2252,7 @@ function toggleTerminalPane() {
 
 function selectApprovalMode(mode: ApprovalMode) {
   approvalMode.value = mode
+  setPermissionProfile(mode === 'full' ? 'full_access' : mode === 'auto' ? 'workspace' : 'guided')
   approvalMenuOpen.value = false
 }
 
@@ -2145,10 +2416,11 @@ async function readWorkspaceFile(path: string) {
 
 async function saveWorkspaceFile() {
   if (!openWorkspaceFile.value) return
+  if (!confirm(`保存对「${openWorkspaceFile.value.name}」的修改？旧版本将保留在审计记录中。`)) return
   await guard(async () => {
     const saved = await request<WorkspaceFile>(`/workspace/file?${workspaceQuery(openWorkspaceFile.value!.path)}`, {
       method: 'PUT',
-      body: JSON.stringify({ content: editorContent.value }),
+      body: JSON.stringify({ content: editorContent.value, confirmed: true }),
     })
     openWorkspaceFile.value = saved
     editorContent.value = saved.content
@@ -2507,6 +2779,7 @@ async function refreshAll() {
   await guard(async () => {
     health.value = await request('/health')
     await Promise.all([loadProjects(), loadSessions(), loadMemories(), loadProviders(), loadModelTemplates()])
+    await loadTendency()
     await ensureDefaultChat()
   })
 }
@@ -2562,6 +2835,7 @@ async function newSession(projectId?: string) {
     closeWorkbench()
     await loadProjects()
     await loadSessions()
+    if (tab.value === 'memory') await loadTendency()
     await nextTick()
     await scrollMessages()
   })
@@ -2580,6 +2854,7 @@ async function openSession(id: string) {
     messages.value = res.messages || []
     chatViewKey.value = id
     await loadLatestAgentRun(id)
+    if (tab.value === 'memory') await loadTendency()
     await nextTick()
     await scrollMessages()
   })
@@ -2638,9 +2913,9 @@ async function archiveSession(session: ChatSession) {
 }
 
 async function deleteSession(session: ChatSession) {
-  if (!confirm(`确认删除「${displaySessionTitle(session)}」？原始消息也会删除。`)) return
+  if (!confirm(`确认删除「${displaySessionTitle(session)}」？会话将隐藏，原始消息仍保留在本地。`)) return
   await guard(async () => {
-    await request(`/chat/sessions/${session.id}`, { method: 'DELETE' })
+    await request(`/chat/sessions/${session.id}?confirmed=true`, { method: 'DELETE' })
     if (activeSession.value === session.id) {
       activeSession.value = ''
       messages.value = []
@@ -2762,12 +3037,46 @@ async function consolidate() {
   await guard(async () => {
     lastConsolidation.value = await request(`/chat/${activeSession.value}/consolidate`, { method: 'POST' })
     await loadSessions()
+    await loadTendency()
   })
 }
 
 async function loadMemories() {
   const res: any = await request('/memories')
   memories.value = res.memories || []
+}
+
+async function loadTendency() {
+  const projectId = activeWorkspaceProjectId.value
+  const params = new URLSearchParams()
+  if (projectId) params.set('project_id', projectId)
+  if (activeSession.value) params.set('session_id', activeSession.value)
+  const query = params.toString() ? `?${params.toString()}` : ''
+  tendencyOverview.value = await request(`/memory/tendency${query}`)
+}
+
+async function compileTendency(scope: TendencyScopeKind, action: 'compile' | 'rebuild') {
+  const projectId = scope === 'workspace' ? activeWorkspaceProjectId.value : ''
+  const sessionId = activeSession.value
+  if (scope === 'workspace' && !projectId) return
+  if (scope === 'session' && !sessionId) return
+  const needsConfirmation = action === 'rebuild' || scope !== 'session'
+  if (needsConfirmation && !confirm(scope === 'session' ? '重新编译该倾向 profile？' : '将当前会话中的稳定倾向晋升到该范围？')) return
+  tendencyBusy.value = `${scope}:${action}`
+  await guard(async () => {
+    await request('/memory/tendency/compile', {
+      method: 'POST',
+      body: JSON.stringify({
+        scope_kind: scope,
+        project_id: projectId || null,
+        session_id: sessionId || null,
+        action,
+        confirmed: needsConfirmation,
+      }),
+    })
+    await loadTendency()
+  })
+  tendencyBusy.value = ''
 }
 
 async function searchMemories() {
@@ -2781,72 +3090,42 @@ async function searchMemories() {
   })
 }
 
-async function openMemory(slug: string) {
+async function openMemory(recordId: string) {
+  if (!recordId) return
   await guard(async () => {
-    memoryDetail.value = await request(`/memories/${slug}`)
+    memoryDetail.value = await request(`/memories/${recordId}`)
+    const metadata = memoryMetadata(memoryDetail.value)
     memoryEdit.value = {
-      description: memoryDetail.value.description || '',
-      body: memoryDetail.value.body || '',
-      priority: memoryDetail.value.priority || 'normal',
-      mem_type: memoryDetail.value.type || 'user',
+      description: metadata.description || '',
+      body: memoryDetail.value.content || '',
     }
-    mergeSourceSlug.value = ''
   })
 }
 
 async function saveMemory() {
-  if (!memoryDetail.value || !confirm('保存前会备份旧版本并重建索引。继续？')) return
+  const recordId = memoryRecordId(memoryDetail.value)
+  if (!recordId || !confirm('保存前会备份旧版本并写入审计。继续？')) return
   await guard(async () => {
-    await request(`/memories/${memoryDetail.value.slug}`, {
+    await request(`/memories/${recordId}`, {
       method: 'PUT',
-      body: JSON.stringify({ ...memoryEdit.value, reason: 'GUI 手动编辑' }),
+      body: JSON.stringify({
+        body: memoryEdit.value.body,
+        description: memoryEdit.value.description,
+        reason: 'GUI 手动编辑',
+        confirmed: true,
+      }),
     })
-    await openMemory(memoryDetail.value.slug)
-    await loadMemories()
-  })
-}
-
-async function archiveMemory() {
-  if (!memoryDetail.value || !confirm('确认把这条记忆归档到 L3？')) return
-  await guard(async () => {
-    await request(`/memories/${memoryDetail.value.slug}/archive`, { method: 'POST' })
-    await openMemory(memoryDetail.value.slug)
+    await openMemory(recordId)
     await loadMemories()
   })
 }
 
 async function deleteMemory() {
-  if (!memoryDetail.value || !confirm('删除前会备份旧版本，但这仍是危险操作。确认删除？')) return
+  const recordId = memoryRecordId(memoryDetail.value)
+  if (!recordId || !confirm('删除前会备份旧版本并写入审计，但这仍是危险操作。确认删除？')) return
   await guard(async () => {
-    await request(`/memories/${memoryDetail.value.slug}`, { method: 'DELETE' })
+    await request(`/memories/${recordId}?confirmed=true`, { method: 'DELETE' })
     memoryDetail.value = null
-    await loadMemories()
-  })
-}
-
-async function mergeMemory() {
-  if (!memoryDetail.value || !mergeSourceSlug.value.trim()) return
-  if (!confirm(`确认将 ${mergeSourceSlug.value} 合并到 ${memoryDetail.value.slug}？来源记忆会被归档。`)) return
-  await guard(async () => {
-    await request('/memories/merge', {
-      method: 'POST',
-      body: JSON.stringify({
-        target_slug: memoryDetail.value.slug,
-        source_slug: mergeSourceSlug.value,
-        merged_body: memoryEdit.value.body,
-        description: memoryEdit.value.description,
-        priority: memoryEdit.value.priority,
-        mem_type: memoryEdit.value.mem_type,
-      }),
-    })
-    await openMemory(memoryDetail.value.slug)
-    await loadMemories()
-  })
-}
-
-async function rebuildIndex() {
-  await guard(async () => {
-    await request('/memories/rebuild-index', { method: 'POST' })
     await loadMemories()
   })
 }
@@ -2866,26 +3145,55 @@ async function openHistory(id: string) {
   })
 }
 
-async function migrateLegacy() {
-  if (!confirm('导入旧历史到 IwIw 会话记忆？已有数据会跳过。')) return
-  await guard(async () => {
-    await request('/session-memory/migrate-legacy', { method: 'POST' })
-    await searchHistory()
-    await loadProjects()
-    await loadSessions()
-  })
+function applyProvidersResponse(res: any) {
+  const providerList: Provider[] = Array.isArray(res) ? res : Array.isArray(res?.providers) ? res.providers : []
+  const roleDefaults = emptyModelRoleDefaults()
+  const rawRoles = !Array.isArray(res) && res?.role_defaults && typeof res.role_defaults === 'object' ? res.role_defaults : {}
+  for (const role of modelRoleIds) {
+    const ref = rawRoles[role]
+    roleDefaults[role] = {
+      provider_id: String(ref?.provider_id || ''),
+      model: String(ref?.model || ''),
+    }
+  }
+  providers.value = { role_defaults: roleDefaults, providers: providerList }
+  reconcileRoleDefaults()
+  savedRoleDefaultsSnapshot.value = roleDefaultsSignature(providers.value.role_defaults)
 }
 
 async function loadProviders() {
   const res: any = await request('/models/providers')
-  providers.value = Array.isArray(res)
-    ? { active_provider_id: res[0]?.id || '', providers: res }
-    : { active_provider_id: res.active_provider_id || '', providers: res.providers || [] }
+  applyProvidersResponse(res)
 }
 
 async function loadModelTemplates() {
   const res: any = await request('/models/templates')
   modelTemplates.value = res.templates || []
+}
+
+function fillProviderForm(provider: Partial<Provider>) {
+  providerForm.id = provider.id || ''
+  providerForm.label = provider.label || ''
+  providerForm.api_style = provider.api_style || 'openai'
+  providerForm.base_url = provider.base_url || ''
+  providerForm.api_key_env = provider.api_key_env || ''
+  providerForm.enabled = provider.enabled !== false
+  providerForm.streaming = provider.streaming !== false
+  providerForm.models = normalizeModels(provider.models)
+  providerModelsText.value = providerForm.models.join(', ')
+}
+
+function openAddModelDialog() {
+  modelTestResult.value = null
+  modelTemplateDialogOpen.value = true
+}
+
+function closeAddModelDialog() {
+  modelTemplateDialogOpen.value = false
+}
+
+function closeModelEditor() {
+  modelEditorOpen.value = false
 }
 
 function applyTemplate(template: any) {
@@ -2894,38 +3202,43 @@ function applyTemplate(template: any) {
   const models = normalizeModels(template.models)
   modelViewKey.value = `template:${template.id}:${suffix}`
   modelTestResult.value = null
-  providerForm.id = id
-  providerForm.label = template.label || '自定义模型'
-  providerForm.api_style = template.api_style || 'openai'
-  providerForm.base_url = template.base_url || ''
-  providerForm.api_key_env = 'MEMORY_AGENT_LLM_API_KEY'
-  providerForm.enabled = true
-  providerForm.streaming = template.streaming !== false
-  providerForm.models = [...models]
-  providerModelsText.value = models.join(', ')
-  const first = models[0] || ''
-  providerForm.defaults = { chat: first, summary: first, memory: first }
+  providerEditorMode.value = 'create'
+  fillProviderForm({
+    id,
+    label: template.label || '自定义模型',
+    api_style: template.api_style || 'openai',
+    base_url: template.base_url || '',
+    api_key_env: 'MEMORY_AGENT_LLM_API_KEY',
+    enabled: true,
+    streaming: template.streaming !== false,
+    models,
+  })
   activeProviderId.value = ''
+  modelTemplateDialogOpen.value = false
+  modelEditorOpen.value = true
+}
+
+function duplicateProvider(provider: Provider) {
+  const suffix = Date.now().toString().slice(-5)
+  providerEditorMode.value = 'create'
+  modelViewKey.value = `provider-copy:${provider.id}:${suffix}`
+  modelTestResult.value = null
+  fillProviderForm({
+    ...provider,
+    id: `${provider.id}-copy-${suffix}`,
+    label: `${provider.label || provider.id} 副本`,
+  })
+  activeProviderId.value = ''
+  modelEditorOpen.value = true
 }
 
 function editProvider(provider: Provider) {
   activeProviderId.value = provider.id
   modelViewKey.value = `provider:${provider.id}`
   modelTestResult.value = null
-  providerForm.id = provider.id
-  providerForm.label = provider.label
-  providerForm.api_style = provider.api_style
-  providerForm.base_url = provider.base_url
-  providerForm.api_key_env = provider.api_key_env || ''
-  providerForm.enabled = Boolean(provider.enabled)
-  providerForm.streaming = provider.streaming !== false
-  providerForm.models = normalizeModels(provider.models)
-  providerModelsText.value = providerForm.models.join(', ')
-  providerForm.defaults = {
-    chat: provider.defaults?.chat || providerForm.models[0] || '',
-    summary: provider.defaults?.summary || providerForm.models[0] || '',
-    memory: provider.defaults?.memory || providerForm.models[0] || '',
-  }
+  providerEditorMode.value = 'edit'
+  fillProviderForm(provider)
+  modelEditorOpen.value = true
 }
 
 function upsertProvider() {
@@ -2943,23 +3256,33 @@ function upsertProvider() {
     enabled: providerForm.enabled,
     streaming: providerForm.streaming !== false,
     models,
-    defaults: { ...providerForm.defaults },
   }
   const index = providers.value.providers.findIndex((provider) => provider.id === item.id)
   if (index >= 0) providers.value.providers.splice(index, 1, item)
   else providers.value.providers.push(item)
   activeProviderId.value = item.id
-  if (!providers.value.active_provider_id) providers.value.active_provider_id = item.id
+  reconcileRoleDefaults()
   return true
 }
 
-function setActiveProvider(id: string) {
-  const providerId = id.trim()
-  if (!providerId) return
-  const exists = providers.value.providers.some((provider) => provider.id === providerId)
-  if (!exists && !upsertProvider()) return
-  providers.value.active_provider_id = providerId
-  activeProviderId.value = providerId
+async function persistProviderState(alreadyConfirmed = false) {
+  if (!alreadyConfirmed && !confirm('保存模型配置？此操作会修改本机配置文件。')) return false
+  try {
+    error.value = ''
+    const res = await request('/models/providers', {
+      method: 'PUT',
+      body: JSON.stringify({
+        role_defaults: providers.value.role_defaults,
+        providers: providers.value.providers,
+        confirmed: true,
+      }),
+    })
+    applyProvidersResponse(res)
+    return true
+  } catch (err: any) {
+    error.value = err?.message || String(err)
+    return false
+  }
 }
 
 function currentProviderDraft(): Provider {
@@ -2973,33 +3296,47 @@ function currentProviderDraft(): Provider {
     enabled: providerForm.enabled,
     streaming: providerForm.streaming !== false,
     models,
-    defaults: { ...providerForm.defaults },
   }
 }
 
-async function saveProviders() {
-  await guard(async () => {
-    if (providerForm.id.trim() || providerForm.label.trim()) upsertProvider()
-    providers.value = await request('/models/providers', {
-      method: 'PUT',
-      body: JSON.stringify({
-        active_provider_id: providers.value.active_provider_id,
-        providers: providers.value.providers,
-      }),
-    })
-  })
+async function saveModelSettings() {
+  return await persistProviderState()
 }
 
-async function testProvider() {
-  const provider = currentProviderDraft()
+async function saveProviderConfig() {
+  if (!upsertProvider()) return false
+  const saved = await persistProviderState()
+  if (saved) modelEditorOpen.value = false
+  return saved
+}
+
+async function saveProviders() {
+  return await persistProviderState()
+}
+
+async function deleteProvider(provider: Provider) {
+  if (!confirm(`删除模型配置“${provider.label || provider.id}”？`)) return
+  providers.value.providers = providers.value.providers.filter((item) => item.id !== provider.id)
+  if (activeProviderId.value === provider.id) activeProviderId.value = ''
+  reconcileRoleDefaults()
+  await persistProviderState(true)
+}
+
+async function testProvider(providerOverride?: Provider) {
+  const provider = providerOverride ? { ...providerOverride, models: normalizeModels(providerOverride.models) } : currentProviderDraft()
   if (!provider.id) return
+  if (!providerOverride) {
+    if (!upsertProvider() || !await persistProviderState()) return
+  }
+  if (!confirm(`测试“${provider.label || provider.id}”连接？此操作会向配置的地址发送模型凭据。`)) return
+  activeProviderId.value = provider.id
   modelTesting.value = true
   modelTestResult.value = { status: 'pending', text: '正在测试连接...' }
   const started = performance.now()
   try {
     const res: any = await request('/models/providers/test', {
       method: 'POST',
-      body: JSON.stringify({ provider }),
+      body: JSON.stringify({ provider, confirmed: true }),
     })
     const latency = Math.round(Number(res.latency_ms) || performance.now() - started)
     if (res.ok) {
@@ -3552,7 +3889,7 @@ input:focus, textarea:focus, select:focus {
 }
 
 .project-list,
-.session-list, .memory-tier-list {
+.session-list, .memory-source-list {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
@@ -3566,7 +3903,7 @@ input:focus, textarea:focus, select:focus {
 .settings-nav::-webkit-scrollbar,
 .project-list::-webkit-scrollbar,
 .session-list::-webkit-scrollbar,
-.memory-tier-list::-webkit-scrollbar {
+.memory-source-list::-webkit-scrollbar {
   width: 0;
   height: 0;
 }
@@ -3812,13 +4149,13 @@ input:focus, textarea:focus, select:focus {
   font-weight: 700;
 }
 
-.tier-group {
+.source-group {
   display: grid;
   gap: 4px;
   padding-top: 3px;
 }
 
-.tier-group header {
+.source-group header {
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
@@ -3829,17 +4166,20 @@ input:focus, textarea:focus, select:focus {
   font-weight: 800;
 }
 
-.tier-code {
+.source-code {
   border-radius: 5px;
   padding: 2px 6px;
   color: white;
   background: #24211d;
 }
 
-.tier-group.important .tier-code { background: #9a5f3f; }
-.tier-group.normal .tier-code { background: #56766a; }
-.tier-group.archive .tier-code { background: #70757d; }
-.tier-group em { color: #8b867d; font-style: normal; }
+.source-group.message .source-code { background: #56766a; }
+.source-group.tool .source-code { background: #4f6385; }
+.source-group.manual .source-code { background: #9a5f3f; }
+.source-group.file .source-code { background: #6f5e82; }
+.source-group.system_event .source-code { background: #70757d; }
+.source-group.search .source-code { background: #5f6f72; }
+.source-group em { color: #8b867d; font-style: normal; }
 
 .workspace {
   min-width: 0;
@@ -4068,7 +4408,24 @@ input:focus, textarea:focus, select:focus {
   box-shadow: 0 24px 70px rgba(36, 33, 29, .25);
 }
 
+.model-dialog {
+  width: min(520px, calc(100vw - 48px));
+  max-height: min(760px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border: 1px solid #d8d4cb;
+  border-radius: 16px;
+  background: #fffefb;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgba(36, 33, 29, .25);
+}
+
+.model-dialog.wide {
+  width: min(720px, calc(100vw - 48px));
+}
+
 .project-dialog header,
+.model-dialog header,
 .project-dialog footer {
   display: flex;
   align-items: flex-start;
@@ -4076,6 +4433,60 @@ input:focus, textarea:focus, select:focus {
   gap: 12px;
   border-bottom: 1px solid #ebe8e1;
   padding: 14px 16px;
+}
+
+.model-template-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 12px;
+}
+
+.model-template-list button {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  border: 1px solid #dedbd2;
+  border-radius: 8px;
+  background: #fbfaf6;
+  color: #2c2823;
+  padding: 12px;
+  text-align: left;
+}
+
+.model-template-list button:hover {
+  border-color: #24211d;
+  background: #f5f2ec;
+}
+
+.model-template-list span,
+.model-template-list em {
+  min-width: 0;
+  overflow: hidden;
+  color: #746f67;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.model-config-form {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  gap: 0;
+  padding: 16px;
+}
+
+.model-config-form footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid #ebe8e1;
+  margin: 4px -16px -16px;
+  padding: 12px 16px;
 }
 
 .project-dialog footer {
@@ -5205,7 +5616,7 @@ p { color: #746f67; line-height: 1.6; }
   flex-wrap: wrap;
 }
 
-.head-actions button, .primary-action, .secondary-action, .merge-row button {
+.head-actions button, .primary-action, .secondary-action {
   border: 1px solid #cfcbc2;
   border-radius: 11px;
   background: #fffefb;
@@ -5213,7 +5624,7 @@ p { color: #746f67; line-height: 1.6; }
   padding: 9px 12px;
 }
 
-.head-actions button:hover, .primary-action:hover, .secondary-action:hover, .merge-row button:hover,
+.head-actions button:hover, .primary-action:hover, .secondary-action:hover,
 .ghost-btn:hover, .quiet-wide:hover {
   background: #f5f2ec;
 }
@@ -5867,8 +6278,275 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   border-radius: 10px;
 }
 
-.memory-stage, .model-panel {
+.memory-stage, .model-stack, .model-panel {
   max-width: 960px;
+}
+
+.model-stack {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.model-role-panel,
+.model-management-panel {
+  display: grid;
+  gap: 14px;
+  border: 1px solid #e3e0d8;
+  border-radius: 8px;
+  background: #fffefb;
+  padding: 18px;
+}
+
+.model-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.model-section-heading h2 {
+  margin-bottom: 5px;
+}
+
+.model-section-heading p {
+  max-width: 680px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.model-section-heading > span {
+  flex: 0 0 auto;
+  border: 1px solid #dedbd2;
+  border-radius: 999px;
+  background: #fbfaf6;
+  color: #5d574f;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.model-role-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.model-role-grid label {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  margin: 0;
+  border: 1px solid #ebe8e1;
+  border-radius: 8px;
+  background: #fbfaf6;
+  padding: 12px;
+}
+
+.model-role-grid label > span {
+  color: #2c2823;
+  font-size: 14px;
+  font-weight: 820;
+}
+
+.model-role-grid select {
+  width: 100%;
+}
+
+.model-role-grid em {
+  color: #746f67;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.45;
+}
+
+.provider-list {
+  display: grid;
+  gap: 8px;
+}
+
+.provider-row-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(180px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #dedbd2;
+  border-radius: 8px;
+  background: #fbfaf6;
+  color: #2c2823;
+  padding: 12px;
+}
+
+.provider-row-card:hover,
+.provider-row-card.selected {
+  border-color: #24211d;
+  background: #f5f2ec;
+}
+
+.provider-row-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.provider-row-main strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.provider-row-main span,
+.provider-row-main em,
+.provider-row-models {
+  min-width: 0;
+  overflow: hidden;
+  color: #746f67;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.provider-row-models {
+  color: #4f4941;
+  font-weight: 760;
+}
+
+.provider-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.provider-row-actions button {
+  border: 1px solid #d8d4cb;
+  border-radius: 8px;
+  background: #fffefb;
+  color: #2c2823;
+  padding: 7px 9px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.provider-row-actions button:hover {
+  background: #f1eee8;
+}
+
+.provider-empty {
+  border: 1px dashed #d8d4cb;
+  border-radius: 8px;
+  background: #fbfaf6;
+  color: #746f67;
+  padding: 12px;
+  font-size: 13px;
+}
+
+.model-page-nav {
+  display: grid;
+  gap: 8px;
+}
+
+.model-page-nav button {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  border: 1px solid #dedbd2;
+  border-radius: 8px;
+  background: #fbfaf6;
+  color: #2c2823;
+  padding: 12px;
+  text-align: left;
+}
+
+.model-page-nav button:hover,
+.model-page-nav button.active {
+  border-color: #24211d;
+  background: #24211d;
+  color: #fffdf9;
+}
+
+.model-page-nav strong,
+.model-page-nav span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-page-nav span {
+  color: #746f67;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.model-page-nav button.active span {
+  color: #e6dfd4;
+}
+
+.model-page-nav em {
+  width: max-content;
+  border-radius: 999px;
+  background: #a23b2a;
+  color: #fffdf9;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.tendency-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.tendency-card {
+  border: 1px solid #e3e0d8;
+  border-radius: 8px;
+  background: #fffefb;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.tendency-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #5c574f;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.tendency-card header em {
+  color: #8b867d;
+  font-style: normal;
+  font-size: 12px;
+}
+
+.tendency-card pre {
+  min-height: 86px;
+  max-height: 160px;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow: auto;
+  color: #2d2924;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.tendency-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 .editor-panel, .model-panel, .replay-panel {
@@ -5891,7 +6569,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   overflow-wrap: anywhere;
 }
 
-.priority-chip {
+.record-chip {
   flex: 0 0 auto;
   border-radius: 6px;
   padding: 5px 8px;
@@ -5900,10 +6578,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   font-size: 12px;
   font-weight: 800;
 }
-
-.priority-chip.core { background: #24211d; }
-.priority-chip.important { background: #9a5f3f; }
-.priority-chip.archive { background: #70757d; }
 
 label {
   display: grid;
@@ -5922,13 +6596,6 @@ label {
 
 .field-grid.three {
   grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.merge-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 10px;
 }
 
 .history-box {
@@ -6108,8 +6775,20 @@ label {
     border-bottom: 1px solid #ebe8e1;
   }
 
-  .page-head, .composer, .field-grid, .field-grid.three, .merge-row {
+  .page-head, .composer, .field-grid, .field-grid.three, .tendency-panel, .model-role-grid {
     grid-template-columns: 1fr;
+  }
+
+  .model-section-heading {
+    display: grid;
+  }
+
+  .provider-row-card {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-row-actions {
+    justify-content: flex-start;
   }
 
   .page-head {

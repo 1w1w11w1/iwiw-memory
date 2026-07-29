@@ -1,9 +1,23 @@
 const BASE = '/api'
+type PermissionProfile = 'read_only' | 'guided' | 'workspace' | 'full_access'
+
+let permissionProfile: PermissionProfile = 'guided'
+
+export function setPermissionProfile(profile: PermissionProfile): void {
+  permissionProfile = profile
+}
+
+function requestHeaders(options: RequestInit): Headers {
+  const headers = new Headers(options.headers)
+  headers.set('Content-Type', 'application/json')
+  headers.set('X-IwIw-Permission-Profile', permissionProfile)
+  return headers
+}
 
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: requestHeaders(options),
   })
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`
@@ -24,8 +38,8 @@ export async function streamRequest(
   onEvent: (event: any) => void | Promise<void>,
 ): Promise<void> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: requestHeaders(options),
   })
   if (!res.ok || !res.body) {
     let detail = `${res.status} ${res.statusText}`

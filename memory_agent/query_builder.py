@@ -61,9 +61,11 @@ def _extract_keywords(text: str, max_words: int = 8) -> list[str]:
             candidates.append(p)
             # 也拆成 bilgram 提高召回
             if len(p) >= 4:
-                candidates.extend(p[i:i+2] for i in range(len(p)-1))
                 candidates.append(p[:3])  # trigram 前缀
                 candidates.append(p[-3:])  # trigram 后缀
+                bigrams = [p[i:i+2] for i in range(len(p)-1)]
+                candidates.extend(bigrams[-4:])
+                candidates.extend(bigrams[:4])
 
     # 去重、保留顺序
     seen: set[str] = set()
@@ -109,6 +111,7 @@ def build_queries(
     # Query 1：完整用户消息（去停用词后）
     if keywords:
         queries.append(" ".join(keywords))
+        queries.extend(keywords[:4])
 
     # Query 2-3：用户消息中最强的 3-4 个词（缩小范围提高精度）
     if len(keywords) >= 3:

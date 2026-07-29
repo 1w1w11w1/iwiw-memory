@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "selfecho_config"
 LOCAL_CONFIG = CONFIG_DIR / "providers.local.json"
 EXAMPLE_CONFIG = CONFIG_DIR / "providers.local.example.json"
+MODEL_ROLES = ("chat", "summary", "memory")
 
 MODEL_TEMPLATES = [
     {
@@ -54,13 +55,58 @@ def _load_raw() -> dict[str, Any]:
         return json.loads(LOCAL_CONFIG.read_text(encoding="utf-8"))
     if EXAMPLE_CONFIG.exists():
         return json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
-    return {"active_provider_id": "", "providers": []}
+    return {"role_defaults": {}, "providers": []}
 
 
-def _default_active_provider_id(providers: list[dict[str, Any]]) -> str:
+def _fallback_provider_id(providers: list[dict[str, Any]]) -> str:
     enabled = next((p for p in providers if p.get("enabled", True) and p.get("id")), None)
-    first = enabled or next((p for p in providers if p.get("id")), None)
-    return str(first.get("id")) if first else ""
+    return str(enabled.get("id")) if enabled else ""
+
+
+def _first_model(provider: dict[str, Any] | None) -> str:
+    if not provider:
+        return ""
+    models = provider.get("models") if isinstance(provider.get("models"), list) else []
+    return str(models[0]) if models else ""
+
+
+def _model_ref(provider_id: str = "", model: str = "") -> dict[str, str]:
+    return {"provider_id": provider_id, "model": model}
+
+
+def _fallback_provider(providers: list[dict[str, Any]]) -> dict[str, Any] | None:
+    provider_id = _fallback_provider_id(providers)
+    return next((p for p in providers if p.get("id") == provider_id), None)
+
+
+def _role_defaults(raw: dict[str, Any], providers: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    configured = raw.get("role_defaults") if isinstance(raw.get("role_defaults"), dict) else {}
+    providers_by_id = {str(p.get("id")): p for p in providers if p.get("id") and p.get("enabled", True)}
+    fallback = _fallback_provider(providers)
+    result: dict[str, dict[str, str]] = {}
+
+    for role in MODEL_ROLES:
+        ref = configured.get(role) if isinstance(configured.get(role), dict) else {}
+        provider_id = str(ref.get("provider_id") or "")
+        model = str(ref.get("model") or "")
+
+        if not provider_id or not model:
+            candidate = providers_by_id.get(provider_id) if provider_id else fallback
+            candidate = candidate or fallback
+            provider_id = str(candidate.get("id") or "") if candidate else ""
+            model = model or _first_model(candidate)
+
+        provider = providers_by_id.get(provider_id)
+        if provider is None:
+            provider = fallback
+            provider_id = str(provider.get("id") or "") if provider else ""
+            if provider is None:
+                model = ""
+        if provider and model not in [str(item) for item in provider.get("models", [])]:
+            model = _first_model(provider)
+        result[role] = _model_ref(provider_id, model)
+
+    return result
 
 
 def _provider_for_save(provider: dict[str, Any]) -> dict[str, Any]:
@@ -68,20 +114,16 @@ def _provider_for_save(provider: dict[str, Any]) -> dict[str, Any]:
     item.pop("api_key_configured", None)
     item.pop("health", None)
     item.pop("last_test", None)
+    item.pop("defaults", None)
     item["streaming"] = bool(item.get("streaming", True))
-    defaults = item.get("defaults") if isinstance(item.get("defaults"), dict) else {}
     models = item.get("models") if isinstance(item.get("models"), list) else []
-    first = str(models[0]) if models else ""
-    item["defaults"] = {
-        "chat": str(defaults.get("chat") or first),
-        "summary": str(defaults.get("summary") or first),
-        "memory": str(defaults.get("memory") or first),
-    }
+    item["models"] = [str(model).strip() for model in models if str(model).strip()]
     return item
 
 
 def _safe_provider(provider: dict[str, Any]) -> dict[str, Any]:
     p = dict(provider)
+    p.pop("defaults", None)
     if "api_key" in p:
         p["api_key"] = "***" if p["api_key"] else ""
     env_name = p.get("api_key_env")
@@ -93,9 +135,8 @@ def _safe_provider(provider: dict[str, Any]) -> dict[str, Any]:
 def list_providers() -> dict[str, Any]:
     raw = _load_raw()
     providers = raw.get("providers", [])
-    active_provider_id = str(raw.get("active_provider_id") or "") or _default_active_provider_id(providers)
     return {
-        "active_provider_id": active_provider_id,
+        "role_defaults": _role_defaults(raw, providers),
         "providers": [_safe_provider(p) for p in providers],
     }
 
@@ -104,8 +145,10 @@ def list_model_templates() -> dict[str, Any]:
     return {"templates": MODEL_TEMPLATES}
 
 
-def save_providers(providers: list[dict[str, Any]], active_provider_id: str | None = None) -> dict[str, Any]:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def render_providers_config(
+    providers: list[dict[str, Any]],
+    role_defaults: dict[str, Any] | None = None,
+) -> str:
     raw = _load_raw()
     current = {p.get("id"): p for p in raw.get("providers", [])}
     merged = []
@@ -117,30 +160,27 @@ def save_providers(providers: list[dict[str, Any]], active_provider_id: str | No
         if item.get("api_key") == "***":
             item["api_key"] = old.get("api_key", "")
         merged.append(_provider_for_save(item))
-    active = active_provider_id or raw.get("active_provider_id") or _default_active_provider_id(merged)
-    ids = {p.get("id") for p in merged}
-    if active not in ids:
-        active = _default_active_provider_id(merged)
-    LOCAL_CONFIG.write_text(
-        json.dumps({"active_provider_id": active, "providers": merged}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    next_raw = {"role_defaults": role_defaults or raw.get("role_defaults") or {}, "providers": merged}
+    normalized_roles = _role_defaults(next_raw, merged)
+    return json.dumps(
+        {"role_defaults": normalized_roles, "providers": merged},
+        ensure_ascii=False,
+        indent=2,
     )
-    return list_providers()
 
 
 def active_provider(role: str = "chat") -> dict[str, Any] | None:
     raw = _load_raw()
     providers = raw.get("providers", [])
-    active = str(raw.get("active_provider_id") or "") or _default_active_provider_id(providers)
-    provider = next((p for p in providers if p.get("id") == active), None)
-    if provider is None:
-        provider = next((p for p in providers if p.get("enabled", True)), None)
+    role_key = role if role in MODEL_ROLES else "chat"
+    role_defaults = _role_defaults(raw, providers)
+    role_ref = role_defaults.get(role_key, {})
+    provider = next((p for p in providers if p.get("id") == role_ref.get("provider_id")), None)
     if provider is None:
         return None
     item = dict(provider)
-    defaults = item.get("defaults") if isinstance(item.get("defaults"), dict) else {}
-    models = item.get("models") if isinstance(item.get("models"), list) else []
-    item["model"] = defaults.get(role) or defaults.get("chat") or (models[0] if models else "")
+    item.pop("defaults", None)
+    item["model"] = role_ref.get("model") or _first_model(provider)
     item["api_key"] = _provider_key(item)
     return item
 

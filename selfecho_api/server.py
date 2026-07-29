@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import mimetypes
@@ -10,39 +11,31 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.responses import FileResponse, StreamingResponse
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
-from memory_agent.db import (
-    archive_memory_result,
-    delete_memory_result,
-    list_history,
-    list_memories_compat as list_memories,
-    merge_memories_result,
-    read_history,
-    read_memory_full,
-    rebuild_index,
-    replace_memory_result,
-    restore_memory_from_history_result,
-)
-from memory_agent.db import (
-    get_memory,
-    list_pending_actions,
-    approve_pending_action_result,
-    reject_pending_action,
-    get_stats,
-)
+from memory_agent.engine import MemoryMutationContext, default_memory_engine
+from memory_agent.scopes import ActiveMemoryScope
 from selfecho_agent import AgentResponse, AgentRunner
+from selfecho_agent.file_mutations import FileMutationService
+from selfecho_config.model_profiles import (
+    LOCAL_CONFIG as PROVIDERS_CONFIG_PATH,
+    list_model_templates,
+    list_providers,
+    render_providers_config,
+    test_provider,
+)
 from selfecho_session import SessionMemoryService
-from selfecho_session.config import DB_PATH, LEGACY_DB_PATH
+from selfecho_session.config import DB_PATH
 
-from .model_config import list_model_templates, list_providers, save_providers, test_provider, test_provider_config
-from .prompt_service import list_prompts, preview_prompt, read_prompt, write_prompt
+from .prompt_service import list_prompts, preview_prompt, prompt_path, read_prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB_DIST = ROOT / "web" / "dist"
@@ -90,16 +83,78 @@ TEXT_SUFFIXES = {
     ".gitignore",
 }
 
+ALLOWED_BROWSER_ORIGINS = {
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+}
+PERMISSION_PROFILE_HEADER = "x-iwiw-permission-profile"
+PERMISSION_PROFILES = {"read_only", "guided", "workspace", "full_access"}
+
 app = FastAPI(title="IwIw API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=sorted(ALLOWED_BROWSER_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def validate_browser_origin(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in ALLOWED_BROWSER_ORIGINS:
+        return JSONResponse({"detail": "origin not allowed"}, status_code=403)
+    path = request.url.path
+    memory_management = (
+        path.startswith("/api/memories")
+        or path.startswith("/api/memory/")
+        or path.startswith("/api/memory-")
+        or path.startswith("/api/session-memory/")
+        or (request.method in {"DELETE", "POST"} and path.startswith("/api/chat/sessions/"))
+        or (request.method in {"POST", "PATCH", "DELETE"} and path == "/api/filesystem/directory")
+        or (request.method == "PUT" and path == "/api/workspace/file")
+        or (request.method == "PUT" and path.startswith("/api/prompts/"))
+        or (request.method in {"PUT", "POST"} and path.startswith("/api/models/providers"))
+    )
+    if memory_management and not _trusted_browser_source(request):
+        return JSONResponse({"detail": "trusted browser source required"}, status_code=403)
+    return await call_next(request)
+
+
+def _trusted_browser_source(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if origin:
+        return origin in ALLOWED_BROWSER_ORIGINS
+    referer = request.headers.get("referer")
+    if not referer:
+        return False
+    parsed = urlsplit(referer)
+    return f"{parsed.scheme}://{parsed.netloc}" in ALLOWED_BROWSER_ORIGINS
+
+
+def _memory_mutation_context(
+    request: Request,
+    *,
+    confirmed: bool,
+    action: str,
+    target_id: str,
+) -> MemoryMutationContext:
+    permission_profile = request.headers.get(PERMISSION_PROFILE_HEADER, "read_only").strip().lower()
+    if permission_profile not in PERMISSION_PROFILES:
+        permission_profile = "read_only"
+    return MemoryMutationContext(
+        permission_profile=permission_profile,
+        confirmed=confirmed,
+        source="trusted_gui" if _trusted_browser_source(request) else "untrusted",
+        action=action,
+        target_id=target_id,
+    )
+
 session_service = SessionMemoryService()
 agent_runner = AgentRunner(session_service, read_prompt)
+file_mutation_service = FileMutationService()
 
 
 class ChatMessageRequest(BaseModel):
@@ -133,25 +188,23 @@ class ChatProjectUpdateRequest(BaseModel):
 
 
 class MemoryEditRequest(BaseModel):
-    description: str
     body: str
-    mem_type: str = "user"
-    priority: str = "normal"
-    event_date: str | None = None
+    description: str = ""
     reason: str = "GUI edit"
+    confirmed: bool = False
 
 
-class MemoryMergeRequest(BaseModel):
-    target_slug: str
-    source_slug: str
-    merged_body: str
-    description: str
-    priority: str | None = None
-    mem_type: str | None = None
+class TendencyCompileRequest(BaseModel):
+    scope_kind: str = "agent_global"
+    project_id: str | None = None
+    session_id: str | None = None
+    action: str = "compile"
+    confirmed: bool = False
 
 
 class PromptWriteRequest(BaseModel):
     content: str
+    confirmed: bool = False
 
 
 class PromptPreviewRequest(BaseModel):
@@ -160,29 +213,35 @@ class PromptPreviewRequest(BaseModel):
 
 class ProvidersWriteRequest(BaseModel):
     providers: list[dict[str, Any]]
-    active_provider_id: str | None = None
+    role_defaults: dict[str, Any] | None = None
+    confirmed: bool = False
 
 
 class ProviderTestRequest(BaseModel):
     provider: dict[str, Any]
+    confirmed: bool = False
 
 
 class WorkspaceFileWriteRequest(BaseModel):
     content: str
+    confirmed: bool = False
 
 
 class FileSystemDirectoryCreateRequest(BaseModel):
     parent: str = ""
     name: str | None = None
+    confirmed: bool = False
 
 
 class FileSystemDirectoryRenameRequest(BaseModel):
     path: str
     name: str
+    confirmed: bool = False
 
 
 class FileSystemDirectoryDeleteRequest(BaseModel):
     path: str
+    confirmed: bool = False
 
 
 class FileSystemDirectoryFavoriteRequest(BaseModel):
@@ -210,6 +269,24 @@ def _workspace_root(project_id: str | None = None) -> Path:
             raise HTTPException(status_code=404, detail="project workspace not found")
         return root
     return ROOT
+
+
+def _active_memory_scope(project_id: str | None = None, session_id: str | None = None) -> ActiveMemoryScope:
+    session = session_service.get_session(session_id) if session_id else None
+    scoped_project_id = project_id or (str(session.get("project_id") or "") if session else "")
+    if session and session.get("scope") != "project":
+        scoped_project_id = ""
+
+    workspace_root: str | None = None
+    if scoped_project_id:
+        project = session_service.get_project(scoped_project_id)
+        if project:
+            workspace_root = str(project.get("path") or "").strip() or None
+    return ActiveMemoryScope.for_session(
+        session_id=str(session.get("id")) if session else session_id,
+        project_id=scoped_project_id or None,
+        workspace_root=workspace_root,
+    )
 
 
 def _workspace_path(relative: str | None = None, project_id: str | None = None) -> Path:
@@ -487,21 +564,18 @@ def _message_metrics(message: str, answer: str, elapsed_ms: int, trace: dict[str
 
 @app.get("/api/health")
 def health():
-    memories = list_memories()
+    try:
+        stats = {"available": True, **default_memory_engine.stats()}
+    except Exception as exc:
+        stats = {"available": False, "error": str(exc)}
     return {
         "ok": True,
-        "memory": {
-            "count": len(memories),
-            "priority": {p: len([m for m in memories if m.get("priority") == p]) for p in ["core", "important", "normal", "archive"]},
-        },
+        "memory": stats,
         "session_memory": {
             "db_path": str(DB_PATH),
             "exists": DB_PATH.exists(),
             "sessions": len(session_service.list_sessions(limit=100000, include_archived=True)),
             "projects": len(session_service.list_projects(include_archived=True)),
-        },
-        "legacy_import": {
-            "available": LEGACY_DB_PATH.exists(),
         },
         "providers": list_providers(),
         "prompts": list_prompts(),
@@ -565,7 +639,7 @@ def filesystem_directories(path: str = ""):
 
 
 @app.post("/api/filesystem/directory")
-def filesystem_directory_create(req: FileSystemDirectoryCreateRequest):
+def filesystem_directory_create(request: Request, req: FileSystemDirectoryCreateRequest):
     parent = _fs_path(req.parent) if req.parent.strip() else _default_project_parent()
     if req.name and req.name.strip():
         target = (parent / _valid_dir_name(req.name)).resolve()
@@ -573,41 +647,62 @@ def filesystem_directory_create(req: FileSystemDirectoryCreateRequest):
         target = _next_project_dir(parent)
     if target.exists():
         raise HTTPException(status_code=409, detail="directory already exists")
-    try:
-        target.mkdir()
-    except OSError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    return _fs_dir_item(target)
+    result = file_mutation_service.create_directory(
+        target,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="filesystem.directory.create",
+            target_id=str(target),
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {**_fs_dir_item(target), "mutation": result.to_dict()}
 
 
 @app.patch("/api/filesystem/directory")
-def filesystem_directory_rename(req: FileSystemDirectoryRenameRequest):
+def filesystem_directory_rename(request: Request, req: FileSystemDirectoryRenameRequest):
     target = _fs_path(req.path)
     new_name = _valid_dir_name(req.name)
     next_path = (target.parent / new_name).resolve()
     if next_path.exists() and next_path != target:
         raise HTTPException(status_code=409, detail="directory already exists")
-    try:
-        target.rename(next_path)
-    except OSError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    return _fs_dir_item(next_path)
+    target_id = f"{target} -> {next_path}"
+    result = file_mutation_service.rename_directory(
+        target,
+        next_path,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="filesystem.directory.rename",
+            target_id=target_id,
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {**_fs_dir_item(next_path), "mutation": result.to_dict()}
 
 
 @app.delete("/api/filesystem/directory")
-def filesystem_directory_delete(req: FileSystemDirectoryDeleteRequest):
+def filesystem_directory_delete(request: Request, req: FileSystemDirectoryDeleteRequest):
     target = _fs_path(req.path)
     if target.parent == target:
         raise HTTPException(status_code=400, detail="cannot delete filesystem root")
-    try:
-        if any(target.iterdir()):
-            raise HTTPException(status_code=409, detail="directory is not empty")
-        target.rmdir()
-    except HTTPException:
-        raise
-    except OSError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    return {"ok": True, "deleted": str(target)}
+    if any(target.iterdir()):
+        raise HTTPException(status_code=409, detail="directory is not empty")
+    result = file_mutation_service.delete_empty_directory(
+        target,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="filesystem.directory.delete",
+            target_id=str(target),
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"ok": True, "deleted": str(target), "mutation": result.to_dict()}
 
 
 @app.post("/api/filesystem/pick-directory")
@@ -671,7 +766,7 @@ def workspace_file(path: str, project_id: str | None = None):
 
 
 @app.put("/api/workspace/file")
-def workspace_file_write(path: str, req: WorkspaceFileWriteRequest, project_id: str | None = None):
+def workspace_file_write(request: Request, path: str, req: WorkspaceFileWriteRequest, project_id: str | None = None):
     root = _workspace_root(project_id)
     target = _workspace_path(path, project_id)
     if not target.exists():
@@ -686,13 +781,25 @@ def workspace_file_write(path: str, req: WorkspaceFileWriteRequest, project_id: 
     encoded = req.content.encode("utf-8")
     if len(encoded) > 600_000:
         raise HTTPException(status_code=413, detail="file is too large to save")
-    target.write_text(req.content, encoding="utf-8")
+    result = file_mutation_service.write_file(
+        target,
+        req.content,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="workspace.file.write",
+            target_id=str(target),
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
     return {
         "name": target.name,
         "path": _rel(target, root),
         "full_path": str(target),
         "content": req.content,
         "size": target.stat().st_size,
+        "mutation": result.to_dict(),
     }
 
 
@@ -749,6 +856,8 @@ def list_chat_sessions(
 @app.patch("/api/chat/sessions/{session_id}")
 def update_chat_session(session_id: str, req: ChatSessionUpdateRequest):
     try:
+        if req.archived is True:
+            session_service.consolidate(session_id, force=True)
         return session_service.update_session(
             session_id,
             title=req.title,
@@ -761,10 +870,37 @@ def update_chat_session(session_id: str, req: ChatSessionUpdateRequest):
 
 
 @app.delete("/api/chat/sessions/{session_id}")
-def delete_chat_session(session_id: str):
-    if not session_service.delete_session(session_id):
-        raise HTTPException(status_code=404, detail="session not found")
-    return {"ok": True, "deleted": session_id}
+def delete_chat_session(request: Request, session_id: str, confirmed: bool = False):
+    result = session_service.delete_session(
+        session_id,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=confirmed,
+            action="session.delete",
+            target_id=session_id,
+        ),
+    )
+    if not result.ok:
+        status = 404 if result.error == "session not found" else 400
+        raise HTTPException(status_code=status, detail=result.to_dict())
+    return {"ok": True, "mutation": result.to_dict(), "deleted": result.target_id}
+
+
+@app.post("/api/chat/sessions/{session_id}/restore/{version}")
+def restore_chat_session(request: Request, session_id: str, version: str, confirmed: bool = False):
+    result = session_service.restore_session_version(
+        session_id,
+        version,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=confirmed,
+            action="session.restore",
+            target_id=session_id,
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"ok": True, "mutation": result.to_dict(), "session": session_service.get_session(session_id)}
 
 
 @app.post("/api/chat/{session_id}/message")
@@ -785,8 +921,8 @@ async def chat_message(session_id: str, req: ChatMessageRequest):
     )
     session = session_service.get_session(session_id)
     consolidation = None
-    if session and not req.private and int(session["turn_count"]) % 12 == 0:
-        result = session_service.consolidate(session_id)
+    if session and not req.private and session_service.should_consolidate(session_id):
+        result = await asyncio.to_thread(session_service.consolidate, session_id)
         consolidation = result.__dict__
     return {
         "answer": answer,
@@ -807,8 +943,16 @@ async def chat_message_stream(session_id: str, req: ChatMessageRequest):
         started = time.perf_counter()
         final_answer = ""
         final_trace: dict[str, Any] = {}
+        assistant_saved = False
         try:
             async for event in agent_runner.respond_stream(session_id, req.message):
+                if event.get("type") == "meta":
+                    final_trace = {
+                        "run_id": event.get("run_id"),
+                        "status": event.get("status", "running"),
+                    }
+                    yield _sse(event)
+                    continue
                 if event.get("type") == "delta":
                     final_answer += str(event.get("text") or "")
                     yield _sse(event)
@@ -824,10 +968,11 @@ async def chat_message_stream(session_id: str, req: ChatMessageRequest):
                         private=req.private,
                         metadata=_message_metrics(req.message, final_answer, elapsed_ms, final_trace),
                     )
+                    assistant_saved = True
                     session = session_service.get_session(session_id)
                     consolidation = None
-                    if session and not req.private and int(session["turn_count"]) % 12 == 0:
-                        result = session_service.consolidate(session_id)
+                    if session and not req.private and session_service.should_consolidate(session_id):
+                        result = await asyncio.to_thread(session_service.consolidate, session_id)
                         consolidation = result.__dict__
                     event = {
                         **event,
@@ -838,6 +983,20 @@ async def chat_message_stream(session_id: str, req: ChatMessageRequest):
                     yield _sse(event)
                     continue
                 yield _sse(event)
+        except (GeneratorExit, asyncio.CancelledError):
+            if final_answer and not assistant_saved:
+                elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+                session_service.append_message(
+                    session_id,
+                    "assistant",
+                    final_answer,
+                    private=req.private,
+                    metadata={
+                        **_message_metrics(req.message, final_answer, elapsed_ms, final_trace),
+                        "status": "cancelled",
+                    },
+                )
+            raise
         except Exception as exc:
             yield _sse({"type": "error", "error": str(exc)})
 
@@ -897,144 +1056,195 @@ def replay_session(session_id: str):
     return {"session": session, "messages": session_service.get_messages(session["id"])}
 
 
-@app.post("/api/session-memory/migrate-legacy")
-def migrate_legacy():
-    return session_service.migrate_legacy()
-
-
 @app.get("/api/memories")
-def memories(priority: str | None = None):
-    return {"memories": list_memories(priority=priority)}
+def memories(source_type: str | None = None, limit: int = 200):
+    records = default_memory_engine.list_records(source_type=source_type, limit=limit, include_all=True)
+    return {"memories": records}
 
 
 @app.get("/api/memories/search")
 def search_memories_api(q: str, limit: int = 20):
-    from memory_agent.retrieval import hybrid_search
-    results = hybrid_search(q, top_k=limit)
-    return {"results": results}
+    results = default_memory_engine.search_records(q, limit=limit)
+    for item in results:
+        item.setdefault("source", "memory_engine")
+    return {"results": results, "trace": {"decision": "management", "total": len(results)}}
 
 
-@app.get("/api/memories/{slug}")
-def memory_detail(slug: str):
-    item = read_memory_full(slug)
-    if not item:
+@app.get("/api/memories/{record_id}")
+def memory_detail(record_id: str):
+    record = default_memory_engine.get_record(record_id, include_all=True)
+    if not record:
         raise HTTPException(status_code=404, detail="memory not found")
-    item["history"] = list_history(slug)
-    return item
+    record["history"] = default_memory_engine.list_record_versions(record_id)
+    return record
 
 
-@app.put("/api/memories/{slug}")
-def edit_memory(slug: str, req: MemoryEditRequest):
-    old = read_memory_full(slug)
+@app.put("/api/memories/{record_id}")
+def edit_memory(request: Request, record_id: str, req: MemoryEditRequest):
+    old = default_memory_engine.get_record(record_id, include_all=True)
     if not old:
         raise HTTPException(status_code=404, detail="memory not found")
-    result = replace_memory_result(
-        slug=slug,
+    result = default_memory_engine.update_record(
+        record_id,
+        content=req.body,
         description=req.description,
-        body=req.body,
-        mem_type=req.mem_type,
-        priority=req.priority,
-        event_date=req.event_date,
-        reason=req.reason,
-        audit_action="manual_edit",
-        details={"priority": req.priority, "type": req.mem_type},
+        reason=req.reason or "manual_edit",
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="memory.update",
+            target_id=record_id,
+        ),
     )
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.to_dict())
+    updated = default_memory_engine.get_record(record_id, include_all=True)
     return {
         "ok": True,
         "mutation": result.to_dict(),
-        "diff": _diff(old["body"], req.body),
-        "memory": read_memory_full(slug),
+        "diff": _diff(old.get("content", ""), req.body),
+        "memory": updated,
     }
 
 
-@app.post("/api/memories/{slug}/archive")
-def archive_memory_api(slug: str):
-    result = archive_memory_result(slug, reason="GUI archive", audit_action="archive")
-    if not result.ok:
-        raise HTTPException(status_code=400, detail=result.to_dict())
-    return {"ok": True, "mutation": result.to_dict(), "memory": read_memory_full(slug)}
-
-
-@app.delete("/api/memories/{slug}")
-def delete_memory_api(slug: str):
-    result = delete_memory_result(slug, reason="GUI delete", audit_action="delete")
-    if not result.ok:
-        raise HTTPException(status_code=400, detail=result.to_dict())
-    return {"ok": True, "mutation": result.to_dict(), "deleted": slug}
-
-
-@app.post("/api/memories/merge")
-def merge_memory_api(req: MemoryMergeRequest):
-    old_target = read_memory_full(req.target_slug)
-    result = merge_memories_result(
-        target_slug=req.target_slug,
-        source_slug=req.source_slug,
-        merged_body=req.merged_body,
-        description=req.description,
-        priority=req.priority,
-        mem_type=req.mem_type,
+@app.delete("/api/memories/{record_id}")
+def delete_memory_api(request: Request, record_id: str, confirmed: bool = False):
+    result = default_memory_engine.delete_record(
+        record_id,
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=confirmed,
+            action="memory.delete",
+            target_id=record_id,
+        ),
+        reason="GUI delete",
     )
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.to_dict())
-    mutation = result.to_dict()
-    mutation["details"]["target_diff"] = _diff(old_target["body"], req.merged_body) if old_target else ""
-    return {
-        "ok": True,
-        "mutation": mutation,
-        "target": read_memory_full(req.target_slug),
-        "source": read_memory_full(req.source_slug),
-    }
+    return {"ok": True, "mutation": result.to_dict(), "deleted": record_id}
 
 
-@app.post("/api/memories/rebuild-index")
-def rebuild_memory_index_api():
-    rebuild_index()
-    return {"ok": True}
-
-
-@app.get("/api/memories/{slug}/history/{version}")
-def memory_history(slug: str, version: str):
-    text = read_history(slug, version)
-    if text is None:
+@app.get("/api/memories/{record_id}/history/{version}")
+def memory_history(record_id: str, version: str):
+    record = default_memory_engine.get_record_version(record_id, version)
+    if not record:
         raise HTTPException(status_code=404, detail="history not found")
-    return {"slug": slug, "version": version, "content": text}
+    return {"record_id": record_id, "version": version, "record": record}
 
 
 @app.get("/api/memory-audit")
 def memory_audit(limit: int = 100):
-    return {"events": session_service.audit_events(limit=limit)}
+    return {"events": default_memory_engine.audit_events(limit=limit)}
 
 
 @app.post("/api/memory-audit/{audit_id}/rollback")
-def rollback_audit(audit_id: str):
-    row = session_service.conn.execute(
-        "SELECT * FROM memory_audit WHERE id = ?",
-        (audit_id,),
-    ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="audit event not found")
-    event = dict(row)
-    slug = event.get("target_slug")
-    backup = event.get("backup_path")
-    if not slug:
-        raise HTTPException(status_code=400, detail="audit event has no target slug")
-
-    # 优先从 memory_versions 表恢复
-    if backup and backup.startswith("version://"):
-        version_id = backup.replace("version://", "")
-        result = restore_memory_from_history_result(
-            slug,
-            version_id,
-            reason=f"rollback audit {audit_id}",
+def rollback_audit(request: Request, audit_id: str, confirmed: bool = False):
+    mutation_context = _memory_mutation_context(
+        request,
+        confirmed=confirmed,
+        action="memory.rollback",
+        target_id=audit_id,
+    )
+    event = default_memory_engine.get_audit_event(audit_id)
+    is_session_rollback = bool(
+        event
+        and event.get("target_type") == "session"
+        and str(event.get("backup_path") or "").startswith("session_version://")
+        and event.get("target_id")
+    )
+    is_workspace_file_rollback = bool(
+        event
+        and event.get("target_type") == "workspace_file"
+        and str(event.get("backup_path") or "").startswith("workspace_version://")
+    )
+    is_directory_rollback = bool(
+        event
+        and event.get("target_type") == "directory"
+        and str(event.get("backup_path") or "").startswith("directory_version://")
+    )
+    if is_session_rollback:
+        if error := mutation_context.authorization_error("memory.rollback", audit_id):
+            raise HTTPException(status_code=400, detail=error)
+        session_id = str(event["target_id"])
+        result = session_service.restore_session_version(
+            session_id,
+            str(event["backup_path"]),
+            mutation_context=mutation_context.delegated("session.restore", session_id),
         )
-        if result.ok and result.target_slug:
-            mutation = result.to_dict()
-            mutation["details"]["rolled_back_event"] = audit_id
-            return {"ok": True, "mutation": mutation, "memory": read_memory_full(result.target_slug)}
+    elif is_workspace_file_rollback or is_directory_rollback:
+        result = file_mutation_service.rollback_audit(
+            audit_id,
+            mutation_context=mutation_context,
+        )
+    else:
+        result = default_memory_engine.rollback_audit(
+            audit_id,
+            mutation_context=mutation_context,
+        )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    response = {
+        "ok": True,
+        "mutation": result.to_dict(),
+    }
+    if is_session_rollback:
+        response["session"] = session_service.get_session(result.target_id or "")
+    elif is_workspace_file_rollback:
+        response["workspace_file"] = {"path": result.target_id}
+    elif is_directory_rollback:
+        response["workspace_directory"] = {"path": result.target_id}
+    else:
+        response["memory"] = default_memory_engine.get_record(result.target_id or "", include_all=True)
+    return response
 
-    raise HTTPException(status_code=400, detail="no restorable version snapshot found")
+
+@app.get("/api/memory/stats")
+def memory_stats():
+    return default_memory_engine.stats()
+
+
+@app.get("/api/memory/tendency")
+def memory_tendency(project_id: str | None = None, session_id: str | None = None, limit: int = 50):
+    active_scope = _active_memory_scope(project_id=project_id, session_id=session_id)
+    return default_memory_engine.tendency_overview(active_scope, limit=limit)
+
+
+@app.post("/api/memory/tendency/compile")
+async def compile_tendency(request: Request, req: TendencyCompileRequest):
+    scope_kind = req.scope_kind.strip() or "agent_global"
+    action = req.action.strip() or "compile"
+    if scope_kind not in {"agent_global", "workspace", "session"}:
+        raise HTTPException(status_code=400, detail="scope_kind must be agent_global, workspace, or session")
+    if action not in {"compile", "rebuild"}:
+        raise HTTPException(status_code=400, detail="action must be compile or rebuild")
+    active_scope = _active_memory_scope(project_id=req.project_id, session_id=req.session_id)
+    if scope_kind == "agent_global":
+        target_scope = active_scope.agent_global()
+    elif scope_kind == "workspace":
+        target_scope = active_scope.workspace()
+        if not target_scope:
+            raise HTTPException(status_code=400, detail="workspace scope requires a project with workspace path")
+    else:
+        target_scope = active_scope.session()
+        if not target_scope:
+            raise HTTPException(status_code=400, detail="session scope requires session_id")
+    result = await default_memory_engine.compile_tendency(
+        scope_kind=target_scope.kind,
+        scope_key=target_scope.key,
+        workspace_id=target_scope.workspace_id,
+        project_id=target_scope.project_id,
+        session_id=req.session_id,
+        rebuild=action == "rebuild",
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="tendency.rebuild" if action == "rebuild" else "tendency.promote",
+            target_id=f"{target_scope.kind}:{target_scope.key}",
+        ),
+    )
+    if not result.get("ok") and result.get("error") not in {"no observations", "no active observations"}:
+        raise HTTPException(status_code=400, detail=result)
+    return {"ok": bool(result.get("ok")), "result": result}
 
 
 @app.get("/api/prompts")
@@ -1051,40 +1261,31 @@ def prompt_detail(name: str):
 
 
 @app.put("/api/prompts/{name}")
-def prompt_write(name: str, req: PromptWriteRequest):
+def prompt_write(request: Request, name: str, req: PromptWriteRequest):
     try:
-        return {"name": name, "content": write_prompt(name, req.content)}
+        target = prompt_path(name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    result = file_mutation_service.write_config_file(
+        target,
+        req.content,
+        action="prompt.write",
+        reason=f"prompt write: {name}",
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="prompt.write",
+            target_id=str(target),
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {"name": name, "content": req.content, "mutation": result.to_dict()}
 
 
 @app.post("/api/prompts/preview")
 def prompt_preview(req: PromptPreviewRequest):
     return {"preview": preview_prompt(req.user_message)}
-
-
-@app.get("/api/memory/pending-actions")
-def memory_pending():
-    return list_pending_actions()
-
-
-@app.post("/api/memory/pending-actions/{pending_id}/approve")
-def memory_pending_approve(pending_id: str):
-    result = approve_pending_action_result(pending_id)
-    if not result.ok:
-        raise HTTPException(status_code=400, detail=result.to_dict())
-    return {"ok": True, "mutation": result.to_dict()}
-
-
-@app.post("/api/memory/pending-actions/{pending_id}/reject")
-def memory_pending_reject(pending_id: str):
-    ok = reject_pending_action(pending_id)
-    return {"ok": ok}
-
-
-@app.get("/api/memory/stats")
-def memory_stats():
-    return get_stats()
 
 
 @app.get("/api/models/providers")
@@ -1098,18 +1299,49 @@ def model_templates():
 
 
 @app.put("/api/models/providers")
-def model_providers_write(req: ProvidersWriteRequest):
-    return save_providers(req.providers, active_provider_id=req.active_provider_id)
+def model_providers_write(request: Request, req: ProvidersWriteRequest):
+    result = file_mutation_service.write_config_file(
+        PROVIDERS_CONFIG_PATH,
+        render_providers_config(req.providers, role_defaults=req.role_defaults),
+        action="model.providers.write",
+        reason="provider configuration write",
+        mutation_context=_memory_mutation_context(
+            request,
+            confirmed=req.confirmed,
+            action="model.providers.write",
+            target_id=str(PROVIDERS_CONFIG_PATH),
+        ),
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.to_dict())
+    return {**list_providers(), "mutation": result.to_dict()}
 
 
 @app.post("/api/models/providers/{provider_id}/test")
-async def model_provider_test(provider_id: str):
+async def model_provider_test(request: Request, provider_id: str, confirmed: bool = False):
+    context = _memory_mutation_context(
+        request,
+        confirmed=confirmed,
+        action="model.provider.test",
+        target_id=provider_id,
+    )
+    if error := context.authorization_error("model.provider.test", provider_id):
+        raise HTTPException(status_code=400, detail=error)
     return await test_provider(provider_id)
 
 
 @app.post("/api/models/providers/test")
-async def model_provider_config_test(req: ProviderTestRequest):
-    return await test_provider_config(req.provider)
+async def model_provider_config_test(request: Request, req: ProviderTestRequest):
+    provider_id = str(req.provider.get("id") or "draft")
+    context = _memory_mutation_context(
+        request,
+        confirmed=req.confirmed,
+        action="model.provider.test",
+        target_id=provider_id,
+    )
+    if error := context.authorization_error("model.provider.test", provider_id):
+        raise HTTPException(status_code=400, detail=error)
+    return await test_provider(provider_id)
 
 
 if WEB_DIST.exists():

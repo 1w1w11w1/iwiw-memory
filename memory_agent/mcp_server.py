@@ -2,65 +2,48 @@
 mcp_server.py — 记忆代理 MCP 服务器
 
 提供工具：
-- extract_and_save:  从对话文本提取记忆并保存
-- search_memories:   BM25 混合搜索（规划中增加向量语义检索）
-- list_memories:     列出记忆，支持按 priority/type 过滤
-- read_memory:       读取单条记忆
-- get_index_stats:   索引统计（记忆数量、类型分布、大小）
-- reindex:           强制重建 BM25 索引
+- search_memories:   语义向量检索
+- list_memories:     列出全量记忆库记录
+- read_memory:       读取单条记录
+- get_index_stats:   统计信息
 
 启动方式：
-  python -m memory-agent.mcp_server
+  python -m memory_agent.mcp_server
 """
 
 import asyncio
 import json
+import os
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from .extractor import extract_and_save
-from .db import (
-    get_memory,
-    list_memories_compat as list_memories,
-    read_memory,
-    rebuild_index,
-)
-from .retrieval import hybrid_search
+from .engine import default_memory_engine
+from .scopes import ActiveMemoryScope
 
 server = Server("memory-agent")
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _host_scope() -> ActiveMemoryScope:
+    return ActiveMemoryScope.for_session(
+        session_id=os.environ.get("IWIW_MCP_SESSION_ID") or None,
+        project_id=os.environ.get("IWIW_MCP_PROJECT_ID") or None,
+        workspace_root=os.environ.get("IWIW_MCP_WORKSPACE_ROOT") or None,
+    )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 工具定义
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
-            name="extract_and_save",
-            description="从文本中提取记忆并自动保存。分析用户消息，识别值得跨会话保存的个人信息（身份、偏好、困难、决策等），ADD-only 追加并 hash 去重。",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "待分析的用户消息文本",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "可选的对话上下文（前几轮对话），帮助理解消息背景",
-                    },
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
             name="search_memories",
-            description="混合搜索记忆库（向量语义 + FTS5 关键词 + 时间衰减 + Priority 加权）。",
+            description="在宿主绑定的当前作用域内搜索记忆。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -72,84 +55,74 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "返回结果数（默认 10）",
                     },
+                    "source_type": {
+                        "type": "string",
+                        "description": "可选来源过滤：message / tool / manual / file / system_event",
+                    },
                 },
                 "required": ["query"],
             },
         ),
         Tool(
             name="list_memories",
-            description="列出所有记忆，支持按 priority 或 type 过滤。",
+            description="列出宿主绑定的当前作用域内的记忆记录。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "priority": {
+                    "source_type": {
                         "type": "string",
-                        "description": "按优先级过滤：core / important / normal / archive",
+                        "description": "按来源类型过滤：message / tool / manual / file / system_event",
                     },
-                    "mem_type": {
-                        "type": "string",
-                        "description": "按类型过滤：user / feedback / project / reference",
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回条数上限（默认 50）",
                     },
                 },
             },
         ),
         Tool(
             name="read_memory",
-            description="读取单条记忆的完整内容。",
+            description="读取单条记忆记录的完整内容。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "slug": {
+                    "record_id": {
                         "type": "string",
-                        "description": "记忆的文件名 slug（不含 .md 后缀）",
+                        "description": "记忆记录完整 ID",
                     },
                 },
-                "required": ["slug"],
+                "required": ["record_id"],
             },
         ),
         Tool(
             name="get_index_stats",
-            description="获取 SQLite 记忆库统计信息：条目数量、类型分布、总大小。",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="rebuild_memory_index",
-            description="从 SQLite 记忆库导出 memory/MEMORY.md 可读索引缓存。",
+            description="获取记忆库统计信息：记录数量、来源分布、向量块数、倾向观察数。",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 工具实现
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    if name == "extract_and_save":
-        message = arguments.get("message", "")
-        context = arguments.get("context", "")
-        saved = await extract_and_save(message, context)
-        return [TextContent(
-            type="text",
-            text=json.dumps(
-                {"new_memories": saved, "count": len(saved)},
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )]
-
-    elif name == "search_memories":
+    if name == "search_memories":
         query = arguments.get("query", "")
         top_k = arguments.get("top_k", 10)
-        results = hybrid_search(query, top_k=top_k)
+        active_scope = _host_scope()
+        results, _trace = default_memory_engine.search(
+            query=query,
+            top_k=top_k,
+            active_scope=active_scope,
+            source_type=arguments.get("source_type") or None,
+        )
         simplified = [
             {
-                "slug": r["slug"],
-                "description": r.get("description", ""),
-                "priority": r.get("priority", "normal"),
+                "record_id": r.get("record_id", ""),
                 "score": r.get("score", 0),
-                "source": r.get("source", "hybrid"),
+                "source": r.get("source", "vector"),
             }
             for r in results
         ]
@@ -159,62 +132,50 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )]
 
     elif name == "list_memories":
-        mems = list_memories(priority=arguments.get("priority"))
-        if mem_type := arguments.get("mem_type"):
-            mems = [m for m in mems if m["type"] == mem_type]
-        # 转换 datetime 为 ISO 字符串，避免 JSON 序列化崩溃
-        sanitized = []
-        for m in mems:
-            d = dict(m)
-            if hasattr(d.get("mtime"), "isoformat"):
-                d["mtime"] = d["mtime"].isoformat()
-            sanitized.append(d)
+        source_type = arguments.get("source_type")
+        limit = arguments.get("limit", 50)
+        active_scope = _host_scope()
+        records = default_memory_engine.list_records(
+            source_type=source_type,
+            limit=limit,
+            active_scope=active_scope,
+        )
+        simplified = [
+            {
+                "id": r["id"],
+                "source_type": r.get("source_type", ""),
+                "scope_type": r.get("scope_type", ""),
+                "created_at": r.get("created_at", ""),
+                "size": len(r.get("content", "")),
+            }
+            for r in records
+        ]
         return [TextContent(
             type="text",
-            text=json.dumps(sanitized, ensure_ascii=False, indent=2),
+            text=json.dumps(simplified, ensure_ascii=False, indent=2),
         )]
 
     elif name == "read_memory":
-        slug = arguments.get("slug", "")
-        content = read_memory(slug)
-        if content is None:
-            return [TextContent(type="text", text=f"Memory '{slug}' not found.")]
-        return [TextContent(type="text", text=content)]
+        record_id = arguments.get("record_id", "")
+        active_scope = _host_scope()
+        record = default_memory_engine.get_record(record_id, active_scope=active_scope)
+        if not record:
+            return [TextContent(type="text", text=f"Record '{record_id}' not found.")]
+        return [TextContent(type="text", text=record.get("content", ""))]
 
     elif name == "get_index_stats":
-        mems = list_memories()
-        type_dist = {}
-        priority_dist = {}
-        total_size = 0
-        for m in mems:
-            t = m.get("type", "unknown")
-            type_dist[t] = type_dist.get(t, 0) + 1
-            p = m.get("priority", "normal")
-            priority_dist[p] = priority_dist.get(p, 0) + 1
-            total_size += m.get("size", 0)
-
+        stats = default_memory_engine.stats(active_scope=_host_scope())
         return [TextContent(
             type="text",
-            text=json.dumps({
-                "total_memories": len(mems),
-                "total_files": len(mems),
-                "total_size_bytes": total_size,
-                "total_size_kb": round(total_size / 1024, 1),
-                "type_distribution": type_dist,
-                "priority_distribution": priority_dist,
-            }, ensure_ascii=False, indent=2),
+            text=json.dumps(stats, ensure_ascii=False, indent=2),
         )]
-
-    elif name == "rebuild_memory_index":
-        rebuild_index()
-        return [TextContent(type="text", text="MEMORY.md cache exported from SQLite.")]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 入口
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main():
     asyncio.run(_run())

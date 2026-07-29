@@ -29,7 +29,6 @@ def _load_dotenv() -> None:
                 value = value.strip().strip('"').strip("'")
                 os.environ.setdefault(key, value)
         except Exception:
-            # 配置读取失败不应该中断主流程
             continue
 
 
@@ -68,63 +67,32 @@ _load_dotenv()
 
 # ── 项目路径 ──
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MEMORY_DIR = PROJECT_ROOT / "memory"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
-# ── 数据库（与会话层合并）──
+# ── 数据库 ──
 MEMORY_DB_PATH = PROJECT_ROOT / "selfecho_data" / "sessions.db"
 
-# ── LLM API 配置 ──
-LLM_API_STYLE = _env("MEMORY_AGENT_LLM_API_STYLE", "anthropic").strip().lower()
-LLM_BASE_URL = _env("MEMORY_AGENT_LLM_BASE_URL", "https://api.deepseek.com/anthropic").rstrip("/")
-LLM_API_KEY = _env("MEMORY_AGENT_LLM_API_KEY", _env("DEEPSEEK_API_KEY", ""))
-LLM_MODEL = _env("MEMORY_AGENT_LLM_MODEL", "deepseek-v4-flash")
-
-# ── 提取配置 ──
+# ── LLM 调用配置 ──
 EXTRACT_MAX_TOKENS = _env_int("MEMORY_AGENT_EXTRACT_MAX_TOKENS", 1200)
 EXTRACT_TEMPERATURE = _env_float("MEMORY_AGENT_EXTRACT_TEMPERATURE", 0.2)
 EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 15.0)
 
-# ── 记忆分级（来自 MemPalace 分层设计） ──
-PRIORITY_TIERS = {
-    "core": {
-        "description": "L0 — 始终加载的核心身份和偏好",
-        "max_chars": 800,
-        "always_load": True,
-    },
-    "important": {
-        "description": "L1 — 重要但非核心（健康、关系、重大决策）",
-        "max_chars": 2000,
-        "always_load": True,
-    },
-    "normal": {
-        "description": "L2 — 按话题触发的日常信息",
-        "max_chars": 5000,
-        "always_load": False,
-    },
-    "archive": {
-        "description": "L3 — 深度搜索按需获取的历史信息",
-        "max_chars": 10000,
-        "always_load": False,
-    },
-}
-
-# ── Hash 去重 ──
-HASH_ALGORITHM = "md5"  # 速度优先，不涉及安全场景
-
-# ── 向量嵌入配置（本地 BGE 模型，中文优化）──
+# ── 向量嵌入配置 ──
 EMBEDDING_MODEL = _env("MEMORY_AGENT_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 EMBEDDING_DIMENSIONS = _env_int("MEMORY_AGENT_EMBEDDING_DIMENSIONS", 512)
 EMBEDDING_BATCH_SIZE = _env_int("MEMORY_AGENT_EMBEDDING_BATCH_SIZE", 16)
-EMBEDDING_DEVICE = _env("MEMORY_AGENT_EMBEDDING_DEVICE", "cpu")  # cpu | cuda | mps
+EMBEDDING_DEVICE = _env("MEMORY_AGENT_EMBEDDING_DEVICE", "cpu")
 
-# ── 检索 ──
+# ── 检索评分权重（对齐设计文档）──
+RETRIEVAL_SEMANTIC_WEIGHT = _env_float("MEMORY_AGENT_RETRIEVAL_SEMANTIC_WEIGHT", 0.55)
+RETRIEVAL_KEYWORD_WEIGHT = _env_float("MEMORY_AGENT_RETRIEVAL_KEYWORD_WEIGHT", 0.25)
+RETRIEVAL_RECENCY_WEIGHT = _env_float("MEMORY_AGENT_RETRIEVAL_RECENCY_WEIGHT", 0.10)
+RETRIEVAL_SCOPE_WEIGHT = _env_float("MEMORY_AGENT_RETRIEVAL_SCOPE_WEIGHT", 0.10)
+
+# ── 检索门控 ──
 HYBRID_TOP_K = _env_int("MEMORY_AGENT_HYBRID_TOP_K", 10)
-HYBRID_SEMANTIC_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_SEMANTIC_WEIGHT", 0.5)
-HYBRID_BM25_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_BM25_WEIGHT", 0.2)
-HYBRID_TIME_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_TIME_WEIGHT", 0.15)
-HYBRID_PRIORITY_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_PRIORITY_WEIGHT", 0.15)
-HYBRID_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_RELEVANCE_THRESHOLD", 0.4)
+HYBRID_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_RELEVANCE_THRESHOLD", 0.45)
+HYBRID_STRONG_SIGNAL_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_STRONG_SIGNAL_THRESHOLD", 0.35)
+RELEVANCE_GATE_FOCUSED_THRESHOLD = _env_float("MEMORY_AGENT_RELEVANCE_GATE_FOCUSED_THRESHOLD", 0.65)
 MEMORY_RECALL_MAX_CHARS = _env_int("MEMORY_AGENT_RECALL_MAX_CHARS", 2500)
 
 # ── 日志 ──

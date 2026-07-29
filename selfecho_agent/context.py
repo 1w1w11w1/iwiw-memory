@@ -1,45 +1,18 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from memory_agent.db import list_memories, read_memory
-from memory_agent.config import LLM_MODEL
+from memory_agent.engine import MemoryEngine, default_memory_engine
+from memory_agent.scopes import ActiveMemoryScope
 
 from selfecho_session import SessionMemoryService
 
 from .modes import IntentDecision
 
 
-WORKSPACE_EXCLUDE_DIRS = {
-    ".git",
-    ".claude",
-    ".codex",
-    "__pycache__",
-    "node_modules",
-    "dist",
-    ".venv",
-    "venv",
-}
-WORKSPACE_EXCLUDE_NAMES = {
-    ".env",
-    "providers.local.json",
-}
-WORKSPACE_EXCLUDE_SUFFIXES = {
-    ".db",
-    ".sqlite",
-    ".sqlite3",
-    ".pdf",
-    ".mp3",
-    ".wav",
-    ".pyc",
-    ".pyo",
-    ".log",
-}
 APP_ROOT = Path(__file__).resolve().parents[1]
-APP_PRIVATE_DIRS = {"memory", "selfecho_data"}
 
 
 @dataclass(frozen=True)
@@ -50,8 +23,13 @@ class ContextBundle:
 
 
 class ContextBuilder:
-    def __init__(self, session_service: SessionMemoryService) -> None:
+    def __init__(
+        self,
+        session_service: SessionMemoryService,
+        memory_engine: MemoryEngine | None = None,
+    ) -> None:
         self.session_service = session_service
+        self.memory_engine = memory_engine or default_memory_engine
 
     def build(
         self,
@@ -60,21 +38,33 @@ class ContextBuilder:
         base_prompt: str,
         user_message: str = "",
     ) -> ContextBundle:
-        core_context, loaded_memory_slugs = self._core_important_context()
+        active_scope = self._active_memory_scope(session_id)
+        memory_context = self.memory_engine.build_context(
+            user_message=user_message,
+            context_messages=self._recent_message_texts(session_id),
+            active_scope=active_scope,
+        )
         sections = [
             self._identity_section(),
             self._mode_section(decision),
             base_prompt.strip(),
-            core_context,
-            self._related_memory_context(session_id, user_message, loaded_memory_slugs),
+            *memory_context.sections,
             self._project_context(session_id),
             self._session_context(session_id),
         ]
         clean_sections = [section for section in sections if section.strip()]
+        trace = memory_context.trace
         metadata = {
             "intent": decision.intent,
             "path": decision.path,
             "reason": decision.reason,
+            "workspace_id": active_scope.workspace_id,
+            "project_id": active_scope.project_id,
+            "memory_available": bool(trace.get("memory_available", True)),
+            "memory_error": trace.get("error", ""),
+            "tendency_profile_ids": sorted(trace.get("tendency_profile_ids", [])),
+            "retrieved_record_ids": trace.get("retrieved_record_ids", []),
+            "memory_budget": trace.get("budget", {}),
         }
         return ContextBundle(
             system_prompt="\n\n".join(clean_sections),
@@ -82,11 +72,27 @@ class ContextBuilder:
             metadata=metadata,
         )
 
+    def _active_memory_scope(self, session_id: str) -> ActiveMemoryScope:
+        try:
+            session = self.session_service.get_session(session_id)
+        except Exception:
+            return ActiveMemoryScope.for_session(session_id=session_id)
+        if not session or session.get("scope") != "project":
+            return ActiveMemoryScope.for_session(session_id=session_id)
+        project_id = str(session.get("project_id") or "").strip()
+        project = self.session_service.get_project(project_id) if project_id else None
+        workspace_root = str(project.get("path") or "").strip() if project else None
+        return ActiveMemoryScope.for_session(
+            session_id=session_id,
+            project_id=project_id or None,
+            workspace_root=workspace_root or None,
+        )
+
     def _identity_section(self) -> str:
         return "\n".join([
             "## IwIw 身份与介绍",
             "你是 IwIw 内置智能体。",
-            f"当前后端默认模型：{LLM_MODEL or '未配置'}。",
+            "当前后端模型由系统配置决定，可通过 selfecho_config 查看。",
             "当用户询问身份、模型或功能时，简短说明：IwIw 可以对话、整理记忆、处理问题，并协助推进工作流。",
             "旧工具来源、本地路径和内部实现不属于常规介绍内容，除非它们和用户当前问题直接相关。",
         ])
@@ -104,40 +110,6 @@ class ContextBuilder:
             f"- reason: {decision.reason}",
             f"- guidance: {guidance}",
         ])
-
-    def _core_important_context(self) -> tuple[str, set[str]]:
-        parts: list[str] = []
-        loaded_slugs: set[str] = set()
-        for priority in ("core", "important"):
-            for mem in list_memories(priority=priority):
-                loaded_slugs.add(mem["slug"])
-                body = read_memory(mem["slug"]) or ""
-                parts.append(f"### {mem['slug']} ({priority})\n{body[:1800]}")
-        if not parts:
-            return "", loaded_slugs
-        return "## L0/L1 长期记忆\n" + "\n\n".join(parts), loaded_slugs
-
-    def _related_memory_context(
-        self,
-        session_id: str,
-        user_message: str,
-        loaded_slugs: set[str],
-    ) -> str:
-        if not user_message.strip():
-            return ""
-        try:
-            from memory_agent.retrieval import format_memory_context, hybrid_search
-
-            results = hybrid_search(
-                user_message=user_message,
-                context_messages=self._recent_message_texts(session_id),
-                top_k=5,
-                relevance_threshold=0.35,
-                exclude_slugs=loaded_slugs,
-            )
-            return format_memory_context(results, max_total_chars=2000)
-        except Exception:
-            return ""
 
     def _recent_message_texts(self, session_id: str, limit: int = 6) -> list[str]:
         if not hasattr(self.session_service, "get_messages"):
@@ -179,46 +151,7 @@ class ContextBuilder:
             return "\n".join(lines)
 
         lines.append("- status: 已绑定到该本地文件夹。回答项目可见范围时应以此路径为准。")
-        snapshot = self._directory_snapshot(project_path)
-        if snapshot:
-            lines.append("")
-            lines.append("### 目录快照（顶层）")
-            lines.extend(snapshot)
         return "\n".join(lines)
-
-    def _directory_snapshot(self, path: Path, limit: int = 40) -> list[str]:
-        rows: list[tuple[str, str]] = []
-        try:
-            children = list(path.iterdir())
-        except OSError as exc:
-            return [f"- 无法读取目录：{exc}"]
-        for child in children:
-            try:
-                if self._is_excluded(child, path):
-                    continue
-                marker = "dir" if child.is_dir() else "file"
-                rows.append((child.name.lower(), f"- [{marker}] {child.name}"))
-            except OSError:
-                continue
-        rows.sort(key=lambda item: item[0])
-        items = [row for _, row in rows[:limit]]
-        if len(rows) > limit:
-            items.append(f"- ... 还有 {len(rows) - limit} 项未展示")
-        return items
-
-    def _is_excluded(self, path: Path, root: Path | None = None) -> bool:
-        name = path.name
-        if root and root.resolve() == APP_ROOT and name in APP_PRIVATE_DIRS:
-            return True
-        if name in WORKSPACE_EXCLUDE_NAMES:
-            return True
-        if path.is_dir() and name in WORKSPACE_EXCLUDE_DIRS:
-            return True
-        if path.is_file() and path.suffix.lower() in WORKSPACE_EXCLUDE_SUFFIXES:
-            return True
-        if os.name == "nt" and name.lower() in {"thumbs.db", "desktop.ini"}:
-            return True
-        return False
 
     def _session_context(self, session_id: str) -> str:
         return "## 当前会话上下文\n" + self.session_service.recent_context(session_id)

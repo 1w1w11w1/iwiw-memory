@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Callable
 
 from selfecho_session import SessionMemoryService
+from selfecho_model import ModelGateway
 
 from ..context import ContextBuilder
 from ..context_budget import ContextBudget, ContextBudgetReport
-from ..model import ModelGateway
 from ..modes import IntentRouter
 from ..planner import DeterministicPlanner
 from ..policy import PolicyEngine
@@ -75,7 +76,8 @@ class AgentOrchestrator:
         policy = self.policy_engine.assess(request.message, decision)
         plan = self.planner.plan(request, decision, policy)
         base_prompt = self.prompt_reader("conversation_reply")
-        bundle = self.context_builder.build(
+        bundle = await asyncio.to_thread(
+            self.context_builder.build,
             request.session_id,
             decision,
             base_prompt,
@@ -99,22 +101,61 @@ class AgentOrchestrator:
             },
         )
         run_id = str(run["id"])
-        yield {
-            "type": "meta",
-            "run_id": run_id,
-            "status": "running",
-            **bundle.metadata,
-            "policy": policy.to_dict(),
-            "context_sections": context_sections,
-            "context_budget": context_budget_report.to_dict(),
-            "plan": plan.to_dict(),
-        }
+        cancellation_recorded = False
+
+        def finish_cancelled(answer_chars: int = 0, budget: ContextBudgetReport = context_budget_report) -> None:
+            nonlocal cancellation_recorded
+            if cancellation_recorded:
+                return
+            cancellation_recorded = True
+            self.trace.finish(
+                run_id,
+                status="cancelled",
+                metadata={
+                    "answer_chars": answer_chars,
+                    "policy": policy.to_dict(),
+                    "streaming": True,
+                    "context_budget": budget.to_dict(),
+                },
+                error="",
+            )
+            self.trace.step(
+                request.session_id,
+                run_id,
+                HarnessStep(
+                    name="run_finished",
+                    title="本轮回复已取消",
+                    status="cancelled",
+                    summary=f"{decision.intent} / {decision.path} / cancelled",
+                    details={"answer_chars": answer_chars},
+                    risk_level=policy.risk_level,
+                ),
+            )
+
+        try:
+            yield {
+                "type": "meta",
+                "run_id": run_id,
+                "status": "running",
+                **bundle.metadata,
+                "policy": policy.to_dict(),
+                "context_sections": context_sections,
+                "context_budget": context_budget_report.to_dict(),
+                "plan": plan.to_dict(),
+            }
+        except (GeneratorExit, asyncio.CancelledError):
+            finish_cancelled()
+            raise
 
         for step in self._initial_steps(decision, policy, context_sections, context_budget_report, plan):
             self.trace.step(request.session_id, run_id, step)
-            yield {"type": "step", "step": step.to_dict()}
+            try:
+                yield {"type": "step", "step": step.to_dict()}
+            except (GeneratorExit, asyncio.CancelledError):
+                finish_cancelled()
+                raise
 
-        tool_results = self.tool_orchestrator.execute_plan(request.session_id, plan)
+        tool_results = await asyncio.to_thread(self.tool_orchestrator.execute_plan, request.session_id, plan)
         for result in tool_results:
             step = HarnessStep(
                 name="tool_result",
@@ -125,7 +166,11 @@ class AgentOrchestrator:
                 risk_level=result.risk_level,
             )
             self.trace.step(request.session_id, run_id, step)
-            yield {"type": "step", "step": step.to_dict()}
+            try:
+                yield {"type": "step", "step": step.to_dict()}
+            except (GeneratorExit, asyncio.CancelledError):
+                finish_cancelled()
+                raise
 
         plan_section = self._plan_section(plan)
         tool_observation_section = self._tool_observation_section(tool_results)
@@ -146,8 +191,12 @@ class AgentOrchestrator:
                 risk_level=policy.risk_level,
             )
             self.trace.step(request.session_id, run_id, step)
-            yield {"type": "model_status", "streaming": False, "reason": "provider_disabled"}
-            yield {"type": "step", "step": step.to_dict()}
+            try:
+                yield {"type": "model_status", "streaming": False, "reason": "provider_disabled"}
+                yield {"type": "step", "step": step.to_dict()}
+            except (GeneratorExit, asyncio.CancelledError):
+                finish_cancelled(budget=prompt_budget_report)
+                raise
         try:
             async for chunk in self.model_gateway.stream(
                 system_prompt=model_system_prompt,
@@ -186,14 +235,25 @@ class AgentOrchestrator:
                     },
                 ),
             )
+        except (GeneratorExit, asyncio.CancelledError):
+            answer = "".join(answer_parts)
+            finish_cancelled(len(answer), prompt_budget_report)
+            raise
         except Exception as exc:
             status = "degraded"
             error = str(exc)
-            answer = (
-                "我先把这句话接住。当前模型连接不可用，所以我没法生成完整回复；"
-                f"但你的原始消息已经保存在本地会话里。错误信息：{exc}"
-            )
-            yield {"type": "delta", "text": answer}
+            if answer_parts:
+                answer = "".join(answer_parts)
+            else:
+                answer = (
+                    "我先把这句话接住。当前模型连接不可用，所以我没法生成完整回复；"
+                    f"但你的原始消息已经保存在本地会话里。错误信息：{exc}"
+                )
+                try:
+                    yield {"type": "delta", "text": answer}
+                except (GeneratorExit, asyncio.CancelledError):
+                    finish_cancelled(len(answer), prompt_budget_report)
+                    raise
             self.trace.step(
                 request.session_id,
                 run_id,

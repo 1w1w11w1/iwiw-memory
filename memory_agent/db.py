@@ -1,22 +1,34 @@
 """
-SQLite storage for long-term memory.
+SQLite storage for the memory system.
 
-The source of truth is selfecho_data/sessions.db. Markdown files under
-memory/ are legacy/export caches only; runtime writes must go through this
-module so versions, audit events, FTS, and vector chunks stay in sync.
+Tables:
+- memory_records:         raw MemoryEnvelope (original materials, no pre-judgment)
+- memory_chunks:          vector chunks for semantic search
+- tendency_observations:  raw tendency signals before compilation
+- tendency_profiles:      compiled behavior profiles
+- memory_versions:        snapshots for rollback
+- memory_audit:           audit log for all mutations
+
+Architecture (ref):
+  全量记忆库不对材料做预先价值判断；是否进入上下文由检索得分、作用域和预算决定。
+  倾向 profile 承担行为默认值，不承担事实归档、事实检索或召回排序。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from .config import MEMORY_DB_PATH
+from .scopes import AGENT_GLOBAL_KEY, normalize_tendency_scope
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Schema
@@ -24,65 +36,193 @@ from .config import MEMORY_DB_PATH
 
 SCHEMA = """
 
-CREATE TABLE IF NOT EXISTS memories (
+CREATE TABLE IF NOT EXISTS memory_records (
     id              TEXT PRIMARY KEY,
-    slug            TEXT UNIQUE NOT NULL,
-    description     TEXT NOT NULL DEFAULT '',
+    source_type     TEXT NOT NULL CHECK(source_type IN ('message','tool','manual','file','system_event')),
+    scope_type      TEXT NOT NULL DEFAULT 'global' CHECK(scope_type IN ('global','project','session')),
+    project_id      TEXT,
+    session_id      TEXT,
+    turn_idx        INTEGER,
+    role            TEXT NOT NULL DEFAULT 'user',
     content         TEXT NOT NULL,
-    mem_type        TEXT NOT NULL DEFAULT 'user'
-                    CHECK(mem_type IN ('user','feedback','project','reference')),
-    priority        TEXT NOT NULL DEFAULT 'normal'
-                    CHECK(priority IN ('core','important','normal','archive')),
-    event_date      TEXT,
-    recorded_date   TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
-    access_count    INTEGER NOT NULL DEFAULT 0,
-    last_access_at  TEXT,
-    embedding_model TEXT,
+    privacy         TEXT NOT NULL DEFAULT 'normal',
+    tags            TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deleted')),
+    vector_status   TEXT NOT NULL DEFAULT 'dirty' CHECK(vector_status IN ('dirty','ready')),
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     metadata        TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE INDEX IF NOT EXISTS idx_records_scope_status
+    ON memory_records(scope_type, status);
+CREATE INDEX IF NOT EXISTS idx_records_source
+    ON memory_records(source_type);
+CREATE INDEX IF NOT EXISTS idx_records_session
+    ON memory_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_records_created
+    ON memory_records(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_message
+    ON memory_records(session_id, turn_idx, role, content_hash)
+    WHERE session_id IS NOT NULL AND turn_idx IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS memory_session_tombstones (
+    session_id      TEXT PRIMARY KEY,
+    deleted_at      TEXT NOT NULL,
+    version_id      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_migration_flags (
+    key             TEXT PRIMARY KEY,
+    applied_at      TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_records_reject_tombstoned_insert
+BEFORE INSERT ON memory_records
+WHEN NEW.session_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM memory_session_tombstones WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'record belongs to deleted session');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_records_reject_tombstoned_update
+BEFORE UPDATE ON memory_records
+WHEN NEW.session_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM memory_session_tombstones WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'record belongs to deleted session');
+END;
+
 CREATE TABLE IF NOT EXISTS memory_chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    record_id       TEXT NOT NULL REFERENCES memory_records(id) ON DELETE CASCADE,
     chunk_index     INTEGER NOT NULL,
     chunk_text      TEXT NOT NULL,
     vector          BLOB,
     model_version   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory
-    ON memory_chunks(memory_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_record
+    ON memory_chunks(record_id, chunk_index);
 
-CREATE TABLE IF NOT EXISTS memory_pending_actions (
+CREATE TABLE IF NOT EXISTS tendency_observations (
     id              TEXT PRIMARY KEY,
-    ts              TEXT NOT NULL,
-    session_id      TEXT,
-    cycle_no        INTEGER,
-    action          TEXT NOT NULL
-                    CHECK(action IN ('archive','merge','delete','downgrade')),
-    target_memory_id TEXT,
-    source_memory_ids TEXT,
-    reason          TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','approved','rejected','executed')),
-    details         TEXT NOT NULL DEFAULT '{}'
+    scope_kind      TEXT NOT NULL CHECK(scope_kind IN ('agent_global','workspace','session')),
+    scope_key       TEXT NOT NULL,
+    workspace_id    TEXT,
+    project_id      TEXT,
+    content         TEXT NOT NULL,
+    source_session_id TEXT,
+    source_turn_range TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','merged','deleted')),
+    suggested_scope_kind TEXT NOT NULL DEFAULT 'session'
+        CHECK(suggested_scope_kind IN ('agent_global','workspace','session'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_pending_status
-    ON memory_pending_actions(status);
+CREATE INDEX IF NOT EXISTS idx_observations_scope
+    ON tendency_observations(scope_kind, scope_key, status);
+CREATE INDEX IF NOT EXISTS idx_observations_source_session
+    ON tendency_observations(source_session_id, status);
+
+CREATE TRIGGER IF NOT EXISTS tendency_observations_reject_tombstoned_insert
+BEFORE INSERT ON tendency_observations
+WHEN NEW.source_session_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM memory_session_tombstones WHERE session_id = NEW.source_session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observation belongs to deleted session');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tendency_observations_reject_tombstoned_update
+BEFORE UPDATE ON tendency_observations
+WHEN NEW.source_session_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM memory_session_tombstones WHERE session_id = NEW.source_session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observation belongs to deleted session');
+END;
+
+CREATE TABLE IF NOT EXISTS tendency_profiles (
+    id              TEXT PRIMARY KEY,
+    scope_kind      TEXT NOT NULL CHECK(scope_kind IN ('agent_global','workspace','session')),
+    scope_key       TEXT NOT NULL,
+    workspace_id    TEXT,
+    project_id      TEXT,
+    content         TEXT NOT NULL,
+    source_observation_ids TEXT NOT NULL DEFAULT '[]',
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_profiles_scope
+    ON tendency_profiles(scope_kind, scope_key);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_profiles_scope
+    ON tendency_profiles(scope_kind, scope_key);
+
+CREATE TABLE IF NOT EXISTS tendency_profile_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      TEXT NOT NULL,
+    scope_kind      TEXT NOT NULL,
+    scope_key       TEXT NOT NULL,
+    workspace_id    TEXT,
+    project_id      TEXT,
+    content         TEXT NOT NULL,
+    source_observation_ids TEXT NOT NULL DEFAULT '[]',
+    version         INTEGER NOT NULL,
+    saved_at        TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_profile_versions_profile
+    ON tendency_profile_versions(profile_id, version);
+
+CREATE TABLE IF NOT EXISTS tendency_mutation_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      TEXT NOT NULL,
+    snapshot        TEXT NOT NULL,
+    saved_at        TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_tendency_mutation_versions_profile
+    ON tendency_mutation_versions(profile_id, id);
 
 CREATE TABLE IF NOT EXISTS memory_versions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_id       TEXT,
-    slug            TEXT NOT NULL,
+    record_id       TEXT,
     content         TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
-    mem_type        TEXT NOT NULL DEFAULT 'user',
-    priority        TEXT NOT NULL DEFAULT 'normal',
-    event_date      TEXT,
+    snapshot        TEXT NOT NULL DEFAULT '{}',
+    saved_at        TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_versions_record
+    ON memory_versions(record_id);
+
+CREATE TABLE IF NOT EXISTS workspace_file_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_path     TEXT NOT NULL,
+    content         BLOB NOT NULL,
+    existed         INTEGER NOT NULL DEFAULT 1,
+    saved_at        TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_versions_target
+    ON workspace_file_versions(target_path, id);
+
+CREATE TABLE IF NOT EXISTS workspace_directory_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    action          TEXT NOT NULL CHECK(action IN ('create','rename','delete')),
+    source_path     TEXT NOT NULL,
+    target_path     TEXT,
     saved_at        TEXT NOT NULL,
     reason          TEXT NOT NULL DEFAULT ''
 );
@@ -91,161 +231,450 @@ CREATE TABLE IF NOT EXISTS memory_audit (
     id                TEXT PRIMARY KEY,
     ts                TEXT NOT NULL,
     action            TEXT NOT NULL,
-    target_slug       TEXT,
+    target_id         TEXT,
+    target_type       TEXT NOT NULL DEFAULT 'record',
     source_session_id TEXT,
-    cycle_no          INTEGER,
     reason            TEXT,
     backup_path       TEXT,
+    status            TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('pending','completed')),
     details           TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE INDEX IF NOT EXISTS idx_audit_ts
+    ON memory_audit(ts);
+
 """
 
-# FTS5 虚拟表必须单独执行（executescript 不支持 CREATE VIRTUAL TABLE 的事务控制）
+# FTS5 virtual table for keyword search (parallel path to vector search)
 FTS_SCHEMA = """
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    record_id UNINDEXED,
     content,
-    description,
-    content='memories',
+    content='memory_records',
     content_rowid='rowid'
 );
 """
 
-# FTS 同步触发器
 FTS_TRIGGERS = """
-CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, content, description)
-    VALUES (new.rowid, new.content, new.description);
+CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memory_records BEGIN
+    INSERT INTO memory_fts(rowid, record_id, content)
+    VALUES (new.rowid, new.id, new.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content, description)
-    VALUES ('delete', old.rowid, old.content, old.description);
+CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memory_records BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, record_id, content)
+    VALUES ('delete', old.rowid, old.id, old.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content, description)
-    VALUES ('delete', old.rowid, old.content, old.description);
-    INSERT INTO memories_fts(rowid, content, description)
-    VALUES (new.rowid, new.content, new.description);
+CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memory_records BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, record_id, content)
+    VALUES ('delete', old.rowid, old.id, old.content);
+    INSERT INTO memory_fts(rowid, record_id, content)
+    VALUES (new.rowid, new.id, new.content);
 END;
 """
+
+
+REQUIRED_SCHEMA_COLUMNS = {
+    "memory_records": {
+        "id", "source_type", "scope_type", "project_id", "session_id", "turn_idx",
+        "role", "content", "content_hash", "privacy", "tags", "status", "vector_status",
+        "created_at", "updated_at", "metadata",
+    },
+    "memory_chunks": {
+        "id", "record_id", "chunk_index", "chunk_text", "vector", "model_version",
+    },
+    "memory_session_tombstones": {
+        "session_id", "deleted_at", "version_id",
+    },
+    "memory_migration_flags": {
+        "key", "applied_at",
+    },
+    "tendency_observations": {
+        "id", "scope_kind", "scope_key", "workspace_id", "project_id", "content", "source_session_id",
+        "source_turn_range", "created_at", "updated_at", "status", "suggested_scope_kind",
+    },
+    "tendency_profiles": {
+        "id", "scope_kind", "scope_key", "workspace_id", "project_id", "content", "source_observation_ids",
+        "version", "created_at", "updated_at",
+    },
+    "tendency_profile_versions": {
+        "id", "profile_id", "scope_kind", "scope_key", "workspace_id", "project_id", "content",
+        "source_observation_ids", "version", "saved_at", "reason",
+    },
+    "tendency_mutation_versions": {
+        "id", "profile_id", "snapshot", "saved_at", "reason",
+    },
+    "memory_versions": {
+        "id", "record_id", "content", "description", "snapshot", "saved_at", "reason",
+    },
+    "workspace_file_versions": {
+        "id", "target_path", "content", "existed", "saved_at", "reason",
+    },
+    "workspace_directory_versions": {
+        "id", "action", "source_path", "target_path", "saved_at", "reason",
+    },
+    "memory_audit": {
+        "id", "ts", "action", "target_id", "target_type", "source_session_id",
+        "reason", "backup_path", "status", "details",
+    },
+}
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Connection
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _connection: sqlite3.Connection | None = None
+_thread_connections = threading.local()
+_connection_lock = threading.Lock()
+_schema_lock = threading.Lock()
+_open_connections: set[sqlite3.Connection] = set()
+_connection_generation = 0
 
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _ensure_data_dir() -> None:
-    MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _validate_schema(conn: sqlite3.Connection) -> None:
+    """Reject incomplete schemas after applying supported migrations."""
+    missing: list[str] = []
+    for table, required_columns in REQUIRED_SCHEMA_COLUMNS.items():
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        actual_columns = {row["name"] for row in rows}
+        for column in sorted(required_columns - actual_columns):
+            missing.append(f"{table}.{column}")
+    if missing:
+        raise RuntimeError(
+            "Memory database schema does not match the new memory system. "
+            "Supported migrations could not supply required columns: "
+            + ", ".join(missing)
+        )
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
+def _prepare_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Move structurally incompatible HEAD tables aside before creating replacements."""
+    conflicts = {
+        "memory_chunks": "record_id",
+        "memory_versions": "record_id",
+    }
+    for table, required_column in conflicts.items():
+        columns = _table_columns(conn, table)
+        if not columns or required_column in columns:
+            continue
+        suffix = 1
+        legacy = f"legacy_{table}"
+        while _table_columns(conn, legacy):
+            suffix += 1
+            legacy = f"legacy_{table}_{suffix}"
+        conn.execute(f'ALTER TABLE "{table}" RENAME TO "{legacy}"')
+
+
+def _import_legacy_memories(conn: sqlite3.Connection) -> None:
+    """Deterministically expose legacy saved memories through the new recall path."""
+    migration_key = "head_memory_schema_import_v1"
+    if conn.execute("SELECT 1 FROM memory_migration_flags WHERE key = ?", (migration_key,)).fetchone():
+        return
+    legacy_columns = _table_columns(conn, "memories")
+    if not {"id", "content"}.issubset(legacy_columns):
+        return
+    for row in conn.execute("SELECT * FROM memories ORDER BY rowid").fetchall():
+        data = dict(row)
+        content = str(data.get("content") or "")
+        created_at = str(data.get("created_at") or data.get("recorded_date") or _now())
+        updated_at = str(data.get("updated_at") or created_at)
+        legacy_metadata = {key: value for key, value in data.items() if key not in {"id", "content"}}
+        conn.execute(
+            """INSERT OR IGNORE INTO memory_records
+               (id, source_type, scope_type, role, content, content_hash, privacy, tags,
+                status, vector_status, created_at, updated_at, metadata)
+               VALUES (?, 'manual', 'global', 'user', ?, ?, 'public', ?,
+                       'active', 'dirty', ?, ?, ?)""",
+            (
+                str(data["id"]),
+                content,
+                str(data.get("content_hash") or _simple_hash(content)),
+                json.dumps(["legacy", str(data.get("mem_type") or "memory")], ensure_ascii=False),
+                created_at,
+                updated_at,
+                json.dumps({"legacy_schema": "head", "legacy": legacy_metadata}, ensure_ascii=False),
+            ),
+        )
+
+    legacy_chunk_tables = conn.execute(
+        """SELECT name FROM sqlite_master
+           WHERE type = 'table' AND name GLOB 'legacy_memory_chunks*'
+           ORDER BY name"""
+    ).fetchall()
+    for table_row in legacy_chunk_tables:
+        table = str(table_row["name"])
+        if not {"id", "memory_id", "chunk_index", "chunk_text"}.issubset(_table_columns(conn, table)):
+            continue
+        conn.execute(
+            f"""INSERT OR IGNORE INTO memory_chunks
+                (id, record_id, chunk_index, chunk_text, vector, model_version)
+                SELECT id, memory_id, chunk_index, chunk_text, vector, model_version
+                FROM "{table}"
+                WHERE EXISTS (SELECT 1 FROM memory_records WHERE id = "{table}".memory_id)"""
+        )
+
+    legacy_version_tables = conn.execute(
+        """SELECT name FROM sqlite_master
+           WHERE type = 'table' AND name GLOB 'legacy_memory_versions*'
+           ORDER BY name"""
+    ).fetchall()
+    for table_row in legacy_version_tables:
+        table = str(table_row["name"])
+        if not {"id", "memory_id", "content", "saved_at"}.issubset(_table_columns(conn, table)):
+            continue
+        for version in conn.execute(f'SELECT * FROM "{table}" ORDER BY id').fetchall():
+            version_data = dict(version)
+            record_id = str(version_data.get("memory_id") or "")
+            record = conn.execute("SELECT * FROM memory_records WHERE id = ?", (record_id,)).fetchone()
+            if not record:
+                continue
+            snapshot = dict(record)
+            snapshot["content"] = str(version_data.get("content") or "")
+            snapshot["content_hash"] = _simple_hash(snapshot["content"])
+            snapshot["metadata"] = json.dumps(
+                {
+                    "description": str(version_data.get("description") or ""),
+                    "legacy_version": version_data,
+                },
+                ensure_ascii=False,
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO memory_versions
+                   (id, record_id, content, description, snapshot, saved_at, reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    version_data["id"],
+                    record_id,
+                    snapshot["content"],
+                    str(version_data.get("description") or ""),
+                    json.dumps(snapshot, ensure_ascii=False),
+                    str(version_data["saved_at"]),
+                    str(version_data.get("reason") or "legacy schema migration"),
+                ),
+            )
+    conn.execute(
+        "INSERT INTO memory_migration_flags (key, applied_at) VALUES (?, ?)",
+        (migration_key, _now()),
+    )
+
+
+def _link_legacy_audit_targets(conn: sqlite3.Connection) -> None:
+    if "target_slug" not in _table_columns(conn, "memory_audit"):
+        return
+    conn.execute(
+        """UPDATE memory_audit
+           SET target_id = (SELECT id FROM memories WHERE slug = memory_audit.target_slug),
+               target_type = 'record'
+           WHERE target_type = 'legacy_memory'
+             AND EXISTS (SELECT 1 FROM memories WHERE slug = memory_audit.target_slug)"""
+    )
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Apply lightweight migrations for tables created by older memory schemas."""
-    fk_rows = conn.execute("PRAGMA foreign_key_list(memory_versions)").fetchall()
-    has_delete_cascade = any(str(row["on_delete"]).upper() == "CASCADE" for row in fk_rows)
-    if not has_delete_cascade:
-        return
-
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.execute("DROP TABLE IF EXISTS memory_versions_new")
-    conn.execute(
-        """
-        CREATE TABLE memory_versions_new (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id       TEXT,
-            slug            TEXT NOT NULL,
-            content         TEXT NOT NULL,
-            description     TEXT NOT NULL DEFAULT '',
-            mem_type        TEXT NOT NULL DEFAULT 'user',
-            priority        TEXT NOT NULL DEFAULT 'normal',
-            event_date      TEXT,
-            saved_at        TEXT NOT NULL,
-            reason          TEXT NOT NULL DEFAULT ''
+    record_columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_records)")}
+    if "vector_status" not in record_columns:
+        conn.execute("ALTER TABLE memory_records ADD COLUMN vector_status TEXT NOT NULL DEFAULT 'dirty'")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_versions)")}
+    if "snapshot" not in columns:
+        conn.execute("ALTER TABLE memory_versions ADD COLUMN snapshot TEXT NOT NULL DEFAULT '{}'")
+    observation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tendency_observations)")}
+    if "suggested_scope_kind" not in observation_columns:
+        conn.execute(
+            "ALTER TABLE tendency_observations "
+            "ADD COLUMN suggested_scope_kind TEXT NOT NULL DEFAULT 'session'"
         )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO memory_versions_new
-            (id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason)
-        SELECT id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason
-        FROM memory_versions
-        """
-    )
-    conn.execute("DROP TABLE memory_versions")
-    conn.execute("ALTER TABLE memory_versions_new RENAME TO memory_versions")
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys=ON")
+    file_version_columns = _table_columns(conn, "workspace_file_versions")
+    if "existed" not in file_version_columns:
+        conn.execute("ALTER TABLE workspace_file_versions ADD COLUMN existed INTEGER NOT NULL DEFAULT 1")
+    audit_columns = _table_columns(conn, "memory_audit")
+    if "target_id" not in audit_columns:
+        conn.execute("ALTER TABLE memory_audit ADD COLUMN target_id TEXT")
+        if "target_slug" in audit_columns:
+            conn.execute("UPDATE memory_audit SET target_id = target_slug WHERE target_id IS NULL")
+    if "target_type" not in audit_columns:
+        conn.execute("ALTER TABLE memory_audit ADD COLUMN target_type TEXT NOT NULL DEFAULT 'legacy_memory'")
+    if "status" not in audit_columns:
+        conn.execute("ALTER TABLE memory_audit ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
 
 
 def connect() -> sqlite3.Connection:
-    """
-    获取或创建到 sessions.db 的连接。
-
-    与会话层（selfecho_session/db.py）共用同一 DB 文件。
-    只初始化记忆相关的表，不涉及会话表。
-    """
+    """Get or create the connection to sessions.db."""
     global _connection
     if _connection is not None:
         return _connection
+    thread_connection = getattr(_thread_connections, "connection", None)
+    thread_generation = getattr(_thread_connections, "generation", -1)
+    if thread_connection is not None and thread_generation == _connection_generation:
+        return thread_connection
 
-    _ensure_data_dir()
+    MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
         str(MEMORY_DB_PATH),
         timeout=30,
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-
-    # 执行 schema
-    conn.executescript(SCHEMA)
-    conn.commit()
-    _migrate_schema(conn)
-
-    # FTS 必须在事务外单独创建
-    conn.execute(FTS_SCHEMA)
-    conn.executescript(FTS_TRIGGERS)
-
-    conn.commit()
-    _connection = conn
+    try:
+        with _schema_lock:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            _prepare_legacy_schema(conn)
+            conn.executescript(SCHEMA)
+            # FTS5 virtual table requires separate execution
+            try:
+                conn.executescript(FTS_SCHEMA + FTS_TRIGGERS)
+            except sqlite3.OperationalError:
+                pass  # FTS may already exist
+            _migrate_schema(conn)
+            _import_legacy_memories(conn)
+            _link_legacy_audit_targets(conn)
+            _validate_schema(conn)
+            conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    _thread_connections.connection = conn
+    _thread_connections.generation = _connection_generation
+    with _connection_lock:
+        _open_connections.add(conn)
     return conn
 
 
 def close() -> None:
-    """关闭连接（用于测试/重置）。"""
-    global _connection
+    """Close the connection (for testing/reset)."""
+    global _connection, _connection_generation
     if _connection is not None:
         _connection.close()
         _connection = None
+    with _connection_lock:
+        for connection in _open_connections:
+            connection.close()
+        _open_connections.clear()
+        _connection_generation += 1
+    for attribute in ("connection", "generation"):
+        if hasattr(_thread_connections, attribute):
+            delattr(_thread_connections, attribute)
+
+
+def close_current_thread() -> None:
+    """Release a short-lived worker thread's connection."""
+    connection = getattr(_thread_connections, "connection", None)
+    if connection is not None:
+        with _connection_lock:
+            _open_connections.discard(connection)
+        connection.close()
+    for attribute in ("connection", "generation"):
+        if hasattr(_thread_connections, attribute):
+            delattr(_thread_connections, attribute)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CRUD
+# Helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
+def _simple_hash(text: str) -> str:
+    """Stable content hash for deterministic memory idempotency."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-@dataclass
-class MemoryMutationResult:
+def _normalize_privacy(privacy: str | None) -> str:
+    value = (privacy or "public").strip().lower()
+    if value in {"public", "internal", "sensitive"}:
+        return value
+    if value in {"private", "secret"}:
+        return "sensitive"
+    # Legacy "normal" records are treated as public only when explicitly
+    # inserted through this normalized path.
+    return "public"
+
+
+def _validate_record_scope(scope_type: str, project_id: str | None, session_id: str | None) -> str:
+    scope = (scope_type or "global").strip().lower()
+    if scope not in {"global", "project", "session"}:
+        raise ValueError("invalid scope_type")
+    if scope == "project" and not project_id:
+        raise ValueError("project memory requires project_id")
+    if scope == "session" and not session_id:
+        raise ValueError("session memory requires session_id")
+    return scope
+
+
+def _retrievable_where(
+    alias: str,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+) -> tuple[str, list[Any]]:
+    """SQL visibility filter for records allowed to enter recall."""
+    params: list[Any] = []
+    visibility = [
+        f"{alias}.status = 'active'",
+        f"COALESCE({alias}.privacy, 'public') <> 'sensitive'",
+        _not_tombstoned_where(alias),
+    ]
+    scopes = [
+        f"({alias}.scope_type = 'global' AND COALESCE({alias}.privacy, 'public') = 'public')",
+    ]
+    if project_id:
+        scopes.append(f"({alias}.scope_type = 'project' AND {alias}.project_id = ?)")
+        params.append(project_id)
+    if session_id:
+        scopes.append(f"({alias}.scope_type = 'session' AND {alias}.session_id = ?)")
+        params.append(session_id)
+    visibility.append("(" + " OR ".join(scopes) + ")")
+    return " AND ".join(visibility), params
+
+
+def _not_tombstoned_where(alias: str) -> str:
+    return (
+        "NOT EXISTS (SELECT 1 FROM memory_session_tombstones mst "
+        f"WHERE mst.session_id = {alias}.session_id)"
+    )
+
+
+def _chunk_text(text: str, max_chars: int = 500) -> list[str]:
+    """Split text by paragraphs, each chunk <= max_chars chars."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks, current = [], ""
+    for para in text.split("\n\n"):
+        if len(current) + len(para) + 2 > max_chars:
+            if current.strip():
+                chunks.append(current.strip())
+            current = para
+        else:
+            current = (current + "\n\n" + para) if current else para
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks or [text]
+
+
+def _chunk_id(record_id: str, idx: int) -> str:
+    return f"{record_id}:{idx}"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Types
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass(frozen=True)
+class MutationResult:
     ok: bool
     action: str
-    target_slug: str | None = None
+    target_id: str | None = None
     changed_rows: int = 0
     version_id: str | None = None
     audit_id: str | None = None
-    backup_path: str | None = None
     error: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -253,710 +682,313 @@ class MemoryMutationResult:
         return {
             "ok": self.ok,
             "action": self.action,
-            "target_slug": self.target_slug,
+            "target_id": self.target_id,
             "changed_rows": self.changed_rows,
             "version_id": self.version_id,
             "audit_id": self.audit_id,
-            "backup_path": self.backup_path,
             "error": self.error,
             "details": self.details,
         }
 
 
-def _valid_priority(p: str) -> str:
-    return p if p in {"core", "important", "normal", "archive"} else "normal"
-
-
-def _valid_type(t: str) -> str:
-    return t if t in {"user", "feedback", "project", "reference"} else "user"
-
-
-def upsert_memory(
-    *,
-    slug: str,
-    description: str,
-    content: str,
-    mem_type: str = "user",
-    priority: str = "normal",
-    event_date: str | None = None,
-    content_hash: str = "",
-    metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    写入一条记忆（INSERT OR UPDATE）。
-
-    如果 slug 已存在则更新（content 追加），不存在则创建。
-    返回完整记忆记录。
-    """
-    conn = connect()
-    now = _now()
-    priority = _valid_priority(priority)
-    mem_type = _valid_type(mem_type)
-    slug = slug.strip().lower().replace(" ", "-")[:50] or "memory"
-
-    existing = conn.execute(
-        "SELECT * FROM memories WHERE slug = ?", (slug,)
-    ).fetchone()
-
-    if existing:
-        # ── 更新：追加到正文末尾 ──
-        old_body = existing["content"]
-        new_body = f"{old_body}\n\n（以下为 {now} 追加）\n\n{content}"
-        new_hash = _simple_hash(new_body)
-        if existing["content_hash"] == new_hash:
-            # 内容无变化，跳过
-            return dict(existing)
-
-        backup_path = _save_version(existing["id"], reason="upsert append", commit=False)
-        cur = conn.execute(
-            """
-            UPDATE memories
-            SET content = ?, content_hash = ?, description = ?,
-                priority = ?, mem_type = ?, event_date = COALESCE(?, event_date),
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (new_body, new_hash, description.strip()[:200],
-             priority, mem_type, event_date, now, existing["id"]),
-        )
-        audit_id = _record_audit(
-            action="upsert_append",
-            target_slug=slug,
-            reason="append extracted memory",
-            backup_path=backup_path,
-            details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
-            commit=False,
-        )
-        if not backup_path or not audit_id or cur.rowcount <= 0:
-            conn.rollback()
-            return dict(existing)
-        conn.commit()
-        refresh_memory_vectors(existing["id"])
-        # 获取更新后的记录
-        updated = conn.execute(
-            "SELECT * FROM memories WHERE id = ?", (existing["id"],)
-        ).fetchone()
-        return dict(updated)
-
-    # ── 创建 ──
-    mem_id = str(uuid.uuid4())
-    new_hash = content_hash or _simple_hash(content)
-
-    cur = conn.execute(
-        """
-        INSERT INTO memories
-            (id, slug, description, content, mem_type, priority,
-             event_date, recorded_date, content_hash,
-             created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (mem_id, slug, description.strip()[:200], content, mem_type, priority,
-         event_date, now, new_hash,
-         now, now, json.dumps(metadata or {}, ensure_ascii=False)),
-    )
-    audit_id = _record_audit(
-        action="create",
-        target_slug=slug,
-        reason="create extracted memory",
-        details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
-        commit=False,
-    )
-    if not audit_id or cur.rowcount <= 0:
-        conn.rollback()
-        raise RuntimeError("memory create audit failed")
-    conn.commit()
-    refresh_memory_vectors(mem_id)
-
-    created = conn.execute(
-        "SELECT * FROM memories WHERE id = ?", (mem_id,)
-    ).fetchone()
-    return dict(created)
-
-
-def get_memory(slug: str) -> dict[str, Any] | None:
-    """按 slug 查询单条记忆。"""
-    conn = connect()
-    row = conn.execute(
-        "SELECT * FROM memories WHERE slug = ?", (slug,)
-    ).fetchone()
-    return _rowdict(row)
-
-
-def get_memory_by_id(memory_id: str) -> dict[str, Any] | None:
-    """按 id 查询单条记忆。"""
-    conn = connect()
-    row = conn.execute(
-        "SELECT * FROM memories WHERE id = ?", (memory_id,)
-    ).fetchone()
-    return _rowdict(row)
-
-
-def list_memories(
-    priority: str | None = None,
-    mem_type: str | None = None,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    """列出记忆，支持按 priority / mem_type 过滤。"""
-    conn = connect()
-    sql = "SELECT * FROM memories"
-    params: list[Any] = []
-    where: list[str] = []
-    if priority:
-        where.append("priority = ?")
-        params.append(priority)
-    if mem_type:
-        where.append("mem_type = ?")
-        params.append(mem_type)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY priority ASC, updated_at DESC LIMIT ?"
-    params.append(limit)
-    return [dict(r) for r in conn.execute(sql, params)]
-
-
-def delete_memory_result(
-    slug: str,
-    *,
-    save_version: bool = True,
-    reason: str = "delete",
-    audit_action: str = "delete",
-    session_id: str | None = None,
-    cycle_no: int | None = None,
-    details: dict[str, Any] | None = None,
-) -> MemoryMutationResult:
-    """Delete a memory through the audited mutation path."""
-    conn = connect()
-    old = get_memory(slug)
-    if not old:
-        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
-    try:
-        backup_path = None
-        if save_version:
-            backup_path = _save_version(old["id"], reason=reason, commit=False)
-            if not backup_path:
-                conn.rollback()
-                return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
-        cur = conn.execute("DELETE FROM memories WHERE slug = ?", (slug,))
-        changed_rows = cur.rowcount
-        if changed_rows <= 0:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, error="no rows changed")
-        audit_details = {"changed_rows": changed_rows, **(details or {})}
-        audit_id = _record_audit(
-            action=audit_action,
-            target_slug=slug,
-            reason=reason,
-            backup_path=backup_path,
-            session_id=session_id,
-            cycle_no=cycle_no,
-            details=audit_details,
-            commit=False,
-        )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
-        conn.commit()
-        return MemoryMutationResult(
-            True,
-            audit_action,
-            slug,
-            changed_rows=changed_rows,
-            version_id=backup_path,
-            audit_id=audit_id,
-            backup_path=backup_path,
-            details=audit_details,
-        )
-    except Exception as exc:
-        conn.rollback()
-        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
-
-
-def delete_memory(slug: str, *, save_version: bool = True) -> bool:
-    """删除一条记忆，默认先保存可恢复快照。"""
-    return delete_memory_result(slug, save_version=save_version).ok
-
-
-def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
-    """
-    保存 LLM 返回的一条记忆维护动作到 SQLite。
-
-    支持动作：create / update / archive / merge / ignore。
-    与旧 store.py 的 save_memory_candidate 接口兼容，但返回
-    (action, slug) 而非 (action, Path)。供 extractor.py 调用。
-
-    Returns:
-        (action, slug) 或 None（跳过/失败）
-    """
-    action = (candidate.get("action") or "create").strip().lower()
-    if action == "ignore":
-        return None
-
-    slug = candidate.get("target_slug") or candidate.get("slug") or "memory"
-
-    try:
-        if action == "archive":
-            archived = archive_memory_by_slug(slug)
-            return ("archive", archived) if archived else None
-
-        if action == "merge":
-            target = candidate.get("target_slug") or slug
-            content = candidate.get("content", "")
-            if not content:
-                return None
-            record = upsert_memory(
-                slug=target,
-                description=candidate.get("description", ""),
-                content=content,
-                mem_type=candidate.get("mem_type", "user"),
-                priority=candidate.get("priority", "normal"),
-                event_date=candidate.get("event_date"),
-                content_hash="",
-            )
-            return ("merge", record["slug"])
-
-        record = upsert_memory(
-            slug=slug,
-            description=candidate.get("description", ""),
-            content=candidate.get("content", ""),
-            mem_type=candidate.get("mem_type", "user"),
-            priority=candidate.get("priority", "normal"),
-            event_date=candidate.get("event_date"),
-            content_hash="",
-        )
-        return (action, record["slug"])
-    except Exception:
-        return None
-
-
-def create_pending_action(
-    action: str,
-    target_memory_slug: str | None = None,
-    *,
-    session_id: str | None = None,
-    cycle_no: int | None = None,
-    reason: str = "",
-    source_memory_ids: list[str] | None = None,
-) -> dict[str, Any] | None:
-    """写入一条待确认的淘汰/合并动作。"""
-    import uuid
-    conn = connect()
-    now = _now()
-    mem = None
-    if target_memory_slug:
-        mem = get_memory(target_memory_slug)
-    pending_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO memory_pending_actions
-            (id, ts, session_id, cycle_no, action, target_memory_id, source_memory_ids, reason, status, details)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}')""",
-        (
-            pending_id, now, session_id, cycle_no, action,
-            mem['id'] if mem else None,
-            json.dumps(source_memory_ids or [], ensure_ascii=False) if source_memory_ids else None,
-            reason,
-        ),
-    )
-    conn.commit()
-    return {'id': pending_id, 'action': action, 'target_slug': target_memory_slug, 'reason': reason, 'status': 'pending'}
-
-
-def list_pending_actions(status: str = 'pending') -> list[dict[str, Any]]:
-    """列出待确认的淘汰动作。"""
-    conn = connect()
-    rows = conn.execute(
-        """SELECT pa.id, pa.ts, pa.action, pa.reason, pa.status, pa.source_memory_ids,
-                   m.slug AS target_slug, m.description AS target_description, m.priority AS target_priority
-            FROM memory_pending_actions pa
-            LEFT JOIN memories m ON m.id = pa.target_memory_id
-            WHERE pa.status = ?
-            ORDER BY pa.ts DESC""",
-        (status,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Audit
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _record_audit(
     *,
     action: str,
-    target_slug: str | None,
-    reason: str,
+    target_id: str | None = None,
+    target_type: str = "record",
+    reason: str = "",
     backup_path: str | None = None,
     session_id: str | None = None,
-    cycle_no: int | None = None,
     details: dict[str, Any] | None = None,
+    status: str = "completed",
     commit: bool = True,
-) -> str | None:
+) -> str:
     """Write an audit event and return its id."""
     audit_id = str(uuid.uuid4())
-    try:
-        conn = connect()
-        conn.execute(
-            """
-            INSERT INTO memory_audit
-                (id, ts, action, target_slug, source_session_id, cycle_no, reason, backup_path, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                audit_id,
-                _now(),
-                action,
-                target_slug,
-                session_id,
-                cycle_no,
-                reason,
-                backup_path,
-                json.dumps(details or {}, ensure_ascii=False),
-            ),
-        )
-        if commit:
-            conn.commit()
-    except sqlite3.OperationalError:
-        return None
+    conn = connect()
+    conn.execute(
+        """INSERT INTO memory_audit
+           (id, ts, action, target_id, target_type, source_session_id, reason, backup_path, status, details)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (audit_id, _now(), action, target_id, target_type, session_id,
+         reason, backup_path, status, json.dumps(details or {}, ensure_ascii=False)),
+    )
+    if commit:
+        conn.commit()
     return audit_id
 
 
-def approve_pending_action_result(pending_id: str) -> MemoryMutationResult:
-    """确认执行待确认动作，并返回版本、审计和改动行数。"""
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# memory_records CRUD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def insert_record(
+    *,
+    source_type: str,
+    content: str,
+    scope_type: str = "global",
+    project_id: str | None = None,
+    session_id: str | None = None,
+    turn_idx: int | None = None,
+    role: str = "user",
+    tags: list[str] | None = None,
+    privacy: str = "public",
+    metadata: dict[str, Any] | None = None,
+) -> MutationResult:
+    """
+    Insert a raw MemoryEnvelope into memory_records.
+
+    This is the deterministic write path — no LLM filters or value judgments.
+    """
+    try:
+        scope_type = _validate_record_scope(scope_type, project_id, session_id)
+        privacy = _normalize_privacy(privacy)
+    except ValueError as exc:
+        return MutationResult(False, "ingest", error=str(exc))
+
     conn = connect()
-    row = conn.execute(
-        "SELECT * FROM memory_pending_actions WHERE id = ? AND status = 'pending'",
-        (pending_id,),
-    ).fetchone()
-    if not row:
-        return MemoryMutationResult(False, "pending_approve", error="pending action not found")
-
-    action = row['action']
-    target_id = row['target_memory_id']
-    if action == "merge":
-        return MemoryMutationResult(False, "pending_merge", error="pending merge is not executable")
-    if not target_id:
-        return MemoryMutationResult(False, f"pending_{action}", error="pending action has no target")
-
-    target = conn.execute("SELECT * FROM memories WHERE id = ?", (target_id,)).fetchone()
-    if not target:
-        return MemoryMutationResult(False, f"pending_{action}", error="target memory not found")
-
-    details = {}
+    now = _now()
+    record_id = str(uuid.uuid4())
+    content_hash = _simple_hash(content)
     try:
-        details = json.loads(row["details"] or "{}")
-    except json.JSONDecodeError:
-        details = {}
-
-    mutation_action = f"pending_{action}"
-    try:
-        backup_path = _save_version(target_id, reason=f"pending {action}: {row['reason'] or ''}".strip(), commit=False)
-        if not backup_path:
+        if session_id is not None and turn_idx is not None:
+            existing = conn.execute(
+                """SELECT id FROM memory_records
+                   WHERE session_id = ? AND turn_idx = ? AND role = ? AND content_hash = ?
+                   LIMIT 1""",
+                (session_id, turn_idx, role, content_hash),
+            ).fetchone()
+            if existing:
+                return MutationResult(
+                    True,
+                    "ingest",
+                    target_id=str(existing["id"]),
+                    changed_rows=0,
+                    details={"status": "duplicate", "record_id_short": str(existing["id"])[:8]},
+                )
+        cur = conn.execute(
+            """INSERT INTO memory_records
+               (id, source_type, scope_type, project_id, session_id, turn_idx, role,
+                content, content_hash, privacy, tags, status, created_at, updated_at, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
+            (record_id, source_type, scope_type, project_id, session_id, turn_idx, role,
+             content, content_hash, privacy,
+             json.dumps(tags or [], ensure_ascii=False),
+             now, now, json.dumps(metadata or {}, ensure_ascii=False)),
+        )
+        changed = cur.rowcount
+        if changed <= 0:
             conn.rollback()
-            return MemoryMutationResult(False, mutation_action, target["slug"], error="version snapshot failed")
-
-        changed_rows = 0
-        if action == 'archive':
-            cur = conn.execute(
-                'UPDATE memories SET priority = "archive", updated_at = ? WHERE id = ?',
-                (_now(), target_id),
-            )
-            changed_rows = cur.rowcount
-        elif action == 'delete':
-            cur = conn.execute('DELETE FROM memories WHERE id = ?', (target_id,))
-            changed_rows = cur.rowcount
-        elif action == 'downgrade':
-            next_priority = _valid_priority(str(details.get("priority") or "normal"))
-            if next_priority == "archive":
-                next_priority = "normal"
-            cur = conn.execute(
-                'UPDATE memories SET priority = ?, updated_at = ? WHERE id = ?',
-                (next_priority, _now(), target_id),
-            )
-            changed_rows = cur.rowcount
-        else:
-            conn.rollback()
-            return MemoryMutationResult(False, mutation_action, target["slug"], backup_path=backup_path, error="unsupported pending action")
-
-        if changed_rows <= 0:
-            conn.rollback()
-            return MemoryMutationResult(False, mutation_action, target["slug"], changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
-
-        audit_details = {"pending_id": pending_id, "changed_rows": changed_rows, "details": details}
+            return MutationResult(False, "ingest", error="insert failed")
         audit_id = _record_audit(
-            action=mutation_action,
-            target_slug=target["slug"],
-            reason=row["reason"] or f"approve pending {action}",
-            backup_path=backup_path,
-            session_id=row["session_id"],
-            cycle_no=row["cycle_no"],
-            details=audit_details,
+            action="ingest",
+            target_id=record_id,
+            reason=f"ingest {source_type}",
+            details={"record_id": record_id, "scope_type": scope_type},
             commit=False,
         )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, mutation_action, target["slug"], changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
-
-        details["backup_path"] = backup_path
-        details["version_id"] = backup_path
-        details["audit_id"] = audit_id
-        details["changed_rows"] = changed_rows
-        conn.execute(
-            'UPDATE memory_pending_actions SET status = "executed", details = ? WHERE id = ?',
-            (json.dumps(details, ensure_ascii=False), pending_id),
-        )
         conn.commit()
-        return MemoryMutationResult(
-            True,
-            mutation_action,
-            target["slug"],
-            changed_rows=changed_rows,
-            version_id=backup_path,
+        return MutationResult(
+            True, "ingest",
+            target_id=record_id,
+            changed_rows=changed,
             audit_id=audit_id,
-            backup_path=backup_path,
-            details=audit_details,
+            details={"record_id_short": record_id[:8]},
         )
-    except Exception as exc:
+    except sqlite3.Error as exc:
         conn.rollback()
-        return MemoryMutationResult(False, mutation_action, target["slug"], error=str(exc))
+        return MutationResult(False, "ingest", error=str(exc))
 
 
-def approve_pending_action(pending_id: str) -> bool:
-    """确认执行待确认动作。"""
-    return approve_pending_action_result(pending_id).ok
-
-
-def reject_pending_action(pending_id: str) -> bool:
-    """拒绝待确认动作。"""
+def get_record(record_id: str) -> dict[str, Any] | None:
+    """Read a single record by id."""
     conn = connect()
-    cur = conn.execute(
-        "UPDATE memory_pending_actions SET status = 'rejected' WHERE id = ? AND status = 'pending'",
-        (pending_id,),
+    row = conn.execute(
+        "SELECT * FROM memory_records WHERE id = ?", (record_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def record_belongs_to_tombstoned_session(record_id: str) -> bool:
+    row = connect().execute(
+        """SELECT 1 FROM memory_records r
+           JOIN memory_session_tombstones t ON t.session_id = r.session_id
+           WHERE r.id = ?""",
+        (record_id,),
+    ).fetchone()
+    return row is not None
+
+
+def list_records(
+    *,
+    source_type: str | None = None,
+    scope_type: str | None = None,
+    status: str = "active",
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """List records with optional filters. Most recent first."""
+    conn = connect()
+    where: list[str] = ["memory_records.status = ?", _not_tombstoned_where("memory_records")]
+    params: list[Any] = [status]
+    if source_type:
+        where.append("memory_records.source_type = ?")
+        params.append(source_type)
+    if scope_type:
+        where.append("memory_records.scope_type = ?")
+        params.append(scope_type)
+    sql = f"SELECT * FROM memory_records WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def list_visible_records(
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    source_type: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """List only records visible to one active recall scope."""
+    where_sql, params = _retrievable_where(
+        "memory_records",
+        project_id=project_id,
+        session_id=session_id,
     )
-    conn.commit()
-    return cur.rowcount > 0
+    if source_type:
+        where_sql += " AND source_type = ?"
+        params.append(source_type)
+    params.append(limit)
+    rows = connect().execute(
+        f"SELECT * FROM memory_records WHERE {where_sql} ORDER BY created_at DESC LIMIT ?",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
-def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
-    """获取适合维护审查的记忆候选（访问最少、更新最早的 normal/important）。"""
-    conn = connect()
-    rows = conn.execute(
-        """SELECT slug, description, priority, access_count, updated_at, content
-            FROM memories
-            WHERE priority IN ('normal', 'important')
-            ORDER BY access_count ASC, updated_at ASC
-            LIMIT ?""",
+def list_dirty_record_ids(limit: int = 20) -> list[str]:
+    rows = connect().execute(
+        """SELECT id FROM memory_records
+           WHERE status = 'active' AND vector_status = 'dirty'
+             AND NOT EXISTS (
+                 SELECT 1 FROM memory_session_tombstones mst
+                 WHERE mst.session_id = memory_records.session_id
+             )
+           ORDER BY updated_at
+           LIMIT ?""",
         (limit,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [str(row["id"]) for row in rows]
 
 
-def get_stats() -> dict[str, Any]:
-    """记忆库统计。"""
+def update_record_status(record_id: str, status: str, *, reason: str = "") -> MutationResult:
+    """Soft delete or restore a record."""
+    if status not in ("active", "deleted"):
+        return MutationResult(False, "update_status", error="invalid status")
     conn = connect()
-    total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-    by_priority = dict(conn.execute(
-        "SELECT priority, COUNT(*) FROM memories GROUP BY priority"
-    ).fetchall())
-    by_type = dict(conn.execute(
-        "SELECT mem_type, COUNT(*) FROM memories GROUP BY mem_type"
-    ).fetchall())
-    total_chunks = conn.execute(
-        "SELECT COUNT(*) FROM memory_chunks"
-    ).fetchone()[0]
-    return {
-        "total_memories": total,
-        "by_priority": by_priority,
-        "by_type": by_type,
-        "total_chunks": total_chunks,
-    }
-
-
-def search_fts(query: str, limit: int = 10) -> list[dict[str, Any]]:
-    """
-    FTS5 关键词搜索（作为向量检索上线前的回退）。
-
-    这是临时方案。Phase 3 上线向量混合检索后，此函数
-    降级为 FTS 回退兜底。
-    """
-    conn = connect()
-    # FTS5 查询：中文按词组匹配（引号），英文前缀查询（加 *）
-    fts_tokens: list[str] = []
-    for w in query.split():
-        w = w.strip()
-        if not w:
-            continue
-        if any('一' <= c <= '鿿' for c in w):
-            # 中文词：双引号精确匹配（CJK 按字符拆分，需短语查询）
-            fts_tokens.append(f'"{w}"')
-        else:
-            # 英文/数字：前缀查询
-            fts_tokens.append(f"{w}*")
-    fts_query = " ".join(fts_tokens)
     try:
-        rows = conn.execute(
-            """
-            SELECT m.id, m.slug, m.description, m.priority, m.mem_type,
-                   snippet(memories_fts, 0, '>>>', '<<<', '...', 24) AS snippet
-            FROM memories_fts
-            JOIN memories m ON m.rowid = memories_fts.rowid
-            WHERE memories_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (fts_query, limit),
-        ).fetchall()
-        results = [dict(r) for r in rows]
-        if results:
-            return results
-    except sqlite3.OperationalError:
-        pass
-    return _search_like(query, limit=limit)
+        old = get_record(record_id)
+        if not old:
+            return MutationResult(False, "update_status", error="record not found")
+        if old.get("status") == status:
+            return MutationResult(False, "update_status", target_id=record_id, error="no changes")
+        version_path = _save_version(record_id, reason=reason or f"set {status}", commit=False)
+        now = _now()
+        cur = conn.execute(
+            "UPDATE memory_records SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, record_id),
+        )
+        changed = cur.rowcount
+        if changed <= 0:
+            conn.rollback()
+            return MutationResult(False, "update_status", target_id=record_id, error="no rows changed")
+        audit_id = _record_audit(
+            action=f"set_{status}",
+            target_id=record_id,
+            reason=reason or f"set {status}",
+            backup_path=version_path,
+            details={"changed_rows": changed},
+            commit=False,
+        )
+        conn.commit()
+        return MutationResult(True, f"set_{status}", target_id=record_id, changed_rows=changed,
+                              version_id=version_path, audit_id=audit_id)
+    except Exception as exc:
+        conn.rollback()
+        return MutationResult(False, "update_status", error=str(exc))
 
 
-def _search_like(query: str, limit: int = 10) -> list[dict[str, Any]]:
-    """Substring fallback for CJK terms when FTS tokenization misses them."""
-    tokens = _fallback_query_tokens(query)
-    if not tokens:
-        return []
+def count_records(status: str = "active") -> int:
+    """Count records by status."""
     conn = connect()
-    rows = conn.execute(
-        "SELECT id, slug, description, priority, mem_type, content, updated_at FROM memories"
-    ).fetchall()
-    scored: list[tuple[int, str, dict[str, Any]]] = []
-    for row in rows:
-        content = row["content"] or ""
-        description = row["description"] or ""
-        haystack = f"{description}\n{content}".lower()
-        score = sum(1 for token in tokens if token.lower() in haystack)
-        if score <= 0:
-            continue
-        scored.append((
-            score,
-            row["updated_at"] or "",
-            {
-                "id": row["id"],
-                "slug": row["slug"],
-                "description": description,
-                "priority": row["priority"],
-                "mem_type": row["mem_type"],
-                "snippet": _make_snippet(content, tokens),
-                "fallback": "like",
-            },
-        ))
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item for _, __, item in scored[:limit]]
-
-
-def _fallback_query_tokens(query: str) -> list[str]:
-    stop_tokens = {
-        "什么", "是什", "怎么", "如何", "为什", "为什么", "这个", "那个",
-        "这些", "那些", "我们", "你们", "他们", "用户", "最近", "之前",
-        "觉得", "知道", "记得", "有没有",
-    }
-    tokens: list[str] = []
-    for raw in query.replace('"', " ").replace("*", " ").split():
-        token = raw.strip().strip("，。！？；：,.!?;:")
-        if len(token) < 2 or token in stop_tokens:
-            continue
-        tokens.append(token)
-        if any("一" <= c <= "鿿" for c in token) and len(token) >= 4:
-            tokens.extend(
-                token[i:i + 2]
-                for i in range(len(token) - 1)
-                if token[i:i + 2] not in stop_tokens
-            )
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for token in tokens:
-        if token not in seen:
-            seen.add(token)
-            deduped.append(token)
-    return deduped[:12]
-
-
-def _make_snippet(content: str, tokens: list[str], radius: int = 80) -> str:
-    lower = content.lower()
-    hit_at = -1
-    hit_token = ""
-    for token in tokens:
-        hit_at = lower.find(token.lower())
-        if hit_at >= 0:
-            hit_token = token
-            break
-    if hit_at < 0:
-        return content[: radius * 2]
-    start = max(hit_at - radius, 0)
-    end = min(hit_at + len(hit_token) + radius, len(content))
-    prefix = "..." if start > 0 else ""
-    suffix = "..." if end < len(content) else ""
-    return f"{prefix}{content[start:end]}{suffix}"
-
-
-def touch_memory(slug: str) -> None:
-    """更新记忆的访问时间（为淘汰策略提供数据）。"""
-    conn = connect()
-    conn.execute(
-        "UPDATE memories SET access_count = access_count + 1, last_access_at = ? WHERE slug = ?",
-        (_now(), slug),
-    )
-    conn.commit()
+    row = conn.execute(
+        f"""SELECT COUNT(*) FROM memory_records
+            WHERE status = ? AND {_not_tombstoned_where('memory_records')}""",
+        (status,),
+    ).fetchone()
+    return row[0] if row else 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 向量存储与检索
+# memory_chunks — vector storage
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def clear_memory_vectors(memory_id: str) -> None:
-    """Remove stale vector chunks for a memory."""
+def clear_record_vectors(record_id: str) -> None:
+    """Remove all vector chunks for a record."""
     conn = connect()
-    conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
-    conn.execute("UPDATE memories SET embedding_model = NULL WHERE id = ?", (memory_id,))
+    conn.execute("DELETE FROM memory_chunks WHERE record_id = ?", (record_id,))
+    conn.execute("UPDATE memory_records SET vector_status = 'dirty' WHERE id = ?", (record_id,))
     conn.commit()
 
 
-def refresh_memory_vectors(
-    memory_id: str,
+def refresh_record_vectors(
+    record_id: str,
     model_version: str = "bge-small-zh-v1.5",
 ) -> dict[str, Any]:
     """
-    Refresh vector chunks for one memory.
-
-    Embedding is best-effort: failures clear stale chunks so FTS remains the
-    fallback instead of returning outdated semantic matches.
+    Refresh vector chunks for one record.
+    Best-effort: on failure clears stale chunks to avoid outdated matches.
     """
     conn = connect()
-    mem = conn.execute("SELECT id, content FROM memories WHERE id = ?", (memory_id,)).fetchone()
-    if not mem:
-        return {"ok": False, "reason": "memory not found"}
-    chunks = _chunk_text(mem["content"])
+    row = conn.execute(
+        "SELECT content FROM memory_records WHERE id = ?", (record_id,)
+    ).fetchone()
+    if not row:
+        return {"ok": False, "reason": "record not found"}
+    chunks = _chunk_text(row["content"])
     try:
         from .embedding import embed_batch
         vectors = embed_batch(chunks)
     except Exception as exc:
-        clear_memory_vectors(memory_id)
+        clear_record_vectors(record_id)
         return {"ok": False, "reason": str(exc)}
     if not vectors:
-        clear_memory_vectors(memory_id)
+        clear_record_vectors(record_id)
         return {"ok": False, "reason": "embedding unavailable"}
-    count = store_memory_vector(memory_id, chunks, vectors, model_version=model_version)
-    conn.execute(
-        "UPDATE memories SET embedding_model = ? WHERE id = ?",
-        (model_version, memory_id),
-    )
-    conn.commit()
+    count = store_record_vectors(record_id, chunks, vectors, model_version=model_version)
     return {"ok": True, "chunks": count}
 
 
-def store_memory_vector(
-    memory_id: str,
+def store_record_vectors(
+    record_id: str,
     chunks: list[str],
     vectors: list[list[float]],
     model_version: str = "bge-small-zh-v1.5",
 ) -> int:
-    """存储记忆的分块文本和向量到 memory_chunks 表。"""
+    """Store chunk text and vectors."""
     conn = connect()
-    conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
+    conn.execute("DELETE FROM memory_chunks WHERE record_id = ?", (record_id,))
     import numpy as np
     for idx, (text, vec) in enumerate(zip(chunks, vectors)):
         conn.execute(
-            "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
-            (memory_id, idx, text, np.array(vec, dtype=np.float32).tobytes(), model_version),
+            "INSERT INTO memory_chunks (record_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
+            (record_id, idx, text, np.array(vec, dtype=np.float32).tobytes(), model_version),
         )
+    conn.execute("UPDATE memory_records SET vector_status = 'ready' WHERE id = ?", (record_id,))
     conn.commit()
     return len(chunks)
 
@@ -964,19 +996,28 @@ def store_memory_vector(
 def search_vectors(
     query_vector: list[float],
     top_k: int = 10,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    source_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    向量余弦相似度搜索（全量扫描，适合 <1000 条记忆）。
-    返回按相似度降序排列的记忆片段列表。
+    Cosine-similarity vector search (full scan, fine for <1000 records).
+    BGE models produce normalized embeddings, so dot product = cosine.
     """
     conn = connect()
     import numpy as np
-    rows = conn.execute("""
-        SELECT c.id, c.memory_id, c.chunk_text, c.vector,
-               m.slug, m.description, m.priority, m.mem_type
+    where_sql, params = _retrievable_where("r", project_id=project_id, session_id=session_id)
+    if source_type:
+        where_sql += " AND r.source_type = ?"
+        params.append(source_type)
+    rows = conn.execute(f"""
+        SELECT c.id, c.record_id, c.chunk_text, c.vector,
+               r.id AS rec_id, r.scope_type, r.project_id, r.session_id, r.updated_at
         FROM memory_chunks c
-        JOIN memories m ON m.id = c.memory_id
-    """).fetchall()
+        JOIN memory_records r ON r.id = c.record_id
+        WHERE {where_sql}
+    """, params).fetchall()
     if not rows:
         return []
 
@@ -989,639 +1030,894 @@ def search_vectors(
         except Exception:
             continue
         scored.append((sim, {
-            "slug": r["slug"], "description": r["description"],
-            "priority": r["priority"], "mem_type": r["mem_type"],
-            "chunk_text": r["chunk_text"][:200], "similarity": round(sim, 4),
+            "record_id": r["rec_id"],
+            "chunk_text": r["chunk_text"][:200],
+            "similarity": round(sim, 4),
+            "scope_type": r["scope_type"],
         }))
     scored.sort(key=lambda x: x[0], reverse=True)
-    # 每个 slug 只保留最高相似度的 chunk
-    seen: set[str] = set()
-    deduped: list[dict] = []
-    for _, item in scored:
-        if item["slug"] not in seen:
-            seen.add(item["slug"])
-            deduped.append(item)
-    return deduped[:top_k]
+    return [item for _, item in scored[:top_k]]
 
 
-def ensure_all_vectors(force: bool = False, model_version: str = "bge-small-zh-v1.5") -> dict:
-    """为所有还没有向量的记忆生成嵌入（幂等）。"""
+def search_fts(
+    query: str,
+    limit: int = 20,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    source_type: str | None = None,
+    include_all: bool = False,
+) -> list[dict[str, Any]]:
+    """Keyword search via FTS5. Returns record_id + snippet.
+
+    Falls back to LIKE search for CJK text (FTS5 default tokenizer doesn't
+    handle unsegmented Chinese/Japanese/Korean).
+    """
     conn = connect()
-    from .embedding import embed_batch
-    memories = conn.execute("SELECT id, slug, content FROM memories ORDER BY updated_at").fetchall()
-    processed = 0; skipped = 0; errors = []
-    for mem in memories:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM memory_chunks WHERE memory_id = ? AND model_version = ?",
-            (mem["id"], model_version),
-        ).fetchone()[0]
-        if existing > 0 and not force:
-            conn.execute(
-                "UPDATE memories SET embedding_model = COALESCE(embedding_model, ?) WHERE id = ?",
-                (model_version, mem["id"]),
-            )
-            skipped += 1; continue
-
-        chunks = _chunk_text(mem["content"])
-        vectors = embed_batch(chunks)
-        if not vectors:
-            errors.append(f"{mem['slug']}: embedding failed"); continue
-
-        conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (mem["id"],))
-        import numpy as np
-        for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            conn.execute(
-                "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
-                (mem["id"], idx, chunk, np.array(vec, dtype=np.float32).tobytes(), model_version),
-            )
-        conn.execute(
-            "UPDATE memories SET embedding_model = ? WHERE id = ?",
-            (model_version, mem["id"]),
+    safe_query = query.replace('"', '""')
+    rows: list[sqlite3.Row] = []
+    if include_all:
+        where_sql, visibility_params = (
+            f"mr.status = 'active' AND {_not_tombstoned_where('mr')}",
+            [],
         )
-        processed += 1
-    conn.commit()
-    return {"processed": processed, "skipped": skipped, "errors": errors, "total": processed + skipped}
-
-
-def _chunk_text(text: str, max_chars: int = 500) -> list[str]:
-    """按段落分割长文本，每块不超过 max_chars 字符。"""
-    if len(text) <= max_chars:
-        return [text]
-    chunks, current = [], ""
-    for para in text.split("\n\n"):
-        if len(current) + len(para) + 2 > max_chars:
-            if current.strip(): chunks.append(current.strip())
-            current = para
-        else:
-            current = (current + "\n\n" + para) if current else para
-    if current.strip(): chunks.append(current.strip())
-    return chunks or [text]
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Hash helpers
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _simple_hash(text: str) -> str:
-    """轻量 hash（非加密，仅去重）。"""
-    import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
-
-
-def count_memories_by_priority() -> dict[str, int]:
+    else:
+        where_sql, visibility_params = _retrievable_where("mr", project_id=project_id, session_id=session_id)
+    if source_type:
+        where_sql += " AND mr.source_type = ?"
+        visibility_params.append(source_type)
     try:
-        conn = connect()
         rows = conn.execute(
-            "SELECT priority, COUNT(*) FROM memories GROUP BY priority"
+            f"""SELECT mf.record_id, snippet(memory_fts, 1, '<b>', '</b>', '...', 40) AS snippet,
+                      mr.content, mr.scope_type, mr.created_at, mr.updated_at
+               FROM memory_fts mf
+               JOIN memory_records mr ON mr.id = mf.record_id
+               WHERE memory_fts MATCH ? AND {where_sql}
+               ORDER BY rank
+               LIMIT ?""",
+            (f'"{safe_query}"', *visibility_params, limit),
         ).fetchall()
-        return {r["priority"]: r[1] for r in rows}
-    except Exception:
-        return {}
+    except sqlite3.OperationalError:
+        pass  # Fall through to LIKE
+
+    # FTS5 MATCH on CJK text often returns 0 rows silently — use LIKE fallback.
+    # QueryBuilder may pass a space-joined CJK term list; match any term instead
+    # of requiring the whole joined string to appear verbatim.
+    if not rows:
+        terms = _like_terms(query)
+        score_expr = " + ".join("CASE WHEN content LIKE ? THEN 1 ELSE 0 END" for _ in terms)
+        where_expr = " OR ".join("content LIKE ?" for _ in terms)
+        if include_all:
+            where_sql, visibility_params = (
+                "memory_records.status = 'active' AND " + _not_tombstoned_where("memory_records"),
+                [],
+            )
+        else:
+            where_sql, visibility_params = _retrievable_where(
+                "memory_records",
+                project_id=project_id,
+                session_id=session_id,
+            )
+        if source_type:
+            where_sql += " AND memory_records.source_type = ?"
+            visibility_params.append(source_type)
+        score_params = [f"%{term}%" for term in terms]
+        where_params = [f"%{term}%" for term in terms]
+        rows = conn.execute(
+            f"""SELECT id AS record_id, substr(content, 1, 200) AS snippet,
+                       content, scope_type, created_at, updated_at,
+                       ({score_expr}) AS match_count
+                FROM memory_records
+                WHERE ({where_expr}) AND {where_sql}
+                ORDER BY match_count DESC, created_at DESC
+                LIMIT ?""",
+            (*score_params, *where_params, *visibility_params, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _like_terms(query: str) -> list[str]:
+    """Terms for CJK LIKE fallback, preserving exact phrase plus split terms."""
+    terms: list[str] = []
+    for term in [query.strip(), *re.split(r"\s+", query.strip())]:
+        cleaned = term.strip().strip('"')
+        if len(cleaned) < 2:
+            continue
+        if cleaned not in terms:
+            terms.append(cleaned)
+    return terms[:12] or [query]
+
+
+def _has_cjk(text: str) -> bool:
+    """Check if text contains CJK characters."""
+    for ch in text:
+        cp = ord(ch)
+        if (0x4E00 <= cp <= 0x9FFF or   # CJK Unified Ideographs
+            0x3400 <= cp <= 0x4DBF or   # CJK Unified Ideographs Extension A
+            0x3040 <= cp <= 0x309F or   # Hiragana
+            0x30A0 <= cp <= 0x30FF or   # Katakana
+            0xAC00 <= cp <= 0xD7AF):     # Hangul
+            return True
+    return False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 兼容层：替代旧 store.py 接口
-# 这些函数保持与 store.py 相同的返回格式，后端基于 SQLite，
-# 以便逐步移除旧的 Markdown 文件操作代码。
+# tendency_observations
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def insert_observation(
+    *,
+    content: str,
+    scope_kind: str = "agent_global",
+    scope_key: str | None = None,
+    workspace_id: str | None = None,
+    project_id: str | None = None,
+    source_session_id: str | None = None,
+    source_turn_range: str | None = None,
+    suggested_scope_kind: str = "session",
+) -> str | None:
+    """Add a raw tendency observation."""
+    if not content.strip():
+        return None
+    try:
+        scope_kind, scope_key = normalize_tendency_scope(scope_kind, scope_key)
+        suggested_scope_kind, _ = normalize_tendency_scope(suggested_scope_kind, scope_key)
+    except ValueError:
+        return None
+    if scope_kind == "agent_global":
+        workspace_id = None
+        project_id = None
+    elif scope_kind == "workspace":
+        workspace_id = workspace_id or scope_key
+    conn = connect()
+    obs_id = str(uuid.uuid4())
+    now = _now()
+    try:
+        conn.execute(
+            """INSERT INTO tendency_observations
+               (id, scope_kind, scope_key, workspace_id, project_id, content,
+                source_session_id, source_turn_range, created_at, updated_at, status,
+                suggested_scope_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            (
+                obs_id,
+                scope_kind,
+                scope_key,
+                workspace_id,
+                project_id,
+                content,
+                source_session_id,
+                source_turn_range,
+                now,
+                now,
+                suggested_scope_kind,
+            ),
+        )
+        _record_audit(
+            action="observe_tendency",
+            target_id=obs_id,
+            target_type="tendency_observation",
+            session_id=source_session_id,
+            reason="record tendency observation",
+            details={
+                "scope_kind": scope_kind,
+                "scope_key": scope_key,
+                "workspace_id": workspace_id,
+                "project_id": project_id,
+                "source_turn_range": source_turn_range,
+                "suggested_scope_kind": suggested_scope_kind,
+            },
+            commit=False,
+        )
+        conn.commit()
+        return obs_id
+    except sqlite3.Error:
+        conn.rollback()
+        return None
 
-def _save_version(memory_id: str, reason: str = "", *, commit: bool = True) -> str | None:
-    """保存记忆当前快照到 memory_versions 表。"""
+
+def list_observations(
+    *,
+    scope_kind: str | None = None,
+    scope_key: str | None = None,
+    workspace_id: str | None = None,
+    project_id: str | None = None,
+    suggested_scope_kind: str | None = None,
+    status: str | None = "active",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List tendency observations, newest first."""
+    conn = connect()
+    where: list[str] = [
+        """NOT EXISTS (
+               SELECT 1 FROM memory_session_tombstones mst
+               WHERE mst.session_id = tendency_observations.source_session_id
+           )"""
+    ]
+    params: list[Any] = []
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if scope_kind:
+        normalized_kind, normalized_key = normalize_tendency_scope(scope_kind, scope_key)
+        where.append("scope_kind = ?")
+        params.append(normalized_kind)
+        if scope_key:
+            where.append("scope_key = ?")
+            params.append(normalized_key)
+    elif scope_key:
+        where.append("scope_key = ?")
+        params.append(scope_key)
+    if workspace_id:
+        where.append("workspace_id = ?")
+        params.append(workspace_id)
+    if project_id:
+        where.append("project_id = ?")
+        params.append(project_id)
+    if suggested_scope_kind:
+        where.append("suggested_scope_kind = ?")
+        params.append(suggested_scope_kind)
+    if not where:
+        where.append("1 = 1")
+    sql = f"SELECT * FROM tendency_observations WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def update_observation_status(obs_id: str, status: str, *, commit: bool = True) -> bool:
+    """Set observation status (merged/deleted)."""
+    if status not in ("active", "merged", "deleted"):
+        return False
+    conn = connect()
+    old = conn.execute("SELECT * FROM tendency_observations WHERE id = ?", (obs_id,)).fetchone()
+    if not old:
+        return False
+    cur = conn.execute(
+        "UPDATE tendency_observations SET status = ?, updated_at = ? WHERE id = ?",
+        (status, _now(), obs_id),
+    )
+    _record_audit(
+        action=f"set_observation_{status}",
+        target_id=obs_id,
+        target_type="tendency_observation",
+        session_id=old["source_session_id"],
+        reason=f"set tendency observation {status}",
+        details={
+            "previous_status": old["status"],
+            "next_status": status,
+            "scope_kind": old["scope_kind"],
+            "scope_key": old["scope_key"],
+            "workspace_id": old["workspace_id"],
+            "project_id": old["project_id"],
+        },
+        commit=False,
+    )
+    if commit:
+        conn.commit()
+    return cur.rowcount > 0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# tendency_profiles
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_profile_by_scope(scope_kind: str, scope_key: str | None = None) -> dict[str, Any] | None:
+    """Read the latest compiled profile for a scope."""
+    try:
+        scope_kind, scope_key = normalize_tendency_scope(scope_kind, scope_key)
+    except ValueError:
+        return None
     conn = connect()
     row = conn.execute(
-        "SELECT slug, content, description, mem_type, priority, event_date FROM memories WHERE id = ?",
-        (memory_id,),
+        """SELECT tp.* FROM tendency_profiles tp
+           WHERE tp.scope_kind = ? AND tp.scope_key = ?
+             AND (tp.scope_kind <> 'session' OR NOT EXISTS (
+                 SELECT 1 FROM memory_session_tombstones mst WHERE mst.session_id = tp.scope_key
+             ))
+           ORDER BY tp.version DESC LIMIT 1""",
+        (scope_kind, scope_key),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    """List compiled tendency profiles."""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT tp.* FROM tendency_profiles tp
+           WHERE tp.scope_kind <> 'session' OR NOT EXISTS (
+               SELECT 1 FROM memory_session_tombstones mst WHERE mst.session_id = tp.scope_key
+           )
+           ORDER BY tp.scope_kind ASC, tp.updated_at DESC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _save_profile_version(profile: dict[str, Any], reason: str = "", *, commit: bool = True) -> str | None:
+    """Snapshot the current profile before it is overwritten."""
+    conn = connect()
+    cursor = conn.execute(
+        """INSERT INTO tendency_profile_versions
+           (profile_id, scope_kind, scope_key, workspace_id, project_id, content,
+            source_observation_ids, version, saved_at, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            profile["id"],
+            profile["scope_kind"],
+            profile["scope_key"],
+            profile.get("workspace_id"),
+            profile.get("project_id"),
+            profile.get("content", ""),
+            profile.get("source_observation_ids", "[]"),
+            int(profile.get("version") or 0),
+            _now(),
+            reason,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return f"profile_version://{cursor.lastrowid}"
+
+
+def list_profile_versions(profile_id: str) -> list[dict[str, Any]]:
+    """List saved versions for a tendency profile."""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT id, version, saved_at, reason, length(content) AS size
+           FROM tendency_profile_versions
+           WHERE profile_id = ?
+           ORDER BY saved_at DESC, id DESC""",
+        (profile_id,),
+    ).fetchall()
+    return [
+        {"version": r["version"], "path": f"profile_version://{r['id']}",
+         "mtime": r["saved_at"], "size": r["size"] or 0, "reason": r["reason"] or ""}
+        for r in rows
+    ]
+
+
+def _string_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item)]
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in parsed if str(item)] if isinstance(parsed, list) else []
+
+
+def _save_tendency_mutation_version(
+    profile_id: str,
+    profile: dict[str, Any] | None,
+    observations: list[dict[str, Any]],
+    *,
+    reason: str,
+    commit: bool = True,
+) -> str:
+    cursor = connect().execute(
+        """INSERT INTO tendency_mutation_versions (profile_id, snapshot, saved_at, reason)
+           VALUES (?, ?, ?, ?)""",
+        (
+            profile_id,
+            json.dumps({"profile": profile, "observations": observations}, ensure_ascii=False),
+            _now(),
+            reason,
+        ),
+    )
+    if commit:
+        connect().commit()
+    return f"tendency_version://{cursor.lastrowid}"
+
+
+def upsert_profile(
+    *,
+    scope_kind: str,
+    scope_key: str | None = None,
+    workspace_id: str | None = None,
+    project_id: str | None = None,
+    content: str,
+    source_observation_ids: list[str] | None = None,
+    merge_observation_ids: list[str] | None = None,
+    replace_source_observation_ids: bool = False,
+) -> MutationResult:
+    """Create or update a profile and merge observations atomically."""
+    try:
+        scope_kind, scope_key = normalize_tendency_scope(scope_kind, scope_key)
+    except ValueError as exc:
+        return MutationResult(False, "upsert_profile", error=str(exc))
+    if scope_kind == "agent_global":
+        workspace_id = None
+        project_id = None
+    elif scope_kind == "workspace":
+        workspace_id = workspace_id or scope_key
+    conn = connect()
+    now = _now()
+    existing = get_profile_by_scope(scope_kind, scope_key)
+    try:
+        merge_ids = list(dict.fromkeys(str(item) for item in (merge_observation_ids or []) if str(item)))
+        observations: list[dict[str, Any]] = []
+        if merge_ids:
+            placeholders = ",".join("?" for _ in merge_ids)
+            rows = conn.execute(
+                f"SELECT * FROM tendency_observations WHERE id IN ({placeholders})",
+                merge_ids,
+            ).fetchall()
+            observations = [dict(row) for row in rows]
+            found_ids = {str(item["id"]) for item in observations}
+            missing = [item for item in merge_ids if item not in found_ids]
+            if missing:
+                return MutationResult(False, "upsert_profile", error=f"observation not found: {missing[0]}")
+
+        profile_id = str(existing["id"]) if existing else str(uuid.uuid4())
+        version_path = _save_tendency_mutation_version(
+            profile_id,
+            existing,
+            observations,
+            reason="compile tendency profile",
+            commit=False,
+        )
+        existing_sources = _string_list(existing.get("source_observation_ids")) if existing else []
+        incoming_sources = _string_list(source_observation_ids or [])
+        next_sources = list(dict.fromkeys(
+            incoming_sources if replace_source_observation_ids else [*existing_sources, *incoming_sources]
+        ))
+        if existing:
+            profile_history_path = _save_profile_version(existing, reason="profile update", commit=False)
+            new_version = existing["version"] + 1
+            cur = conn.execute(
+                """UPDATE tendency_profiles
+                   SET content = ?, source_observation_ids = ?, version = ?, updated_at = ?
+                   WHERE id = ?""",
+                (content, json.dumps(next_sources, ensure_ascii=False),
+                 new_version, now, existing["id"]),
+            )
+        else:
+            profile_history_path = None
+            new_version = 1
+            cur = conn.execute(
+                """INSERT INTO tendency_profiles
+                   (id, scope_kind, scope_key, workspace_id, project_id, content,
+                    source_observation_ids, version, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (profile_id, scope_kind, scope_key, workspace_id, project_id, content,
+                 json.dumps(next_sources, ensure_ascii=False),
+                 new_version, now, now),
+            )
+        changed = cur.rowcount
+        if changed <= 0:
+            conn.rollback()
+            return MutationResult(False, "upsert_profile", error="no rows changed")
+        for observation_id in merge_ids:
+            merged = conn.execute(
+                """UPDATE tendency_observations
+                   SET status = 'merged', updated_at = ?
+                   WHERE id = ? AND status <> 'merged'""",
+                (now, observation_id),
+            ).rowcount
+            changed += merged
+        audit_id = _record_audit(
+            action="compile_profile",
+            target_id=profile_id,
+            target_type="tendency_profile",
+            reason=f"compile {scope_kind} profile v{new_version}",
+            backup_path=version_path,
+            details={
+                "scope_kind": scope_kind,
+                "scope_key": scope_key,
+                "workspace_id": workspace_id,
+                "project_id": project_id,
+                "version": new_version,
+                "changed_rows": changed,
+                "merged_observation_ids": merge_ids,
+                "profile_history_version": profile_history_path,
+            },
+            commit=False,
+        )
+        conn.commit()
+        return MutationResult(True, "upsert_profile", target_id=profile_id, changed_rows=changed, audit_id=audit_id,
+                              version_id=version_path, details={"version": new_version, "scope_kind": scope_kind,
+                                                               "merged_observation_ids": merge_ids})
+    except Exception as exc:
+        conn.rollback()
+        return MutationResult(False, "upsert_profile", error=str(exc))
+
+
+def restore_tendency_mutation_version(version: str) -> MutationResult:
+    """Rollback one atomic profile/observation mutation snapshot."""
+    try:
+        version_id = int(version)
+    except (TypeError, ValueError):
+        return MutationResult(False, "rollback_tendency", error="invalid tendency version")
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM tendency_mutation_versions WHERE id = ?",
+        (version_id,),
+    ).fetchone()
+    if not row:
+        return MutationResult(False, "rollback_tendency", error="tendency version not found")
+    try:
+        snapshot = json.loads(row["snapshot"] or "{}")
+        previous_profile = snapshot.get("profile")
+        previous_observations = snapshot.get("observations") or []
+        profile_id = str(row["profile_id"])
+        current_profile_row = conn.execute(
+            "SELECT * FROM tendency_profiles WHERE id = ?",
+            (profile_id,),
+        ).fetchone()
+        current_profile = dict(current_profile_row) if current_profile_row else None
+        observation_ids = list(dict.fromkeys([
+            *_string_list(current_profile.get("source_observation_ids") if current_profile else []),
+            *_string_list(previous_profile.get("source_observation_ids") if previous_profile else []),
+            *[str(item.get("id") or "") for item in previous_observations if item.get("id")],
+        ]))
+        current_observations: list[dict[str, Any]] = []
+        if observation_ids:
+            placeholders = ",".join("?" for _ in observation_ids)
+            current_observations = [
+                dict(item)
+                for item in conn.execute(
+                    f"SELECT * FROM tendency_observations WHERE id IN ({placeholders})",
+                    observation_ids,
+                ).fetchall()
+            ]
+        rollback_version = _save_tendency_mutation_version(
+            profile_id,
+            current_profile,
+            current_observations,
+            reason=f"before rollback tendency version {version_id}",
+            commit=False,
+        )
+
+        changed = 0
+        if previous_profile is None:
+            changed += conn.execute("DELETE FROM tendency_profiles WHERE id = ?", (profile_id,)).rowcount
+        else:
+            conn.execute("DELETE FROM tendency_profiles WHERE id = ?", (profile_id,))
+            columns = [
+                "id", "scope_kind", "scope_key", "workspace_id", "project_id", "content",
+                "source_observation_ids", "version", "created_at", "updated_at",
+            ]
+            conn.execute(
+                f"INSERT INTO tendency_profiles ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                [previous_profile.get(column) for column in columns],
+            )
+            changed += 1
+        for observation in previous_observations:
+            changed += conn.execute(
+                """UPDATE tendency_observations
+                   SET scope_kind = ?, scope_key = ?, workspace_id = ?, project_id = ?, content = ?,
+                       source_session_id = ?, source_turn_range = ?, created_at = ?, updated_at = ?,
+                       status = ?, suggested_scope_kind = ?
+                   WHERE id = ?""",
+                (
+                    observation.get("scope_kind"), observation.get("scope_key"),
+                    observation.get("workspace_id"), observation.get("project_id"),
+                    observation.get("content"), observation.get("source_session_id"),
+                    observation.get("source_turn_range"), observation.get("created_at"),
+                    observation.get("updated_at"), observation.get("status"),
+                    observation.get("suggested_scope_kind", "session"), observation.get("id"),
+                ),
+            ).rowcount
+        referenced_observation_ids: set[str] = set()
+        for profile_row in conn.execute("SELECT source_observation_ids FROM tendency_profiles"):
+            referenced_observation_ids.update(_string_list(profile_row["source_observation_ids"]))
+        previous_by_id = {
+            str(item["id"]): item for item in previous_observations if item.get("id")
+        }
+        for observation_id in observation_ids:
+            previous_status = str(previous_by_id.get(observation_id, {}).get("status") or "active")
+            desired_status = (
+                "deleted"
+                if previous_status == "deleted"
+                else ("merged" if observation_id in referenced_observation_ids else "active")
+            )
+            changed += conn.execute(
+                """UPDATE tendency_observations SET status = ?, updated_at = ?
+                   WHERE id = ? AND status <> ?""",
+                (desired_status, _now(), observation_id, desired_status),
+            ).rowcount
+        if changed <= 0:
+            conn.rollback()
+            return MutationResult(False, "rollback_tendency", target_id=profile_id, error="no rows changed")
+        audit_id = _record_audit(
+            action="rollback_tendency",
+            target_id=profile_id,
+            target_type="tendency_profile",
+            reason=f"restore tendency mutation version {version_id}",
+            backup_path=rollback_version,
+            details={"changed_rows": changed, "restored_version": version_id},
+            commit=False,
+        )
+        conn.commit()
+        return MutationResult(
+            True,
+            "rollback_tendency",
+            target_id=profile_id,
+            changed_rows=changed,
+            version_id=rollback_version,
+            audit_id=audit_id,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MutationResult(False, "rollback_tendency", error=str(exc))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# memory_versions — snapshots
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _save_version(record_id: str, reason: str = "", *, commit: bool = True) -> str | None:
+    """Snapshot the complete mutable record state into memory_versions."""
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM memory_records WHERE id = ?",
+        (record_id,),
     ).fetchone()
     if not row:
         return None
+    description = ""
+    try:
+        meta = json.loads(row["metadata"] or "{}")
+        description = meta.get("description", "")
+    except (json.JSONDecodeError, TypeError):
+        pass
     cursor = conn.execute(
-        """INSERT INTO memory_versions
-           (memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (memory_id, row["slug"], row["content"], row["description"],
-         row["mem_type"], row["priority"], row["event_date"],
-         _now(), reason),
+        """INSERT INTO memory_versions (record_id, content, description, snapshot, saved_at, reason)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (record_id, row["content"], description,
+         json.dumps(dict(row), ensure_ascii=False), _now(), reason),
     )
     if commit:
         conn.commit()
     return f"version://{cursor.lastrowid}"
 
 
-def read_memory(slug: str) -> str | None:
-    """读取记忆正文（纯文本），匹配 store.read_memory。"""
-    mem = get_memory(slug)
-    return mem["content"] if mem else None
-
-
-def read_memory_full(slug: str) -> dict[str, Any] | None:
-    """返回完整记录，匹配 store.read_memory_full。"""
-    mem = get_memory(slug)
-    if not mem:
-        return None
-    return {
-        "slug": mem["slug"],
-        "path": str(MEMORY_DB_PATH.parent / f"{mem['slug']}.md"),
-        "frontmatter": "",
-        "body": mem["content"],
-        "description": mem.get("description", ""),
-        "priority": mem.get("priority", "normal"),
-        "type": mem.get("mem_type", "user"),
-        "event_date": mem.get("event_date", ""),
-        "recorded_date": mem.get("recorded_date", ""),
-        "hash": mem.get("content_hash", ""),
-        "mtime": mem.get("updated_at", ""),
-        "size": len(mem.get("content", "")),
-    }
-
-
-def list_memories_compat(
-    priority: str | None = None,
-    mem_type: str | None = None,
-) -> list[dict[str, Any]]:
-    """
-    返回兼容 store.list_memories 格式的列表。
-
-    结果字段：slug, description, priority, type, mem_type, mtime, size, content
-    """
-    records = list_memories(priority=priority, mem_type=mem_type)
+def list_record_versions(record_id: str) -> list[dict[str, Any]]:
+    """List versions for a record, newest first."""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT id, saved_at, reason, length(content) AS size
+           FROM memory_versions
+           WHERE record_id = ?
+           ORDER BY saved_at DESC""",
+        (record_id,),
+    ).fetchall()
     return [
-        {
-            "slug": r["slug"],
-            "description": r.get("description", ""),
-            "priority": r.get("priority", "normal"),
-            "type": r.get("mem_type", "user"),
-            "mem_type": r.get("mem_type", "user"),
-            "mtime": r.get("updated_at", ""),
-            "size": len(r.get("content", "")),
-            "content": r.get("content", ""),
-        }
-        for r in records
-    ]
-
-
-def replace_memory_result(
-    *,
-    slug: str,
-    description: str,
-    body: str,
-    mem_type: str = "user",
-    priority: str = "normal",
-    event_date: str | None = None,
-    reason: str = "",
-    audit_action: str = "manual_edit",
-    details: dict[str, Any] | None = None,
-) -> MemoryMutationResult:
-    """覆盖写入记忆，并返回审计结果。"""
-    old = get_memory(slug)
-    if not old:
-        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
-
-    conn = connect()
-    now = _now()
-    priority = _valid_priority(priority)
-    mem_type = _valid_type(mem_type)
-    content_hash = _simple_hash(body)
-
-    try:
-        backup_path = _save_version(old["id"], reason=reason or "edit", commit=False)
-        if not backup_path:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
-        cur = conn.execute(
-            """UPDATE memories
-               SET content = ?, description = ?, mem_type = ?, priority = ?,
-                   event_date = COALESCE(?, event_date),
-                   content_hash = ?, updated_at = ?
-               WHERE slug = ?""",
-            (body, description.strip()[:200], mem_type, priority,
-             event_date, content_hash, now, slug),
-        )
-        changed_rows = cur.rowcount
-        if changed_rows <= 0:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
-        audit_details = {"changed_rows": changed_rows, **(details or {})}
-        audit_id = _record_audit(
-            action=audit_action,
-            target_slug=slug,
-            reason=reason or audit_action,
-            backup_path=backup_path,
-            details=audit_details,
-            commit=False,
-        )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
-        conn.commit()
-        refresh_memory_vectors(old["id"])
-        return MemoryMutationResult(
-            True,
-            audit_action,
-            slug,
-            changed_rows=changed_rows,
-            version_id=backup_path,
-            audit_id=audit_id,
-            backup_path=backup_path,
-            details=audit_details,
-        )
-    except Exception as exc:
-        conn.rollback()
-        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
-
-
-def replace_memory(
-    *,
-    slug: str,
-    description: str,
-    body: str,
-    mem_type: str = "user",
-    priority: str = "normal",
-    event_date: str | None = None,
-    reason: str = "",
-) -> str | None:
-    """覆盖写入记忆（替换 content，非追加），匹配 store.replace_memory。"""
-    result = replace_memory_result(
-        slug=slug,
-        description=description,
-        body=body,
-        mem_type=mem_type,
-        priority=priority,
-        event_date=event_date,
-        reason=reason,
-    )
-    return slug if result.ok else None
-
-
-def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: str = "archive") -> MemoryMutationResult:
-    """设置 priority = 'archive'，并返回审计结果。"""
-    old = get_memory(slug)
-    if not old:
-        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
-    conn = connect()
-    try:
-        backup_path = _save_version(old["id"], reason=reason, commit=False)
-        if not backup_path:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
-        cur = conn.execute(
-            "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
-            (_now(), slug),
-        )
-        changed_rows = cur.rowcount
-        if changed_rows <= 0:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
-        audit_details = {"changed_rows": changed_rows}
-        audit_id = _record_audit(
-            action=audit_action,
-            target_slug=slug,
-            reason=reason,
-            backup_path=backup_path,
-            details=audit_details,
-            commit=False,
-        )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
-        conn.commit()
-        return MemoryMutationResult(
-            True,
-            audit_action,
-            slug,
-            changed_rows=changed_rows,
-            version_id=backup_path,
-            audit_id=audit_id,
-            backup_path=backup_path,
-            details=audit_details,
-        )
-    except Exception as exc:
-        conn.rollback()
-        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
-
-
-def archive_memory_by_slug(slug: str) -> str | None:
-    """设置 priority = 'archive'，匹配 store.archive_memory。"""
-    return slug if archive_memory_result(slug).ok else None
-
-
-def delete_memory_compat(slug: str) -> str | None:
-    """删除记忆，保存快照后删除，匹配 store.delete_memory_file。"""
-    return slug if delete_memory(slug) else None
-
-
-def merge_memories_result(
-    target_slug: str,
-    source_slug: str,
-    merged_body: str,
-    description: str,
-    priority: str | None = None,
-    mem_type: str | None = None,
-    archive_source: bool = True,
-) -> MemoryMutationResult:
-    """合并两条记忆，并返回审计结果。"""
-    target = get_memory(target_slug)
-    source = get_memory(source_slug)
-    if not target or not source:
-        return MemoryMutationResult(False, "merge", target_slug, error="target or source memory not found")
-
-    new_priority = _valid_priority(priority or target.get("priority", "normal"))
-    new_type = _valid_type(mem_type or target.get("mem_type", "user"))
-    conn = connect()
-    now = _now()
-    content_hash = _simple_hash(merged_body)
-    try:
-        target_backup = _save_version(target["id"], reason=f"merge from {source_slug}", commit=False)
-        source_backup = _save_version(source["id"], reason=f"merge into {target_slug}", commit=False)
-        if not target_backup or not source_backup:
-            conn.rollback()
-            return MemoryMutationResult(False, "merge", target_slug, error="version snapshot failed")
-        target_cur = conn.execute(
-            """UPDATE memories
-               SET content = ?, description = ?, mem_type = ?, priority = ?,
-                   content_hash = ?, updated_at = ?
-               WHERE slug = ?""",
-            (merged_body, description.strip()[:200], new_type, new_priority,
-             content_hash, now, target_slug),
-        )
-        changed_rows = target_cur.rowcount
-        source_rows = 0
-        if archive_source:
-            source_cur = conn.execute(
-                "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
-                (now, source_slug),
-            )
-            source_rows = source_cur.rowcount
-        changed_rows += source_rows
-        if changed_rows <= 0:
-            conn.rollback()
-            return MemoryMutationResult(False, "merge", target_slug, changed_rows=changed_rows, backup_path=target_backup, error="no rows changed")
-        audit_details = {
-            "changed_rows": changed_rows,
-            "source_slug": source_slug,
-            "target_version_id": target_backup,
-            "source_version_id": source_backup,
-            "source_archived": archive_source,
-        }
-        audit_id = _record_audit(
-            action="merge",
-            target_slug=target_slug,
-            reason=f"merge from {source_slug}",
-            backup_path=target_backup,
-            details=audit_details,
-            commit=False,
-        )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, "merge", target_slug, changed_rows=changed_rows, backup_path=target_backup, error="audit write failed")
-        conn.commit()
-        refresh_memory_vectors(target["id"])
-        return MemoryMutationResult(
-            True,
-            "merge",
-            target_slug,
-            changed_rows=changed_rows,
-            version_id=target_backup,
-            audit_id=audit_id,
-            backup_path=target_backup,
-            details=audit_details,
-        )
-    except Exception as exc:
-        conn.rollback()
-        return MemoryMutationResult(False, "merge", target_slug, error=str(exc))
-
-
-def merge_memories(
-    target_slug: str,
-    source_slug: str,
-    merged_body: str,
-    description: str,
-    priority: str | None = None,
-    mem_type: str | None = None,
-    archive_source: bool = True,
-) -> str | None:
-    """合并两条记忆，匹配 store.merge_memory_files。"""
-    result = merge_memories_result(
-        target_slug,
-        source_slug,
-        merged_body,
-        description,
-        priority=priority,
-        mem_type=mem_type,
-        archive_source=archive_source,
-    )
-    return target_slug if result.ok else None
-
-
-def list_history(slug: str) -> list[dict[str, Any]]:
-    """列出记忆的版本历史，匹配 store.list_history。"""
-    mem = get_memory(slug)
-    conn = connect()
-    if mem:
-        rows = conn.execute(
-            """SELECT id, saved_at, reason, length(content) AS size
-               FROM memory_versions
-               WHERE memory_id = ? OR slug = ?
-               ORDER BY saved_at DESC""",
-            (mem["id"], slug),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT id, saved_at, reason, length(content) AS size
-               FROM memory_versions
-               WHERE slug = ?
-               ORDER BY saved_at DESC""",
-            (slug,),
-        ).fetchall()
-    return [
-        {
-            "version": r["id"],
-            "path": f"version://{r['id']}",
-            "mtime": r["saved_at"],
-            "size": r["size"] or 0,
-            "reason": r["reason"] or "",
-        }
+        {"version": r["id"], "path": f"version://{r['id']}",
+         "mtime": r["saved_at"], "size": r["size"] or 0, "reason": r["reason"] or ""}
         for r in rows
     ]
 
 
-def read_history_record(slug: str, version: str) -> dict[str, Any] | None:
-    """读取指定版本的结构化历史记录。"""
-    mem = get_memory(slug)
+def get_record_version(record_id: str, version: str) -> dict[str, Any] | None:
     try:
         version_id = int(version)
     except (TypeError, ValueError):
         return None
-    conn = connect()
-    if mem:
-        row = conn.execute(
-            """SELECT id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason
-               FROM memory_versions
-               WHERE (memory_id = ? OR slug = ?) AND id = ?""",
-            (mem["id"], slug, version_id),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            """SELECT id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason
-               FROM memory_versions
-               WHERE slug = ? AND id = ?""",
-            (slug, version_id),
-        ).fetchone()
+    row = connect().execute(
+        "SELECT * FROM memory_versions WHERE record_id = ? AND id = ?",
+        (record_id, version_id),
+    ).fetchone()
     if not row:
         return None
-    return dict(row)
+    data = json.loads(row["snapshot"] or "{}")
+    if not data:
+        data = {"id": record_id, "content": row["content"]}
+    data["version"] = row["id"]
+    data["saved_at"] = row["saved_at"]
+    data["reason"] = row["reason"]
+    return data
 
 
-def restore_memory_from_history_result(slug: str, version: str, reason: str = "") -> MemoryMutationResult:
-    """Restore a memory snapshot from memory_versions, recreating deleted rows."""
-    record = read_history_record(slug, version)
-    if not record:
-        return MemoryMutationResult(False, "rollback_restore", slug, error="history version not found")
+def get_audit_event(audit_id: str) -> dict[str, Any] | None:
+    row = connect().execute("SELECT * FROM memory_audit WHERE id = ?", (audit_id,)).fetchone()
+    return dict(row) if row else None
 
-    target_slug = str(record.get("slug") or slug).strip().lower().replace(" ", "-")[:50] or "memory"
-    body = record.get("content") or ""
-    description = record.get("description") or ""
-    mem_type = _valid_type(record.get("mem_type") or "user")
-    priority = _valid_priority(record.get("priority") or "normal")
-    event_date = record.get("event_date")
 
-    if get_memory(target_slug):
-        return replace_memory_result(
-            slug=target_slug,
-            description=description,
-            body=body,
-            mem_type=mem_type,
-            priority=priority,
-            event_date=event_date,
-            reason=reason or f"restore version {version}",
-            audit_action="rollback_restore",
-            details={"restored_from": f"version://{version}"},
-        )
+def list_audit_events(limit: int = 100) -> list[dict[str, Any]]:
+    rows = connect().execute(
+        "SELECT * FROM memory_audit ORDER BY ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
-    conn = connect()
-    now = _now()
-    memory_id = record.get("memory_id") or str(uuid.uuid4())
-    if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
-        memory_id = str(uuid.uuid4())
 
+def restore_record_version(record_id: str, version: str) -> MutationResult:
+    """Restore record content from a version snapshot."""
     try:
+        version_id = int(version)
+    except (TypeError, ValueError):
+        return MutationResult(False, "restore", error="invalid version")
+    conn = connect()
+    row = conn.execute(
+        "SELECT content, description, snapshot FROM memory_versions WHERE record_id = ? AND id = ?",
+        (record_id, version_id),
+    ).fetchone()
+    if not row:
+        return MutationResult(False, "restore", target_id=record_id, error="version not found")
+    try:
+        snapshot = json.loads(row["snapshot"] or "{}")
+        content = str(snapshot.get("content", row["content"]))
+        metadata = snapshot.get("metadata")
+        if not isinstance(metadata, str):
+            metadata = json.dumps({"description": row["description"]}, ensure_ascii=False)
+        version_path = _save_version(record_id, reason=f"restore from version {version}", commit=False)
+        now = _now()
         cur = conn.execute(
-            """
-            INSERT INTO memories
-                (id, slug, description, content, mem_type, priority,
-                 event_date, recorded_date, content_hash,
-                 created_at, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            """UPDATE memory_records
+               SET source_type = ?, scope_type = ?, project_id = ?, session_id = ?, turn_idx = ?,
+                   role = ?, content = ?, content_hash = ?, privacy = ?, tags = ?, status = ?, vector_status = 'dirty',
+                   updated_at = ?, metadata = ?
+               WHERE id = ?""",
             (
-                memory_id,
-                target_slug,
-                description.strip()[:200],
-                body,
-                mem_type,
-                priority,
-                event_date,
+                snapshot.get("source_type", "manual"),
+                snapshot.get("scope_type", "global"),
+                snapshot.get("project_id"),
+                snapshot.get("session_id"),
+                snapshot.get("turn_idx"),
+                snapshot.get("role", "user"),
+                content,
+                _simple_hash(content),
+                snapshot.get("privacy", "public"),
+                snapshot.get("tags", "[]"),
+                snapshot.get("status", "active"),
                 now,
-                _simple_hash(body),
-                now,
-                now,
-                json.dumps(
-                    {"restored_from": f"version://{version}", "restore_reason": reason},
-                    ensure_ascii=False,
-                ),
+                metadata,
+                record_id,
             ),
         )
-        changed_rows = cur.rowcount
-        if changed_rows <= 0:
+        changed = cur.rowcount
+        if changed <= 0:
             conn.rollback()
-            return MemoryMutationResult(False, "rollback_restore", target_slug, changed_rows=changed_rows, error="no rows changed")
-        audit_details = {"changed_rows": changed_rows, "restored_from": f"version://{version}"}
+            return MutationResult(False, "restore", target_id=record_id, error="no rows changed")
         audit_id = _record_audit(
-            action="rollback_restore",
-            target_slug=target_slug,
-            reason=reason or f"restore version {version}",
-            details=audit_details,
+            action="restore",
+            target_id=record_id,
+            reason=f"restore from version {version}",
+            backup_path=version_path,
+            details={"changed_rows": changed, "version_snapshot": version_path},
             commit=False,
         )
-        if not audit_id:
-            conn.rollback()
-            return MemoryMutationResult(False, "rollback_restore", target_slug, changed_rows=changed_rows, error="audit write failed")
         conn.commit()
-        refresh_memory_vectors(memory_id)
-        return MemoryMutationResult(
-            True,
-            "rollback_restore",
-            target_slug,
-            changed_rows=changed_rows,
-            audit_id=audit_id,
-            details=audit_details,
-        )
+        return MutationResult(True, "restore", target_id=record_id, changed_rows=changed,
+                              version_id=version_path, audit_id=audit_id)
     except Exception as exc:
         conn.rollback()
-        return MemoryMutationResult(False, "rollback_restore", target_slug, error=str(exc))
+        return MutationResult(False, "restore", error=str(exc))
 
 
-def restore_memory_from_history(slug: str, version: str, reason: str = "") -> str | None:
-    """Restore a memory snapshot from memory_versions, recreating deleted rows."""
-    result = restore_memory_from_history_result(slug, version, reason=reason)
-    return result.target_slug if result.ok else None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stats
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def get_stats(
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    workspace_id: str | None = None,
+    include_all: bool = True,
+) -> dict[str, Any]:
+    """Memory system statistics."""
+    conn = connect()
+    if include_all:
+        visible_records = _not_tombstoned_where("r")
+        record_params: list[Any] = []
+    else:
+        visible_records, record_params = _retrievable_where(
+            "r",
+            project_id=project_id,
+            session_id=session_id,
+        )
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM memory_records r WHERE {visible_records}",
+        record_params,
+    ).fetchone()[0]
+    by_status = dict(conn.execute(
+        f"SELECT status, COUNT(*) FROM memory_records r WHERE {visible_records} GROUP BY status",
+        record_params,
+    ).fetchall())
+    by_source = dict(conn.execute(
+        f"SELECT source_type, COUNT(*) FROM memory_records r WHERE {visible_records} GROUP BY source_type",
+        record_params,
+    ).fetchall())
+    total_chunks = conn.execute(
+        f"""SELECT COUNT(*) FROM memory_chunks c
+            JOIN memory_records r ON r.id = c.record_id
+            WHERE {visible_records}""",
+        record_params,
+    ).fetchone()[0]
 
-def read_history(slug: str, version: str) -> str | None:
-    """读取指定版本的历史内容，匹配 store.read_history。"""
-    row = read_history_record(slug, version)
-    if not row:
-        return None
-    # 以 Markdown 形式返回，包含旧 frontmatter 风格的元信息
-    return (
-        f"---\nslug: {slug}\n"
-        f"description: {row['description']}\n"
-        f"type: {row['mem_type']}\n"
-        f"priority: {row['priority']}\n"
-        f"---\n\n{row['content']}"
-    )
-
-
-def rebuild_index() -> None:
-    """Export a readable MEMORY.md cache from the SQLite memory store."""
-    from .config import MEMORY_INDEX
-
-    MEMORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    memories = list_memories_compat()
-    grouped: dict[str, list[dict[str, Any]]] = {
-        "core": [], "important": [], "normal": [], "archive": [],
+    tendency_scopes = ["scope_kind = 'agent_global'"]
+    tendency_params: list[Any] = []
+    if workspace_id:
+        tendency_scopes.append("(scope_kind = 'workspace' AND scope_key = ?)")
+        tendency_params.append(workspace_id)
+    if session_id:
+        tendency_scopes.append("(scope_kind = 'session' AND scope_key = ?)")
+        tendency_params.append(session_id)
+    tendency_scope_sql = "1 = 1" if include_all else "(" + " OR ".join(tendency_scopes) + ")"
+    obs_count = conn.execute(
+        f"""SELECT COUNT(*) FROM tendency_observations o
+           WHERE o.status = 'active' AND {tendency_scope_sql}
+             AND NOT EXISTS (
+                 SELECT 1 FROM memory_session_tombstones mst
+                 WHERE mst.session_id = o.source_session_id
+             )""",
+        tendency_params,
+    ).fetchone()[0]
+    profile_count = conn.execute(
+        f"""SELECT COUNT(*) FROM tendency_profiles tp
+           WHERE ({tendency_scope_sql}) AND (tp.scope_kind <> 'session' OR NOT EXISTS (
+               SELECT 1 FROM memory_session_tombstones mst WHERE mst.session_id = tp.scope_key
+           ))""",
+        tendency_params,
+    ).fetchone()[0]
+    dirty_vectors = conn.execute(
+        f"""SELECT COUNT(*) FROM memory_records r
+            WHERE r.status = 'active' AND r.vector_status = 'dirty' AND {visible_records}""",
+        record_params,
+    ).fetchone()[0]
+    return {
+        "total_records": total,
+        "by_status": by_status,
+        "by_source_type": by_source,
+        "total_chunks": total_chunks,
+        "active_observations": obs_count,
+        "tendency_profiles": profile_count,
+        "dirty_vectors": dirty_vectors,
     }
-    for mem in memories:
-        p = mem.get("priority", "normal")
-        grouped.setdefault(p, []).append(mem)
 
-    TIER_HEADINGS = [
-        ("core", "L0 · Core（始终加载）"),
-        ("important", "L1 · Important（始终加载）"),
-        ("normal", "L2 · Normal（按话题触发）"),
-        ("archive", "L3 · Archive（深度检索按需）"),
-    ]
 
-    lines = [
-        "# 记忆索引",
-        "",
-        "> SQLite 是当前真源；Markdown 文件是只读缓存。",
-        ">",
-        "> **启动时**：从 SQLite 加载 L0（core）和 L1（important）记忆完整内容；L2/L3 按话题检索。",
-        "",
-    ]
-    for priority, heading in TIER_HEADINGS:
-        lines.append(f"## {heading}")
-        lines.append("")
-        items = sorted(grouped.get(priority, []), key=lambda m: m.get("slug", ""))
-        if items:
-            for mem in items:
-                slug = mem.get("slug", "")
-                desc = mem.get("description", slug)
-                label = slug.replace("_", " ")
-                lines.append(f"- [{label}]({slug}.md) — {desc}")
-        else:
-            lines.append("- （暂无）")
-        lines.append("")
-
-    MEMORY_INDEX.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+def update_record(
+    record_id: str,
+    *,
+    content: str | None = None,
+    description: str | None = None,
+    reason: str = "",
+) -> MutationResult:
+    """Edit/replace a record's content. Saves version and writes audit."""
+    old = get_record(record_id)
+    if not old:
+        return MutationResult(False, "update", target_id=record_id, error="record not found")
+    conn = connect()
+    now = _now()
+    new_content = content if content is not None else old["content"]
+    try:
+        old_metadata = json.loads(old.get("metadata") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        old_metadata = {}
+    old_desc = str(old_metadata.get("description") or "")
+    new_desc = description if description is not None else old_desc
+    if new_content == old["content"] and new_desc == old_desc:
+        return MutationResult(False, "update", target_id=record_id, error="no changes")
+    try:
+        version_path = _save_version(record_id, reason=reason or "update", commit=False)
+        if not version_path:
+            conn.rollback()
+            return MutationResult(False, "update", target_id=record_id, error="version snapshot failed")
+        cur = conn.execute(
+            """UPDATE memory_records
+               SET content = ?, content_hash = ?, updated_at = ?, metadata = ?, vector_status = 'dirty'
+               WHERE id = ?""",
+            (new_content, _simple_hash(new_content), now,
+             json.dumps({**old_metadata, "description": new_desc}, ensure_ascii=False),
+             record_id),
+        )
+        changed = cur.rowcount
+        if changed <= 0:
+            conn.rollback()
+            return MutationResult(False, "update", target_id=record_id, error="no rows changed")
+        audit_id = _record_audit(
+            action="update",
+            target_id=record_id,
+            reason=reason or "update",
+            backup_path=version_path,
+            details={"changed_rows": changed},
+            commit=False,
+        )
+        conn.commit()
+        return MutationResult(True, "update", target_id=record_id, changed_rows=changed,
+                              version_id=version_path, audit_id=audit_id)
+    except Exception as exc:
+        conn.rollback()
+        return MutationResult(False, "update", target_id=record_id, error=str(exc))

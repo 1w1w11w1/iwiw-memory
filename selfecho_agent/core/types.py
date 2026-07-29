@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from selfecho_model import ModelCallConfig
+
 
 StepStatus = Literal[
     "pending",
@@ -27,14 +29,6 @@ AgentStreamEvent: TypeAlias = dict[str, Any]
 class AgentRequest:
     session_id: str
     message: str
-
-
-@dataclass(frozen=True)
-class ModelCallConfig:
-    role: str
-    max_tokens: int
-    temperature: float
-    timeout: float
 
 
 @dataclass(frozen=True)
