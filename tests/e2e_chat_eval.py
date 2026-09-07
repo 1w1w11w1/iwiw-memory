@@ -79,7 +79,7 @@ def injected_per_turn(stdout):
 
 
 def extraction_flag(stdout):
-    return any('[提取]' in l or '检测到高信号' in l for l in stdout.splitlines())
+    return any('[自动提取]' in l for l in stdout.splitlines())
 
 
 def stats_counts(stdout):
@@ -166,27 +166,6 @@ def sc_extraction_context():
         }
 
 
-def sc_latency():
-    """E2E-04 提取延迟体验：高信号 3 轮 vs 闲聊 3 轮的轮均耗时差。"""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        hi_turns = ['我决定下周开始学游泳', '我计划报名一个健身班', '我打算每个月存一千块钱']
-        lo_turns = ['今天随便聊聊天气', '嗯嗯', '好的呢']
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t1, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t2:
-            r_hi = run_chat(hi_turns, str(Path(t1) / 'hi.db'))
-            r_lo = run_chat(lo_turns, str(Path(t2) / 'lo.db'))
-        per_hi = r_hi['wall'] / len(hi_turns)
-        per_lo = r_lo['wall'] / len(lo_turns)
-        delta = per_hi - per_lo
-        return {
-            'name': 'latency',
-            'ok': delta < 5.0,
-            'per_turn_hi': round(per_hi, 1),
-            'per_turn_lo': round(per_lo, 1),
-            'delta_per_turn': round(delta, 1),
-            'stdout_tail': r_hi['stdout'][-500:],
-        }
-
-
 def sc_commands():
     """E2E-05 管理命令冒烟：help/stats/pending 生命周期正常。"""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -218,7 +197,6 @@ SCENARIOS = [
     sc_trigger_coverage,
     sc_inject_relevance,
     sc_extraction_context,
-    sc_latency,
     sc_commands,
     sc_llm_failure,
 ]

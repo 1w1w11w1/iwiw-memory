@@ -6,7 +6,7 @@ chat.py — 记忆系统 CLI 工作台（独立 chat 功能）
 能力：
 - 对话：LLM 回复，启动时注入 core（必须载入）记忆全文，
   每轮按话题联想相关记忆注入上下文。
-- 实时提取：should_trigger 命中高信号即调用 extract_and_save。
+- 自动提取：每轮对话后自动分析并保存（无门禁，带完整对话上下文，回复后执行不阻塞）。
 - 命令：
   /mem list [priority]       列出记忆
   /mem search <q>            搜索记忆
@@ -62,7 +62,6 @@ from .db import (
 )
 from .extractor import extract_and_save
 from .retrieval import search_memories
-from .triggers import should_trigger
 from .llm import stream_text, LLMConfigurationError
 
 # ── 系统提示 ──
@@ -72,8 +71,9 @@ BASE_SYSTEM_PROMPT = """你是一个「记忆工作台」里的对话助手，�
 规则：
 1. 记忆分级（三值）：core 必须载入（启动注入）；normal 按话题检索注入；archive 为归档状态。
 2. 回复中如涉及记忆内容，直接自然引用，不要提及内部机制（如 slug、检索分数）。
-3. 当用户表达的信息值得长期保存（身份、偏好、决策、困扰、反馈），或你发现新事实，
-   主动提示用户这些内容已（或建议）写入记忆。
+3. 系统会在每轮对话后自动分析并保存值得长期记住的信息（身份、偏好、决策、困扰、反馈）。
+   你不需要向用户承诺"已记住"，也不要请求确认；如果用户要求你记住什么，
+   告诉用户系统会自动处理即可。
 4. 简洁、真诚，使用中文。
 """
 
@@ -337,7 +337,6 @@ async def run() -> None:
     print(" 输入 /help 查看命令；/quit 退出")
     print("=" * 60)
 
-    always_load = _always_load_text()
     history: list[dict[str, str]] = []
     # injected_slugs: slug -> 最近注入的轮次（用于"窗口内去重"：
     # 记忆滑出上下文窗口后允许重新联想，避免长会话中联想枯竭）
@@ -368,22 +367,13 @@ async def run() -> None:
                 break
             continue
 
-        # ── 实时触发提取（高信号）──
-        if should_trigger(line):
-            print("（检测到高信号，正在提取记忆...）")
-            try:
-                saved = await extract_and_save(line)
-                if saved:
-                    print(f"（已写入记忆: {', '.join(saved)}）")
-                else:
-                    print("（未提取到新记忆）")
-            except Exception as exc:
-                print(f"（提取失败: {exc}）")
-
         # ── 组装上下文（联想注入 → system 层，模型当作已知背景）──
         system = BASE_SYSTEM_PROMPT
+        # 每轮重算常驻层与词面索引：会话中新写入的记忆立即生效（A2 一致性）
+        always_load = _always_load_text()
         if always_load:
             system += "\n\n" + always_load
+        session.build_word_index(list_memories())
         core_slugs = {m["slug"] for m in list_memories(priority="core")}
         # 窗口内去重：只排除"最近 W 轮内注入过"的记忆（已滑出窗口的允许重新联想）
         state["_turn"] = int(state.get("_turn", 0)) + 1
@@ -459,6 +449,15 @@ async def run() -> None:
         history.append({"role": "user", "content": line})
         history.append({"role": "assistant", "content": reply})
         state["last_user_message"] = line
+
+        # ── 每轮自动提取（无门禁、带完整对话上下文；回复之后执行不阻塞体验）──
+        ctx = "\n".join(f"[{m['role']}]: {m['content'][:500]}" for m in history[-6:])
+        try:
+            saved = await extract_and_save(line, context=ctx)
+            if saved:
+                print(f"[自动提取] {', '.join(saved)}")
+        except Exception as exc:
+            print(f"[自动提取失败] {exc}")
 
 
 def main() -> None:

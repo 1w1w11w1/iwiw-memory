@@ -244,8 +244,8 @@ def _should_skip(message: str) -> bool:
     """跳过低信息量的纯功能性消息"""
     stripped = message.strip()
 
-    # 太短
-    if len(stripped) < 8:
+    # 过短的功能性输入（"嗯嗯/哦哦/好的"）跳过；短事实句（"我对芒果过敏"）保留
+    if len(stripped) < 4:
         return True
 
     # IDE 自动注入的上下文（如 VSCode 自动附加的选中文本），不是用户自然表达

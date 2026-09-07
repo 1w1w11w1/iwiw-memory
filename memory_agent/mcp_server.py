@@ -2,7 +2,7 @@
 mcp_server.py — 记忆系统 MCP 服务器（DSH 接入桥）
 
 提供工具：
-- extract_and_save : 从对话文本提取记忆并保存（实时触发）
+- extract_and_save : 从对话文本提取记忆并保存（每轮自动，带对话上下文）
 - search_memories  : 确定性搜索（FTS5 词面 + 会话状态联想 + 时间衰减 + 优先级）
 - list_memories    : 列出记忆（按 priority/type 过滤）
 - read_memory      : 读取单条记忆
@@ -16,7 +16,6 @@ mcp_server.py — 记忆系统 MCP 服务器（DSH 接入桥）
 - pending_actions  : 待确认动作列表
 - pending_approve  : 审批通过
 - pending_reject   : 审批拒绝
-- memory_trigger   : 判断消息是否应触发提取
 
 
 启动：python -m memory_agent.mcp_server
@@ -47,7 +46,6 @@ from .db import (
 )
 from .extractor import extract_and_save
 from .retrieval import search_memories
-from .triggers import should_trigger
 
 server = Server("memory-system")
 
@@ -173,12 +171,6 @@ async def list_tools() -> list[Tool]:
             ["pending_id"],
         ),
         _tool(
-            "memory_trigger",
-            "判断一条消息是否包含高信号（应立刻提取为长期记忆的内容）。",
-            {"message": {"type": "string"}},
-            ["message"],
-        ),
-        _tool(
             "maintenance_review",
             "审查记忆维护候选（访问最少、更新最早的 normal），生成归档待确认动作（不自动执行）。",
             {"limit": {"type": "integer", "description": "候选数量，默认 20"}},
@@ -267,10 +259,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "pending_reject":
         return ok({"ok": reject_pending_action(arguments["pending_id"]), "pending_id": arguments["pending_id"]})
-
-    if name == "memory_trigger":
-        message = arguments.get("message", "")
-        return ok({"trigger": should_trigger(message), "message": message[:200]})
 
     if name == "maintenance_review":
         from .maintenance import review_maintenance
