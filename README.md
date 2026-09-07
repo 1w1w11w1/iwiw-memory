@@ -1,82 +1,90 @@
-# IwIw
+# 记忆系统（memory-agent）
 
-IwIw 是一个记忆驱动的本地个人智能体。当前重点不是继续堆聊天能力，而是把记忆、会话、上下文组装、工具执行、权限边界和审计逐步收敛成成熟的 agent harness。
+一个独立的本地长期记忆系统。核心是 SQLite 分级事实记忆（core/normal/archive），自带 CLI 对话工作台（chat）用于日常使用与机制验证，并通过 MCP 对外提供完整工具面（为后续接入 DSH 预留）。
 
-## 当前结构
+> 项目早期为个人智能体原型（含自研 harness 与 Web 界面），现已转型为独立的记忆系统核心，移除 harness、会话层与界面层。
 
-- `memory_agent/`：长期事实记忆层，真源是 `selfecho_data/sessions.db` 中的 SQLite 表。
-- `selfecho_session/`：IwIw 会话记忆层，保存 GUI 会话、原始消息、滚动摘要、周期摘要、会话搜索和回放。
-- `selfecho_agent/`：agent harness 层，负责上下文组装、模式识别、运行追踪和问题处理流程。
-- `selfecho_api/` + `web/`：本地 API 与 GUI。
-- `memory/`：历史遗留或人工可读导出缓存，不再是写入真源。
+## 文档
 
-## 记忆系统原则
+- [架构总览](docs/architecture.md) — 分层、模块职责、不变量
+- [数据流](docs/data-flow.md) — 提取 / 检索 / 写入 / 维护 / 启动五条链路
+- [CLI 使用指南](docs/chat-guide.md) — 命令参考与典型流程
+- [DSH 接入规划](docs/dsh-integration.md) — 第二阶段方向
 
-- 长期事实记忆以 SQLite 为真源，核心表包括 `memories`、`memory_chunks`、`memories_fts`、`memory_pending_actions`、`memory_versions`、`memory_audit`。
-- 启动时只加载 L0 `core` 和 L1 `important` 完整内容；L2/L3 按话题检索。
-- GUI 会话必须保存完整原始消息，摘要只用于上下文管理，不能替代原始记录。
-- 长期记忆的写入、编辑、合并、归档、删除和回滚必须走统一 mutation 入口，并写入版本与审计。
-- Markdown 导出如存在，只是可读缓存；不能绕过 SQLite 直接改长期记忆。
+## 结构
+
+- `memory_agent/`：记忆系统核心（自包含，零外部项目依赖）
+  - `db.py`：SQLite 存储、mutation 入口（版本/审计/回滚）、FTS 索引同步
+  - `retrieval.py`：确定性检索（FTS 词面 + 会话状态联想 + 时间衰减 + 优先级加权）
+  - `extractor.py`：LLM 提取（create/update/archive/merge，update 为全文替换）
+  - `triggers.py`：高信号实时触发检测（纯规则）
+  - `llm.py`：LLM 调用封装（Anthropic/OpenAI 兼容，支持多轮）
+  - `query_builder.py`：查询扩展
+  - `chat.py`：CLI 对话工作台（`python -m memory_agent.chat`）
+  - `mcp_server.py`：MCP 工具服务器（`python -m memory_agent.mcp_server`）
+- `data/`：数据目录（`memory.db` 单一真源；`legacy/` 历史资料；`logs/`）
+- `tests/`：核心机制评估
 
 ## 快速开始
 
-1. 复制 `.env.example` 为 `.env`，填写本地模型或 API 配置。
-2. 安装后端依赖：
+1. 复制 `.env.example` 为 `.env`，填写 `MEMORY_AGENT_LLM_API_KEY`。
+2. 安装依赖：
 
-```powershell
-pip install -r requirements.txt
-```
+   ```powershell
+   pip install -r requirements.txt
+   ```
 
-3. 安装并构建前端：
+3. 启动 CLI 工作台：
 
-```powershell
-cd web
-npm install
-npm run build
-cd ..
-```
+   ```powershell
+   python -m memory_agent.chat
+   ```
 
-4. 启动本地 API 和 GUI：
+## 记忆分级
 
-```powershell
-python -m selfecho_api
-```
+| 值 | 语义 | 加载策略 |
+|---|---|---|
+| `core` | 身份、健康、关系、重大决策、核心偏好 | 必须载入（对话前注入） |
+| `normal` | 日常信息、阶段计划、一般偏好 | 按需载入（话题触发检索） |
+| `archive` | 过时/冗余记忆（归档状态，可回滚） | 不参与常规检索与维护候选 |
 
-浏览器访问 `http://127.0.0.1:8765`。
+> 旧版本的四级（L0–L3）已收敛为三值：`important` 并入 `core`（都是必须载入），`archive` 从"重要性档位"重新定位为"生命周期状态"（维护流程的产物）。
 
-开发前端时使用：
+## 记忆系统不变量
 
-```powershell
-cd web
-npm run dev
-```
+1. 长期事实记忆以 `data/memory.db` 的 SQLite 为唯一真源；不再有 Markdown 真源或导出缓存。
+2. 写入、编辑、合并、归档、删除、回滚必须走统一 mutation 入口，保存变更前版本并写入审计。
+3. 破坏性操作返回 `version_id`、`audit_id`、`changed_rows`；`changed_rows == 0` 不能当成功。
+4. 删除不能导致历史版本丢失（`memory_versions` 独立保留，可回滚恢复）。
+5. 内容变更后必须刷新 FTS 索引（`db.py` 的 FTS 触发器保证）。
+6. 更新采用全文替换语义（非追加），避免正文无限膨胀；变更前内容进版本表。
+7. 检索必须进入真实对话上下文链路（chat 每轮注入 + core 启动注入）。
 
-Vite 开发服务器默认代理 `/api` 到 `http://127.0.0.1:8765`。
+## CLI 工作台命令
 
-## 数据目录
+| 命令 | 说明 |
+|---|---|
+| 普通输入 | 对话（启动注入 core 记忆，每轮话题检索注入相关记忆；高信号实时提取） |
+| `/mem list [priority]` | 列出记忆 |
+| `/mem search <q>` | 搜索记忆 |
+| `/mem read <slug>` | 读取记忆正文 |
+| `/mem edit <slug>` | 编辑记忆（多行，`__END__` 结束） |
+| `/mem archive|delete|merge|history|rollback` | 归档/删除/合并/历史/回滚 |
+| `/pending [status]` `/pending approve|reject <id>` | 待确认维护动作审批 |
+| `/maintain` | 审查记忆维护候选（生成归档待确认动作） |
+| `/extract` | 对最近一条消息强制提取 |
+| `/stats` | 记忆库统计 |
+| `/quit` | 退出 |
 
-```text
-selfecho_data/sessions.db       # 长期事实记忆 + IwIw 会话记忆真源
-selfecho_data/legacy/           # 旧历史导入资料
-selfecho_data/audit/            # 审计和导出预留目录
-memory/                         # 历史遗留或 SQLite 导出缓存
-selfecho_config/prompts/        # 对话、问题处理、记忆整理与编辑策略
-selfecho_config/providers.local.json  # 本地模型配置，不提交
-```
+## MCP 工具面（DSH 接入桥）
 
-## 主要能力
+`mcp_server.py` 提供 16 个工具：extract_and_save / search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / memory_trigger / maintenance_review。
 
-- 陪我想想：承接用户表达，保存原始会话，可手动或周期整理。
-- 工作模式：逐步承载澄清、规划、执行、工具调用和错误恢复。
-- 会话记忆：搜索、回放、导入旧历史资料。
-- 长期记忆：查看、搜索、编辑、归档、删除、合并、回滚。
-- Prompt 策略：查看和编辑对话、问题处理、记忆整理、摘要、记忆编辑策略。
-- 模型管理：本地 provider 配置和连接测试。
-- 健康状态：检查记忆库、会话库、模型和 Prompt 状态。
+第二阶段可通过 DSH 的 `@deepseek-ai/dsh-mcp-client` 挂载，使记忆工具进入任意 DSH 会话。
 
-## 架构文档
+## 开发
 
-- [记忆系统当前架构](docs/memory-system-architecture.md)
-- [Agent Harness 架构](docs/iwiw-agent-harness-architecture.md)
-- [模型管理](docs/iwiw-model-management.md)
-- [WebSocket 统一通道设计](docs/phase6-websocket-design.md)
+- 核心机制评估：`python tests/memory_system_eval.py`
+- 联想质量评估：`python tests/associative_recall_eval.py`
+- 万字长对话评估：`python tests/long_conversation_eval.py`
+- 检索质量手测：chat 内 `/mem search`，或直接调用 `search_memories`

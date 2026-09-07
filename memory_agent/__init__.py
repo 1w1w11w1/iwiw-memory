@@ -1,8 +1,8 @@
-"""
-memory-agent — 全自动记忆代理
+"""memory_agent — 独立的本地长期记忆系统。
 
-架构：
-1. 提取层 — consolidate() 周期提取 + extract_and_save 按需提取
-2. MCP 层  — 搜索/浏览/统计/手动提取工具
-3. 向量层  — 语义检索（规划中）
+核心：SQLite 分级事实记忆（core/normal/archive）+ 确定性检索 + LLM 提取 + 实时触发。
+
+界面：
+- CLI 工作台：python -m memory_agent.chat
+- MCP 工具面：python -m memory_agent.mcp_server
 """

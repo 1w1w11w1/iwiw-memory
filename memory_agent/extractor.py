@@ -15,6 +15,7 @@ from .config import (
 )
 from .llm import LLMConfigurationError, complete_text
 from .db import list_memories, save_memory_candidate
+from .retrieval import search_memories
 
 # ── 日志 ──
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -46,7 +47,7 @@ def _memory_catalog_text(limit: int = 80) -> str:
         logger.warning("Could not load memory catalog: %s", exc)
         return "(记忆目录读取失败，本次只判断是否创建新记忆。)"
 
-    priority_order = {"core": 0, "important": 1, "normal": 2, "archive": 3}
+    priority_order = {"core": 0, "normal": 1, "archive": 2}
     memories = sorted(
         memories,
         key=lambda m: (priority_order.get(m.get("priority", "normal"), 9), m.get("slug", "")),
@@ -111,9 +112,9 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
     "slug": "短英文slug",
     "target_slug": "仅 update/merge 时填写已有记忆 slug",
     "description": "一句话描述（用于索引）",
-    "content": "用中文自然语言写成的完整记忆内容。create 时写完整正文；update 时只需写新增内容，系统会追加到末尾，不要复述已有内容。",
+    "content": "用中文自然语言写成的完整记忆内容。create 时写完整正文；update 时必须给出更新后的【完整正文】（基于「可能相关的已有记忆」全文改写/补充，系统会全文替换，不是追加）。",
     "mem_type": "user|feedback|project|reference"（见下方 mem_type 选择规则）,
-    "priority": "core|important|normal|archive",
+    "priority": "core|normal|archive",
     "event_date": "YYYY-MM-DD（事实发生日期，从上下文推算；实在无法推算则用 null）",
     "reason": "一句话说明为什么执行此动作"
   }
@@ -121,11 +122,11 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 ```
 
 ## 决策规则
-- 新信息明显属于已有记忆：使用 update，target_slug 必须是已有 slug。
+- 新信息明显属于已有记忆：使用 update，target_slug 必须是已有 slug，content 给出该记忆更新后的完整正文（合并旧信息与新增信息，保留仍有价值的部分，删除过时部分）。
 - 新信息是独立主题：使用 create。
 - 信息含糊、只是临时情绪、或和现有内容无新增：返回 []。
 - 不要把不同的人合并到同一条记忆；同学/朋友等人物不确定时宁可 create 或 ignore，不要猜测合并。
-- update 时 content 只需提供新增内容（不要复述或总结已有内容），系统会自动追加到正文末尾。
+- update 时不要只写新增内容：系统会全文替换 content，旧内容不会保留。
 
 ## mem_type 选择规则
 根据信息类型选择最合适的 mem_type：
@@ -153,15 +154,33 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 当信息同时符合多个类型时，优先级：feedback > project > user > reference。
 
 
-## Priority 分级标准
-- **core**：身份标识、核心偏好、认知模式 — 每次会话必须加载
-- **important**：健康、关系、重大决策 — 每次会话必须加载
-- **normal**：日常信息、计划、一般偏好 — 按话题触发加载
-- **archive**：已完成的历史事件、过时的偏好 — 深度搜索按需获取
+## Priority 分级标准（三值）
+- **core**：身份、健康、关系、重大决策、核心偏好、认知模式 — 必须载入（对话前注入）
+- **normal**：日常信息、阶段计划、一般偏好 — 按需载入（话题触发检索）
+- **archive**：归档状态，不由提取设置；过时内容由维护流程处理
 
 如果没有值得保存的信息，返回空数组 []。不要编造、不要过度解读、不要保存聊天中已明显重复的信息。
 
 注意：当前日期是 {current_date}。event_date 应根据对话上下文中提到的时间线索来推算（如"昨天""上周""上个月"），不要默认用当前日期。"""
+
+
+def _related_memories_text(message: str, context: str = "", top_k: int = 5) -> str:
+    """检索与当前消息相关的已有记忆，附全文节选，供模型精准 update/去重。"""
+    try:
+        ctx_msgs = [context] if context else None
+        results = search_memories(message, context_messages=ctx_msgs, top_k=top_k)
+    except Exception as exc:
+        logger.warning("related memory retrieval failed: %s", exc)
+        return ""
+    if not results:
+        return ""
+    lines = ["## 可能相关的已有记忆（全文节选）", "> update 必须基于这些内容改写为完整正文；无关内容不要动。", ""]
+    for mem in results:
+        header = f"- **{mem['slug']}** ({mem['priority']}, {mem['mem_type']}) — {mem.get('description', '')}"
+        body = (mem.get("content") or "")[:400]
+        lines.append(f"{header}\n  {body}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 async def extract_from_message(message: str, context: str = "") -> list[dict[str, Any]]:
@@ -184,7 +203,11 @@ async def extract_from_message(message: str, context: str = "") -> list[dict[str
         return []
 
     catalog = _memory_catalog_text()
-    user_content = f"## 已有记忆目录\n{catalog}\n\n## 用户消息\n{message}"
+    related = _related_memories_text(message, context)
+    user_content = f"## 已有记忆目录\n{catalog}"
+    if related:
+        user_content += f"\n\n{related}"
+    user_content += f"\n\n## 用户消息\n{message}"
     if context:
         user_content = f"## 对话上文\n{context}\n\n{user_content}"
 
@@ -248,11 +271,6 @@ def _should_skip(message: str) -> bool:
             return True
 
     return False
-
-
-def should_skip_message(message: str) -> bool:
-    """供 hook 层做预过滤，避免日志把跳过误写成提取。"""
-    return _should_skip(message)
 
 
 def _parse_extraction_result(raw: str) -> list[dict[str, Any]]:

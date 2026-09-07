@@ -9,6 +9,7 @@ module so versions, audit events, FTS, and vector chunks stay in sync.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -32,29 +33,16 @@ CREATE TABLE IF NOT EXISTS memories (
     mem_type        TEXT NOT NULL DEFAULT 'user'
                     CHECK(mem_type IN ('user','feedback','project','reference')),
     priority        TEXT NOT NULL DEFAULT 'normal'
-                    CHECK(priority IN ('core','important','normal','archive')),
+                    CHECK(priority IN ('core','normal','archive')),
     event_date      TEXT,
     recorded_date   TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
     access_count    INTEGER NOT NULL DEFAULT 0,
     last_access_at  TEXT,
-    embedding_model TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     metadata        TEXT NOT NULL DEFAULT '{}'
 );
-
-CREATE TABLE IF NOT EXISTS memory_chunks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    chunk_index     INTEGER NOT NULL,
-    chunk_text      TEXT NOT NULL,
-    vector          BLOB,
-    model_version   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory
-    ON memory_chunks(memory_id, chunk_index);
 
 CREATE TABLE IF NOT EXISTS memory_pending_actions (
     id              TEXT PRIMARY KEY,
@@ -146,52 +134,12 @@ def _ensure_data_dir() -> None:
     MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Apply lightweight migrations for tables created by older memory schemas."""
-    fk_rows = conn.execute("PRAGMA foreign_key_list(memory_versions)").fetchall()
-    has_delete_cascade = any(str(row["on_delete"]).upper() == "CASCADE" for row in fk_rows)
-    if not has_delete_cascade:
-        return
-
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys=OFF")
-    conn.execute("DROP TABLE IF EXISTS memory_versions_new")
-    conn.execute(
-        """
-        CREATE TABLE memory_versions_new (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id       TEXT,
-            slug            TEXT NOT NULL,
-            content         TEXT NOT NULL,
-            description     TEXT NOT NULL DEFAULT '',
-            mem_type        TEXT NOT NULL DEFAULT 'user',
-            priority        TEXT NOT NULL DEFAULT 'normal',
-            event_date      TEXT,
-            saved_at        TEXT NOT NULL,
-            reason          TEXT NOT NULL DEFAULT ''
-        )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO memory_versions_new
-            (id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason)
-        SELECT id, memory_id, slug, content, description, mem_type, priority, event_date, saved_at, reason
-        FROM memory_versions
-        """
-    )
-    conn.execute("DROP TABLE memory_versions")
-    conn.execute("ALTER TABLE memory_versions_new RENAME TO memory_versions")
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys=ON")
-
-
 def connect() -> sqlite3.Connection:
     """
-    获取或创建到 sessions.db 的连接。
+    获取或创建到 data/memory.db 的连接（单一真源）。
 
-    与会话层（selfecho_session/db.py）共用同一 DB 文件。
-    只初始化记忆相关的表，不涉及会话表。
+    记忆系统独立持有该库，不与其他层共享文件。
+    多线程读写由 SQLite WAL + busy_timeout 保证安全。
     """
     global _connection
     if _connection is not None:
@@ -206,11 +154,24 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
 
     # 执行 schema
     conn.executescript(SCHEMA)
     conn.commit()
-    _migrate_schema(conn)
+
+    # 幂等迁移：三级分级（旧数据 important → core，两者都是必须载入）
+    conn.execute("UPDATE memories SET priority = 'core' WHERE priority = 'important'")
+    # 幂等清理：旧库残留的向量表（去向量化）
+    conn.execute("DROP TABLE IF EXISTS memory_chunks")
+    try:
+        # 旧库 embedding_model 列（SQLite 3.35+ 支持 DROP COLUMN）
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
+        if "embedding_model" in cols:
+            conn.execute("ALTER TABLE memories DROP COLUMN embedding_model")
+    except sqlite3.OperationalError:
+        pass  # 旧 SQLite 不支持 DROP COLUMN，保留列（无害）
+    conn.commit()
 
     # FTS 必须在事务外单独创建
     conn.execute(FTS_SCHEMA)
@@ -264,7 +225,11 @@ class MemoryMutationResult:
 
 
 def _valid_priority(p: str) -> str:
-    return p if p in {"core", "important", "normal", "archive"} else "normal"
+    # 三值分级：core=必须载入 / normal=按需载入 / archive=归档状态
+    # 旧数据中的 'important' 兼容映射为 'core'（两者都是必须载入）
+    if p == "important":
+        return "core"
+    return p if p in {"core", "normal", "archive"} else "normal"
 
 
 def _valid_type(t: str) -> str:
@@ -283,62 +248,38 @@ def upsert_memory(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    写入一条记忆（INSERT OR UPDATE）。
+    写入一条记忆（INSERT OR REPLACE 语义）。
 
-    如果 slug 已存在则更新（content 追加），不存在则创建。
-    返回完整记忆记录。
+    - slug 不存在：创建新记忆。
+    - slug 已存在：以 content 全文替换旧正文，变更前快照写入 memory_versions，
+      变更事件写入 memory_audit，并同步 FTS 索引。
+
+    任何失败都会 raise（不允许静默成功）；调用方如需可恢复结果，
+    请使用 replace_memory_result / delete_memory_result 等 *result 入口。
     """
+    slug = slug.strip().lower().replace(" ", "-")[:50] or "memory"
+    existing = get_memory(slug)
+
+    if existing:
+        result = replace_memory_result(
+            slug=slug,
+            description=description,
+            body=content,
+            mem_type=mem_type,
+            priority=priority,
+            event_date=event_date,
+            reason="upsert replace",
+            audit_action="upsert_replace",
+            details={"mem_type": mem_type, "priority": priority},
+        )
+        if not result.ok:
+            raise RuntimeError(f"memory update failed: {result.error}")
+        return dict(get_memory(slug))
+
     conn = connect()
     now = _now()
     priority = _valid_priority(priority)
     mem_type = _valid_type(mem_type)
-    slug = slug.strip().lower().replace(" ", "-")[:50] or "memory"
-
-    existing = conn.execute(
-        "SELECT * FROM memories WHERE slug = ?", (slug,)
-    ).fetchone()
-
-    if existing:
-        # ── 更新：追加到正文末尾 ──
-        old_body = existing["content"]
-        new_body = f"{old_body}\n\n（以下为 {now} 追加）\n\n{content}"
-        new_hash = _simple_hash(new_body)
-        if existing["content_hash"] == new_hash:
-            # 内容无变化，跳过
-            return dict(existing)
-
-        backup_path = _save_version(existing["id"], reason="upsert append", commit=False)
-        cur = conn.execute(
-            """
-            UPDATE memories
-            SET content = ?, content_hash = ?, description = ?,
-                priority = ?, mem_type = ?, event_date = COALESCE(?, event_date),
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (new_body, new_hash, description.strip()[:200],
-             priority, mem_type, event_date, now, existing["id"]),
-        )
-        audit_id = _record_audit(
-            action="upsert_append",
-            target_slug=slug,
-            reason="append extracted memory",
-            backup_path=backup_path,
-            details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
-            commit=False,
-        )
-        if not backup_path or not audit_id or cur.rowcount <= 0:
-            conn.rollback()
-            return dict(existing)
-        conn.commit()
-        refresh_memory_vectors(existing["id"])
-        # 获取更新后的记录
-        updated = conn.execute(
-            "SELECT * FROM memories WHERE id = ?", (existing["id"],)
-        ).fetchone()
-        return dict(updated)
-
-    # ── 创建 ──
     mem_id = str(uuid.uuid4())
     new_hash = content_hash or _simple_hash(content)
 
@@ -365,7 +306,6 @@ def upsert_memory(
         conn.rollback()
         raise RuntimeError("memory create audit failed")
     conn.commit()
-    refresh_memory_vectors(mem_id)
 
     created = conn.execute(
         "SELECT * FROM memories WHERE id = ?", (mem_id,)
@@ -378,15 +318,6 @@ def get_memory(slug: str) -> dict[str, Any] | None:
     conn = connect()
     row = conn.execute(
         "SELECT * FROM memories WHERE slug = ?", (slug,)
-    ).fetchone()
-    return _rowdict(row)
-
-
-def get_memory_by_id(memory_id: str) -> dict[str, Any] | None:
-    """按 id 查询单条记忆。"""
-    conn = connect()
-    row = conn.execute(
-        "SELECT * FROM memories WHERE id = ?", (memory_id,)
     ).fetchone()
     return _rowdict(row)
 
@@ -471,18 +402,19 @@ def delete_memory_result(
         return MemoryMutationResult(False, audit_action, slug, error=str(exc))
 
 
-def delete_memory(slug: str, *, save_version: bool = True) -> bool:
-    """删除一条记忆，默认先保存可恢复快照。"""
-    return delete_memory_result(slug, save_version=save_version).ok
-
-
 def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
     """
     保存 LLM 返回的一条记忆维护动作到 SQLite。
 
     支持动作：create / update / archive / merge / ignore。
-    与旧 store.py 的 save_memory_candidate 接口兼容，但返回
-    (action, slug) 而非 (action, Path)。供 extractor.py 调用。
+    - create  : 新建记忆（content 为完整正文）。
+    - update  : 全文替换目标记忆（content 必须是更新后的完整正文，
+                不再使用追加语义，避免正文无限膨胀）。
+    - archive : 归档目标记忆（priority → archive）。
+    - merge   : 将 content 全文替换进 target_slug，可选归档 source_slug。
+
+    所有动作都走带版本快照 + 审计的 mutation 入口；
+    失败记录日志并返回 None（调用方不应把 None 当作成功）。
 
     Returns:
         (action, slug) 或 None（跳过/失败）
@@ -491,40 +423,51 @@ def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
     if action == "ignore":
         return None
 
-    slug = candidate.get("target_slug") or candidate.get("slug") or "memory"
+    slug = (candidate.get("target_slug") or candidate.get("slug") or "memory").strip()
+    content = candidate.get("content") or ""
+    description = candidate.get("description") or ""
+    mem_type = candidate.get("mem_type") or "user"
+    priority = candidate.get("priority") or "normal"
+    event_date = candidate.get("event_date")
 
     try:
         if action == "archive":
-            archived = archive_memory_by_slug(slug)
-            return ("archive", archived) if archived else None
+            result = archive_memory_result(slug, reason=candidate.get("reason") or "extract archive")
+            return ("archive", slug) if result.ok else None
 
         if action == "merge":
-            target = candidate.get("target_slug") or slug
-            content = candidate.get("content", "")
             if not content:
                 return None
-            record = upsert_memory(
-                slug=target,
-                description=candidate.get("description", ""),
-                content=content,
-                mem_type=candidate.get("mem_type", "user"),
-                priority=candidate.get("priority", "normal"),
-                event_date=candidate.get("event_date"),
-                content_hash="",
+            result = replace_memory_result(
+                slug=slug, description=description, body=content,
+                mem_type=mem_type, priority=priority, event_date=event_date,
+                reason="merge from extraction", audit_action="extract_merge",
             )
-            return ("merge", record["slug"])
+            if not result.ok:
+                return None
+            source = candidate.get("source_slug")
+            if source and source != slug:
+                archive_memory_result(source, reason=f"merged into {slug}")
+            return ("merge", slug)
 
+        # create / update：先尝试替换（slug 已存在），不存在则创建
+        result = replace_memory_result(
+            slug=slug, description=description, body=content,
+            mem_type=mem_type, priority=priority, event_date=event_date,
+            reason="extract write", audit_action=f"extract_{action}",
+        )
+        if result.ok:
+            return (action, slug)
         record = upsert_memory(
-            slug=slug,
-            description=candidate.get("description", ""),
-            content=candidate.get("content", ""),
-            mem_type=candidate.get("mem_type", "user"),
-            priority=candidate.get("priority", "normal"),
-            event_date=candidate.get("event_date"),
+            slug=slug, description=description, content=content,
+            mem_type=mem_type, priority=priority, event_date=event_date,
             content_hash="",
         )
         return (action, record["slug"])
-    except Exception:
+    except Exception as exc:
+        logging.getLogger("memory_agent.db").warning(
+            "save_memory_candidate failed (%s %s): %s", action, slug, exc
+        )
         return None
 
 
@@ -732,12 +675,12 @@ def reject_pending_action(pending_id: str) -> bool:
 
 
 def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
-    """获取适合维护审查的记忆候选（访问最少、更新最早的 normal/important）。"""
+    """获取适合维护审查的记忆候选（访问最少、更新最早的 normal）。"""
     conn = connect()
     rows = conn.execute(
         """SELECT slug, description, priority, access_count, updated_at, content
             FROM memories
-            WHERE priority IN ('normal', 'important')
+            WHERE priority = 'normal'
             ORDER BY access_count ASC, updated_at ASC
             LIMIT ?""",
         (limit,),
@@ -755,23 +698,16 @@ def get_stats() -> dict[str, Any]:
     by_type = dict(conn.execute(
         "SELECT mem_type, COUNT(*) FROM memories GROUP BY mem_type"
     ).fetchall())
-    total_chunks = conn.execute(
-        "SELECT COUNT(*) FROM memory_chunks"
-    ).fetchone()[0]
     return {
         "total_memories": total,
         "by_priority": by_priority,
         "by_type": by_type,
-        "total_chunks": total_chunks,
     }
 
 
 def search_fts(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """
-    FTS5 关键词搜索（作为向量检索上线前的回退）。
-
-    这是临时方案。Phase 3 上线向量混合检索后，此函数
-    降级为 FTS 回退兜底。
+    FTS5 关键词搜索 + CJK 子串兜底（确定性检索的词面通道）。
     """
     conn = connect()
     # FTS5 查询：中文按词组匹配（引号），英文前缀查询（加 *）
@@ -801,10 +737,12 @@ def search_fts(query: str, limit: int = 10) -> list[dict[str, Any]]:
             (fts_query, limit),
         ).fetchall()
         results = [dict(r) for r in rows]
-        if results:
-            return results
     except sqlite3.OperationalError:
-        pass
+        # MATCH 语法/分词失败（如中文无匹配 token）
+        results = []
+    if results:
+        return results
+    # FTS5 空结果（常见于中文分词 miss）→ 子串匹配兜底
     return _search_like(query, limit=limit)
 
 
@@ -851,7 +789,10 @@ def _fallback_query_tokens(query: str) -> list[str]:
     tokens: list[str] = []
     for raw in query.replace('"', " ").replace("*", " ").split():
         token = raw.strip().strip("，。！？；：,.!?;:")
-        if len(token) < 2 or token in stop_tokens:
+        if not token or token in stop_tokens:
+            continue
+        # 中文实义单字（吃/辣/跑）参与子串匹配；纯英文/数字单字丢弃
+        if len(token) < 2 and not any("一" <= c <= "鿿" for c in token):
             continue
         tokens.append(token)
         if any("一" <= c <= "鿿" for c in token) and len(token) >= 4:
@@ -887,177 +828,6 @@ def _make_snippet(content: str, tokens: list[str], radius: int = 80) -> str:
     return f"{prefix}{content[start:end]}{suffix}"
 
 
-def touch_memory(slug: str) -> None:
-    """更新记忆的访问时间（为淘汰策略提供数据）。"""
-    conn = connect()
-    conn.execute(
-        "UPDATE memories SET access_count = access_count + 1, last_access_at = ? WHERE slug = ?",
-        (_now(), slug),
-    )
-    conn.commit()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 向量存储与检索
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def clear_memory_vectors(memory_id: str) -> None:
-    """Remove stale vector chunks for a memory."""
-    conn = connect()
-    conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
-    conn.execute("UPDATE memories SET embedding_model = NULL WHERE id = ?", (memory_id,))
-    conn.commit()
-
-
-def refresh_memory_vectors(
-    memory_id: str,
-    model_version: str = "bge-small-zh-v1.5",
-) -> dict[str, Any]:
-    """
-    Refresh vector chunks for one memory.
-
-    Embedding is best-effort: failures clear stale chunks so FTS remains the
-    fallback instead of returning outdated semantic matches.
-    """
-    conn = connect()
-    mem = conn.execute("SELECT id, content FROM memories WHERE id = ?", (memory_id,)).fetchone()
-    if not mem:
-        return {"ok": False, "reason": "memory not found"}
-    chunks = _chunk_text(mem["content"])
-    try:
-        from .embedding import embed_batch
-        vectors = embed_batch(chunks)
-    except Exception as exc:
-        clear_memory_vectors(memory_id)
-        return {"ok": False, "reason": str(exc)}
-    if not vectors:
-        clear_memory_vectors(memory_id)
-        return {"ok": False, "reason": "embedding unavailable"}
-    count = store_memory_vector(memory_id, chunks, vectors, model_version=model_version)
-    conn.execute(
-        "UPDATE memories SET embedding_model = ? WHERE id = ?",
-        (model_version, memory_id),
-    )
-    conn.commit()
-    return {"ok": True, "chunks": count}
-
-
-def store_memory_vector(
-    memory_id: str,
-    chunks: list[str],
-    vectors: list[list[float]],
-    model_version: str = "bge-small-zh-v1.5",
-) -> int:
-    """存储记忆的分块文本和向量到 memory_chunks 表。"""
-    conn = connect()
-    conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
-    import numpy as np
-    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
-        conn.execute(
-            "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
-            (memory_id, idx, text, np.array(vec, dtype=np.float32).tobytes(), model_version),
-        )
-    conn.commit()
-    return len(chunks)
-
-
-def search_vectors(
-    query_vector: list[float],
-    top_k: int = 10,
-) -> list[dict[str, Any]]:
-    """
-    向量余弦相似度搜索（全量扫描，适合 <1000 条记忆）。
-    返回按相似度降序排列的记忆片段列表。
-    """
-    conn = connect()
-    import numpy as np
-    rows = conn.execute("""
-        SELECT c.id, c.memory_id, c.chunk_text, c.vector,
-               m.slug, m.description, m.priority, m.mem_type
-        FROM memory_chunks c
-        JOIN memories m ON m.id = c.memory_id
-    """).fetchall()
-    if not rows:
-        return []
-
-    query_arr = np.array(query_vector, dtype=np.float32)
-    scored: list[tuple[float, dict]] = []
-    for r in rows:
-        try:
-            vec = np.frombuffer(r["vector"], dtype=np.float32)
-            sim = float(np.dot(query_arr, vec))
-        except Exception:
-            continue
-        scored.append((sim, {
-            "slug": r["slug"], "description": r["description"],
-            "priority": r["priority"], "mem_type": r["mem_type"],
-            "chunk_text": r["chunk_text"][:200], "similarity": round(sim, 4),
-        }))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    # 每个 slug 只保留最高相似度的 chunk
-    seen: set[str] = set()
-    deduped: list[dict] = []
-    for _, item in scored:
-        if item["slug"] not in seen:
-            seen.add(item["slug"])
-            deduped.append(item)
-    return deduped[:top_k]
-
-
-def ensure_all_vectors(force: bool = False, model_version: str = "bge-small-zh-v1.5") -> dict:
-    """为所有还没有向量的记忆生成嵌入（幂等）。"""
-    conn = connect()
-    from .embedding import embed_batch
-    memories = conn.execute("SELECT id, slug, content FROM memories ORDER BY updated_at").fetchall()
-    processed = 0; skipped = 0; errors = []
-    for mem in memories:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM memory_chunks WHERE memory_id = ? AND model_version = ?",
-            (mem["id"], model_version),
-        ).fetchone()[0]
-        if existing > 0 and not force:
-            conn.execute(
-                "UPDATE memories SET embedding_model = COALESCE(embedding_model, ?) WHERE id = ?",
-                (model_version, mem["id"]),
-            )
-            skipped += 1; continue
-
-        chunks = _chunk_text(mem["content"])
-        vectors = embed_batch(chunks)
-        if not vectors:
-            errors.append(f"{mem['slug']}: embedding failed"); continue
-
-        conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (mem["id"],))
-        import numpy as np
-        for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            conn.execute(
-                "INSERT INTO memory_chunks (memory_id, chunk_index, chunk_text, vector, model_version) VALUES (?, ?, ?, ?, ?)",
-                (mem["id"], idx, chunk, np.array(vec, dtype=np.float32).tobytes(), model_version),
-            )
-        conn.execute(
-            "UPDATE memories SET embedding_model = ? WHERE id = ?",
-            (model_version, mem["id"]),
-        )
-        processed += 1
-    conn.commit()
-    return {"processed": processed, "skipped": skipped, "errors": errors, "total": processed + skipped}
-
-
-def _chunk_text(text: str, max_chars: int = 500) -> list[str]:
-    """按段落分割长文本，每块不超过 max_chars 字符。"""
-    if len(text) <= max_chars:
-        return [text]
-    chunks, current = [], ""
-    for para in text.split("\n\n"):
-        if len(current) + len(para) + 2 > max_chars:
-            if current.strip(): chunks.append(current.strip())
-            current = para
-        else:
-            current = (current + "\n\n" + para) if current else para
-    if current.strip(): chunks.append(current.strip())
-    return chunks or [text]
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Hash helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1066,17 +836,6 @@ def _simple_hash(text: str) -> str:
     """轻量 hash（非加密，仅去重）。"""
     import hashlib
     return hashlib.md5(text.encode("utf-8")).hexdigest()
-
-
-def count_memories_by_priority() -> dict[str, int]:
-    try:
-        conn = connect()
-        rows = conn.execute(
-            "SELECT priority, COUNT(*) FROM memories GROUP BY priority"
-        ).fetchall()
-        return {r["priority"]: r[1] for r in rows}
-    except Exception:
-        return {}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1112,52 +871,6 @@ def read_memory(slug: str) -> str | None:
     """读取记忆正文（纯文本），匹配 store.read_memory。"""
     mem = get_memory(slug)
     return mem["content"] if mem else None
-
-
-def read_memory_full(slug: str) -> dict[str, Any] | None:
-    """返回完整记录，匹配 store.read_memory_full。"""
-    mem = get_memory(slug)
-    if not mem:
-        return None
-    return {
-        "slug": mem["slug"],
-        "path": str(MEMORY_DB_PATH.parent / f"{mem['slug']}.md"),
-        "frontmatter": "",
-        "body": mem["content"],
-        "description": mem.get("description", ""),
-        "priority": mem.get("priority", "normal"),
-        "type": mem.get("mem_type", "user"),
-        "event_date": mem.get("event_date", ""),
-        "recorded_date": mem.get("recorded_date", ""),
-        "hash": mem.get("content_hash", ""),
-        "mtime": mem.get("updated_at", ""),
-        "size": len(mem.get("content", "")),
-    }
-
-
-def list_memories_compat(
-    priority: str | None = None,
-    mem_type: str | None = None,
-) -> list[dict[str, Any]]:
-    """
-    返回兼容 store.list_memories 格式的列表。
-
-    结果字段：slug, description, priority, type, mem_type, mtime, size, content
-    """
-    records = list_memories(priority=priority, mem_type=mem_type)
-    return [
-        {
-            "slug": r["slug"],
-            "description": r.get("description", ""),
-            "priority": r.get("priority", "normal"),
-            "type": r.get("mem_type", "user"),
-            "mem_type": r.get("mem_type", "user"),
-            "mtime": r.get("updated_at", ""),
-            "size": len(r.get("content", "")),
-            "content": r.get("content", ""),
-        }
-        for r in records
-    ]
 
 
 def replace_memory_result(
@@ -1214,7 +927,6 @@ def replace_memory_result(
             conn.rollback()
             return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
         conn.commit()
-        refresh_memory_vectors(old["id"])
         return MemoryMutationResult(
             True,
             audit_action,
@@ -1228,29 +940,6 @@ def replace_memory_result(
     except Exception as exc:
         conn.rollback()
         return MemoryMutationResult(False, audit_action, slug, error=str(exc))
-
-
-def replace_memory(
-    *,
-    slug: str,
-    description: str,
-    body: str,
-    mem_type: str = "user",
-    priority: str = "normal",
-    event_date: str | None = None,
-    reason: str = "",
-) -> str | None:
-    """覆盖写入记忆（替换 content，非追加），匹配 store.replace_memory。"""
-    result = replace_memory_result(
-        slug=slug,
-        description=description,
-        body=body,
-        mem_type=mem_type,
-        priority=priority,
-        event_date=event_date,
-        reason=reason,
-    )
-    return slug if result.ok else None
 
 
 def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: str = "archive") -> MemoryMutationResult:
@@ -1298,16 +987,6 @@ def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: s
     except Exception as exc:
         conn.rollback()
         return MemoryMutationResult(False, audit_action, slug, error=str(exc))
-
-
-def archive_memory_by_slug(slug: str) -> str | None:
-    """设置 priority = 'archive'，匹配 store.archive_memory。"""
-    return slug if archive_memory_result(slug).ok else None
-
-
-def delete_memory_compat(slug: str) -> str | None:
-    """删除记忆，保存快照后删除，匹配 store.delete_memory_file。"""
-    return slug if delete_memory(slug) else None
 
 
 def merge_memories_result(
@@ -1375,7 +1054,6 @@ def merge_memories_result(
             conn.rollback()
             return MemoryMutationResult(False, "merge", target_slug, changed_rows=changed_rows, backup_path=target_backup, error="audit write failed")
         conn.commit()
-        refresh_memory_vectors(target["id"])
         return MemoryMutationResult(
             True,
             "merge",
@@ -1389,28 +1067,6 @@ def merge_memories_result(
     except Exception as exc:
         conn.rollback()
         return MemoryMutationResult(False, "merge", target_slug, error=str(exc))
-
-
-def merge_memories(
-    target_slug: str,
-    source_slug: str,
-    merged_body: str,
-    description: str,
-    priority: str | None = None,
-    mem_type: str | None = None,
-    archive_source: bool = True,
-) -> str | None:
-    """合并两条记忆，匹配 store.merge_memory_files。"""
-    result = merge_memories_result(
-        target_slug,
-        source_slug,
-        merged_body,
-        description,
-        priority=priority,
-        mem_type=mem_type,
-        archive_source=archive_source,
-    )
-    return target_slug if result.ok else None
 
 
 def list_history(slug: str) -> list[dict[str, Any]]:
@@ -1547,7 +1203,6 @@ def restore_memory_from_history_result(slug: str, version: str, reason: str = ""
             conn.rollback()
             return MemoryMutationResult(False, "rollback_restore", target_slug, changed_rows=changed_rows, error="audit write failed")
         conn.commit()
-        refresh_memory_vectors(memory_id)
         return MemoryMutationResult(
             True,
             "rollback_restore",
@@ -1560,68 +1215,3 @@ def restore_memory_from_history_result(slug: str, version: str, reason: str = ""
         conn.rollback()
         return MemoryMutationResult(False, "rollback_restore", target_slug, error=str(exc))
 
-
-def restore_memory_from_history(slug: str, version: str, reason: str = "") -> str | None:
-    """Restore a memory snapshot from memory_versions, recreating deleted rows."""
-    result = restore_memory_from_history_result(slug, version, reason=reason)
-    return result.target_slug if result.ok else None
-
-
-def read_history(slug: str, version: str) -> str | None:
-    """读取指定版本的历史内容，匹配 store.read_history。"""
-    row = read_history_record(slug, version)
-    if not row:
-        return None
-    # 以 Markdown 形式返回，包含旧 frontmatter 风格的元信息
-    return (
-        f"---\nslug: {slug}\n"
-        f"description: {row['description']}\n"
-        f"type: {row['mem_type']}\n"
-        f"priority: {row['priority']}\n"
-        f"---\n\n{row['content']}"
-    )
-
-
-def rebuild_index() -> None:
-    """Export a readable MEMORY.md cache from the SQLite memory store."""
-    from .config import MEMORY_INDEX
-
-    MEMORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    memories = list_memories_compat()
-    grouped: dict[str, list[dict[str, Any]]] = {
-        "core": [], "important": [], "normal": [], "archive": [],
-    }
-    for mem in memories:
-        p = mem.get("priority", "normal")
-        grouped.setdefault(p, []).append(mem)
-
-    TIER_HEADINGS = [
-        ("core", "L0 · Core（始终加载）"),
-        ("important", "L1 · Important（始终加载）"),
-        ("normal", "L2 · Normal（按话题触发）"),
-        ("archive", "L3 · Archive（深度检索按需）"),
-    ]
-
-    lines = [
-        "# 记忆索引",
-        "",
-        "> SQLite 是当前真源；Markdown 文件是只读缓存。",
-        ">",
-        "> **启动时**：从 SQLite 加载 L0（core）和 L1（important）记忆完整内容；L2/L3 按话题检索。",
-        "",
-    ]
-    for priority, heading in TIER_HEADINGS:
-        lines.append(f"## {heading}")
-        lines.append("")
-        items = sorted(grouped.get(priority, []), key=lambda m: m.get("slug", ""))
-        if items:
-            for mem in items:
-                slug = mem.get("slug", "")
-                desc = mem.get("description", slug)
-                label = slug.replace("_", " ")
-                lines.append(f"- [{label}]({slug}.md) — {desc}")
-        else:
-            lines.append("- （暂无）")
-        lines.append("")
-
-    MEMORY_INDEX.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

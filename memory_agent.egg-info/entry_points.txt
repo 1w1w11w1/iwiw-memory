@@ -1,0 +1,3 @@
+[console_scripts]
+memory-agent-chat = memory_agent.chat:main
+memory-agent-mcp = memory_agent.mcp_server:main

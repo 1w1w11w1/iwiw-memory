@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-agent"
+version = "0.2.0"
+description = "独立的本地长期记忆系统：SQLite 分级记忆 + DSC 会话状态 + 确定性检索 + LLM 提取 + 维护"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "mcp>=1.0",
+    "jieba>=0.42",
+]
+
+[project.scripts]
+memory-agent-mcp = "memory_agent.mcp_server:main"
+memory-agent-chat = "memory_agent.chat:main"
+
+[tool.setuptools]
+packages = ["memory_agent"]

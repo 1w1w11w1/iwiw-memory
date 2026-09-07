@@ -1,13 +1,8 @@
 .venv/
 .env
-selfecho_config/providers.local.json
-selfecho_config/**/*.local.json
-selfecho_data/
-memory/
+data/
 .claude/
 .codex/
-web/node_modules/
-web/dist/
 *.log
 __pycache__/
 *.py[cod]

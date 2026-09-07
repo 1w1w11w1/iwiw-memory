@@ -1,10 +1,10 @@
 """
-记忆代理配置。
+memory_agent 配置。
 
 设计目标：
-- 项目目录可重命名，不把 e:\\desktop\\111 写死在代码里。
+- 项目目录可重命名，不把绝对路径写死在代码里。
 - API key 只从环境变量或本地 .env 读取，不提交到仓库文件。
-- 记忆系统复用同一套轻量 LLM 配置。
+- 数据真源：data/memory.db（SQLite 单一真源，Markdown 已废弃）。
 """
 
 from __future__ import annotations
@@ -68,11 +68,11 @@ _load_dotenv()
 
 # ── 项目路径 ──
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MEMORY_DIR = PROJECT_ROOT / "memory"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
-# ── 数据库（与会话层合并）──
-MEMORY_DB_PATH = PROJECT_ROOT / "selfecho_data" / "sessions.db"
+# ── 数据真源 ──
+DATA_DIR = PROJECT_ROOT / "data"
+# MEMORY_AGENT_DB_PATH：测试隔离钩子（E2E 用临时库覆盖真源路径）
+MEMORY_DB_PATH = Path(_env("MEMORY_AGENT_DB_PATH", str(DATA_DIR / "memory.db")))
 
 # ── LLM API 配置 ──
 LLM_API_STYLE = _env("MEMORY_AGENT_LLM_API_STYLE", "anthropic").strip().lower()
@@ -85,25 +85,23 @@ EXTRACT_MAX_TOKENS = _env_int("MEMORY_AGENT_EXTRACT_MAX_TOKENS", 1200)
 EXTRACT_TEMPERATURE = _env_float("MEMORY_AGENT_EXTRACT_TEMPERATURE", 0.2)
 EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 15.0)
 
-# ── 记忆分级（来自 MemPalace 分层设计） ──
+# ── 记忆分级（三值）──
+# core   = 必须载入：对话前注入上下文（身份、健康、关系、重大决策）
+# normal = 按需载入：话题触发检索（日常信息、一般偏好、阶段计划）
+# archive = 归档状态：过时/冗余后保留但降权、不参与维护候选（可回滚）
 PRIORITY_TIERS = {
     "core": {
-        "description": "L0 — 始终加载的核心身份和偏好",
+        "description": "必须载入 — 对话前注入的身份/健康/关系/决策",
         "max_chars": 800,
         "always_load": True,
     },
-    "important": {
-        "description": "L1 — 重要但非核心（健康、关系、重大决策）",
-        "max_chars": 2000,
-        "always_load": True,
-    },
     "normal": {
-        "description": "L2 — 按话题触发的日常信息",
+        "description": "按需载入 — 话题触发检索的日常信息",
         "max_chars": 5000,
         "always_load": False,
     },
     "archive": {
-        "description": "L3 — 深度搜索按需获取的历史信息",
+        "description": "归档状态 — 保留但降权，不参与常规检索与维护候选",
         "max_chars": 10000,
         "always_load": False,
     },
@@ -112,20 +110,20 @@ PRIORITY_TIERS = {
 # ── Hash 去重 ──
 HASH_ALGORITHM = "md5"  # 速度优先，不涉及安全场景
 
-# ── 向量嵌入配置（本地 BGE 模型，中文优化）──
-EMBEDDING_MODEL = _env("MEMORY_AGENT_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
-EMBEDDING_DIMENSIONS = _env_int("MEMORY_AGENT_EMBEDDING_DIMENSIONS", 512)
-EMBEDDING_BATCH_SIZE = _env_int("MEMORY_AGENT_EMBEDDING_BATCH_SIZE", 16)
-EMBEDDING_DEVICE = _env("MEMORY_AGENT_EMBEDDING_DEVICE", "cpu")  # cpu | cuda | mps
-
 # ── 检索 ──
-HYBRID_TOP_K = _env_int("MEMORY_AGENT_HYBRID_TOP_K", 10)
-HYBRID_SEMANTIC_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_SEMANTIC_WEIGHT", 0.5)
-HYBRID_BM25_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_BM25_WEIGHT", 0.2)
-HYBRID_TIME_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_TIME_WEIGHT", 0.15)
-HYBRID_PRIORITY_WEIGHT = _env_float("MEMORY_AGENT_HYBRID_PRIORITY_WEIGHT", 0.15)
-HYBRID_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_HYBRID_RELEVANCE_THRESHOLD", 0.4)
+# 分数尺度：base = Σ(FTS 命中数×bm25 权重) + 状态候选×state 权重，再乘时间/优先级因子
+# （权重真源是 retrieval.DEFAULT_WEIGHTS）。单次 FTS 命中约 0.6，阈值默认 0.15 过滤无关结果。
+SEARCH_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_SEARCH_RELEVANCE_THRESHOLD", 0.15)
 MEMORY_RECALL_MAX_CHARS = _env_int("MEMORY_AGENT_RECALL_MAX_CHARS", 2500)
 
 # ── 日志 ──
-LOG_FILE = PROJECT_ROOT / "memory_agent" / "extractor.log"
+LOG_FILE = DATA_DIR / "logs" / "extractor.log"
+
+# ── 会话（chat 工作台）──
+CHAT_CONTEXT_TURNS = _env_int("MEMORY_AGENT_CHAT_CONTEXT_TURNS", 12)
+# 注入精度优先：top_k 过大会带出无关记忆（误注入挤占去重窗口，阻塞后续回指）
+CHAT_RECALL_TOP_K = _env_int("MEMORY_AGENT_CHAT_RECALL_TOP_K", 3)
+CHAT_MAX_REPLY_TOKENS = _env_int("MEMORY_AGENT_CHAT_MAX_REPLY_TOKENS", 1024)
+# DSC 压缩：历史超过 CHAT_CONTEXT_TURNS 轮时，旧上下文压成 SessionState 检查点，
+# 保留最近 CHAT_COMPACT_TAIL_TURNS 轮完整原文（尾部保留，借鉴 Codex compaction tail）
+CHAT_COMPACT_TAIL_TURNS = _env_int("MEMORY_AGENT_CHAT_COMPACT_TAIL_TURNS", 6)
