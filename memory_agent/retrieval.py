@@ -125,6 +125,7 @@ def search_memories(
             "priority": mem.get("priority", "normal"),
             "mem_type": mem.get("mem_type", "user"),
             "content": mem.get("content", "")[:500],
+            "recorded_date": mem.get("recorded_date", ""),
             "score": round(final_score, 4),
             "source": "deterministic",
         }))

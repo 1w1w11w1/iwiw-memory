@@ -95,7 +95,8 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 1. 看对话上文（[assistant] / [ai] 标签），找到 AI 的完整分析段落
 2. 判断用户是否在认可这些分析——用户追加修正时以修正版为准
 3. 将分析中的**核心洞察**转化为用户视角的记忆，而非照抄 AI 措辞
-4. 【语言强制规则】content 必须使用与「用户消息」完全相同的语言：英文消息 → 英文 content，中文消息 → 中文 content。绝对禁止在英文消息的记忆 content 中使用中文。description 同理。以第三人称描述用户
+4. 【细节保留规则】保留具体的日期、时间、数字、金额、人名、机构名、地名——这些是记忆的核心价值，摘要时不可省略。
+5. 【语言强制规则】content 必须使用与「用户消息」完全相同的语言：英文消息 → 英文 content，中文消息 → 中文 content。绝对禁止在英文消息的记忆 content 中使用中文。description 同理。以第三人称描述用户
 5. 用户对 AI 分析做了修正或限定时（如"实际上他确实有爱好，但性格高傲"），以修正版为准
 
 **示例**：
@@ -183,7 +184,7 @@ def _related_memories_text(message: str, context: str = "", top_k: int = 5) -> s
     return "\n".join(lines)
 
 
-async def extract_from_message(message: str, context: str = "") -> list[dict[str, Any]]:
+async def extract_from_message(message: str, context: str = "", session_date: str = "") -> list[dict[str, Any]]:
     """
     从用户消息中提取记忆候选。
 
@@ -306,18 +307,20 @@ def _parse_extraction_result(raw: str) -> list[dict[str, Any]]:
     return []
 
 
-async def extract_and_save(message: str, context: str = "") -> list[str]:
+async def extract_and_save(message: str, context: str = "", session_date: str = "") -> list[str]:
     """
     一步完成：提取 → 去重 → 写入。
 
     Returns:
         新创建的记忆文件 slug 列表
     """
-    candidates = await extract_from_message(message, context)
+    candidates = await extract_from_message(message, context, session_date=session_date)
     saved: list[str] = []
 
     for c in candidates:
         try:
+            if session_date:
+                c["_recorded_date"] = session_date
             result = save_memory_candidate(c)
             if result:
                 action, slug = result

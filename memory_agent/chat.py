@@ -452,8 +452,9 @@ async def run() -> None:
 
         # ── 每轮自动提取（无门禁、带完整对话上下文；回复之后执行不阻塞体验）──
         ctx = "\n".join(f"[{m['role']}]: {m['content'][:500]}" for m in history[-6:])
+        from datetime import date as _date
         try:
-            saved = await extract_and_save(line, context=ctx)
+            saved = await extract_and_save(line, context=ctx, session_date=_date.today().isoformat())
             if saved:
                 print(f"[自动提取] {', '.join(saved)}")
         except Exception as exc:

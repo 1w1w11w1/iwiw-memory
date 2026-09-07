@@ -246,6 +246,7 @@ def upsert_memory(
     event_date: str | None = None,
     content_hash: str = "",
     metadata: dict[str, Any] | None = None,
+    recorded_date: str | None = None,
 ) -> dict[str, Any]:
     """
     写入一条记忆（INSERT OR REPLACE 语义）。
@@ -292,7 +293,7 @@ def upsert_memory(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (mem_id, slug, description.strip()[:200], content, mem_type, priority,
-         event_date, now, new_hash,
+         event_date, recorded_date or now, new_hash,
          now, now, json.dumps(metadata or {}, ensure_ascii=False)),
     )
     audit_id = _record_audit(
@@ -451,6 +452,8 @@ def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
             return ("merge", slug)
 
         # create / update：先尝试替换（slug 已存在），不存在则创建
+        # _recorded_date：提取方显式指定的记录日期（如 LoCoMo session 日期），用于时间锚定
+        recorded = candidate.get("_recorded_date") or None
         result = replace_memory_result(
             slug=slug, description=description, body=content,
             mem_type=mem_type, priority=priority, event_date=event_date,
@@ -462,6 +465,7 @@ def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
             slug=slug, description=description, content=content,
             mem_type=mem_type, priority=priority, event_date=event_date,
             content_hash="",
+            recorded_date=recorded,
         )
         return (action, record["slug"])
     except Exception as exc:

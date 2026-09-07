@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import httpx
 import json
 import sys
 import tempfile
@@ -73,6 +74,7 @@ def process_turn(msg: str, session_state: SessionState, db_path: str) -> dict:
 async def answer_question_async(
     question: str,
     top_k: int = 5,
+    speaker: str = "",
 ) -> str:
     """用记忆系统回答一个问题。"""
     from memory_agent.retrieval import search_memories
@@ -86,7 +88,9 @@ async def answer_question_async(
     # 组装记忆上下文
     mem_lines = []
     for r in results:
-        mem_lines.append(f"- [{r['priority']}] {r['slug']}: {r.get('content', '')[:200]}")
+        rdate = r.get("recorded_date") or r.get("metadata", {}).get("recorded_date", "")
+        date_tag = f" (recorded: {rdate})" if rdate else ""
+        mem_lines.append(f"- {r['slug']}{date_tag}: {r.get('content', '')[:200]}")
     memory_block = "\n".join(mem_lines)
     
     qa_prompt = f"""Answer the question based on the following memories. If the memories don't contain enough information, honestly say "I cannot answer based on my memories."
@@ -140,6 +144,18 @@ async def judge_answer_async(question: str, ground_truth: str, answer: str) -> s
     return result.strip().lower()
 
 
+# ── 带重试的 LLM 调用包装（瞬时网络错误重试 2 次）──
+async def llm_with_retry(coro_factory, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            return await coro_factory()
+        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as e:
+            if attempt < retries:
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
+            raise
+
+
 # ── 主评测流程 ──
 
 def run_evaluation(
@@ -188,12 +204,13 @@ def run_evaluation(
         nonlocal extraction_count, turn_count
         buffer = []
         for sess_num, turns in sessions:
+            # session 日期（LoCoMo 的 session_N_date_time）
+            sess_date = conv.get(f"session_{sess_num}_date_time", "")
+            sess_date = str(sess_date)[:10] if sess_date else ""
             for turn in turns:
                 speaker = turn.get("speaker", "")
                 text = turn.get("text", "").strip()
                 if not text:
-                    continue
-                if speaker != speaker_a:
                     continue
                 turn_count += 1
                 buffer.append(text)
@@ -203,7 +220,7 @@ def run_evaluation(
                 if len(buffer) >= BATCH_SIZE:
                     merged = chr(10).join(f"[消息{j+1}]: {m}" for j, m in enumerate(buffer))
                     try:
-                        saved = await extract_and_save(merged)
+                        saved = await llm_with_retry(lambda: extract_and_save(merged, session_date=sess_date))
                         if saved:
                             extraction_count += len(saved)
                     except Exception as exc:
@@ -213,7 +230,7 @@ def run_evaluation(
         if buffer:
             merged = chr(10).join(f"[消息{j+1}]: {m}" for j, m in enumerate(buffer))
             try:
-                saved = await extract_and_save(merged)
+                saved = await extract_and_save(merged, session_date=sess_date)
                 if saved:
                     extraction_count += len(saved)
             except Exception as exc:
@@ -239,7 +256,7 @@ def run_evaluation(
     qa_pairs = scoped_qa
     
     # Phase 2: QA 并发评测（8 路并发 + 智能 judge 跳过）
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(4)
     judge_calls = [0]
     
     def fast_judge(answer: str, ground_truth: str, category: int):
@@ -260,11 +277,20 @@ def run_evaluation(
             question = qa.get("question", "")
             ground_truth = str(qa.get("answer", ""))
             category = qa.get("category", 0)
-            answer = await answer_question_async(question)
-            judgment = fast_judge(answer, ground_truth, category)
-            if judgment is None:
-                judge_calls[0] += 1
-                judgment = await judge_answer_async(question, ground_truth, answer)
+            try:
+                answer = await llm_with_retry(lambda: answer_question_async(question, speaker=speaker_a))
+                judgment = fast_judge(answer, ground_truth, category)
+                if judgment is None:
+                    judge_calls[0] += 1
+                    judgment = await llm_with_retry(lambda: judge_answer_async(question, ground_truth, answer))
+            except Exception as exc:
+                return {
+                    "question": question[:60],
+                    "answer": f"[error] {type(exc).__name__}",
+                    "ground_truth": ground_truth[:60],
+                    "category": category,
+                    "judgment": "incorrect",
+                }
             return {
                 "question": question[:60],
                 "answer": answer[:100],
