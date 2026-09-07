@@ -1,0 +1,16 @@
+E:\desktop\111\.venv\Lib\site-packages\jieba\_compat.py:18: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+Traceback (most recent call last):
+  File "E:\desktop\111\tests\locomo_eval.py", line 309, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "E:\desktop\111\tests\locomo_eval.py", line 299, in main
+    report = run_evaluation(data_path, args.conversation, args.max_sessions)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\desktop\111\tests\locomo_eval.py", line 177, in run_evaluation
+    sessions = get_sessions(conv)
+               ^^^^^^^^^^^^^^^^^^
+  File "E:\desktop\111\tests\locomo_eval.py", line 46, in get_sessions
+    conv = conversation["conversation"]
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+KeyError: 'conversation'

@@ -95,7 +95,7 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
 1. 看对话上文（[assistant] / [ai] 标签），找到 AI 的完整分析段落
 2. 判断用户是否在认可这些分析——用户追加修正时以修正版为准
 3. 将分析中的**核心洞察**转化为用户视角的记忆，而非照抄 AI 措辞
-4. content 用中文自然语言，以第三人称描述用户
+4. 【语言强制规则】content 必须使用与「用户消息」完全相同的语言：英文消息 → 英文 content，中文消息 → 中文 content。绝对禁止在英文消息的记忆 content 中使用中文。description 同理。以第三人称描述用户
 5. 用户对 AI 分析做了修正或限定时（如"实际上他确实有爱好，但性格高傲"），以修正版为准
 
 **示例**：
@@ -112,7 +112,7 @@ EXTRACT_SYSTEM_PROMPT = """你是一个「个人记忆维护器」。你的任�
     "slug": "短英文slug",
     "target_slug": "仅 update/merge 时填写已有记忆 slug",
     "description": "一句话描述（用于索引）",
-    "content": "用中文自然语言写成的完整记忆内容。create 时写完整正文；update 时必须给出更新后的【完整正文】（基于「可能相关的已有记忆」全文改写/补充，系统会全文替换，不是追加）。",
+    "content": "完整记忆内容（语言跟随输入消息语言）。create 时写完整正文；update 时必须给出更新后的【完整正文】（基于「可能相关的已有记忆」全文改写/补充，系统会全文替换，不是追加）。",
     "mem_type": "user|feedback|project|reference"（见下方 mem_type 选择规则）,
     "priority": "core|normal|archive",
     "event_date": "YYYY-MM-DD（事实发生日期，从上下文推算；实在无法推算则用 null）",

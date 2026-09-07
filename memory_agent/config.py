@@ -83,7 +83,7 @@ LLM_MODEL = _env("MEMORY_AGENT_LLM_MODEL", "deepseek-v4-flash")
 # ── 提取配置 ──
 EXTRACT_MAX_TOKENS = _env_int("MEMORY_AGENT_EXTRACT_MAX_TOKENS", 1200)
 EXTRACT_TEMPERATURE = _env_float("MEMORY_AGENT_EXTRACT_TEMPERATURE", 0.2)
-EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 15.0)
+EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 60.0)
 
 # ── 记忆分级（三值）──
 # core   = 必须载入：对话前注入上下文（身份、健康、关系、重大决策）
