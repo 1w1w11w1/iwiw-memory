@@ -13,6 +13,7 @@
 | [associative-recall-architecture.md](associative-recall-architecture.md) | 联想架构评估：向量是错配工具，重构方向 |
 | [competitive-comparison.md](competitive-comparison.md) | 竞品结构对比：经验吸取与不足清单 |
 | [evidence-audit.md](evidence-audit.md) | 机制证据审计：验证有效/竞品存在/直觉自创 |
+| [exploration-report.md](exploration-report.md) | LoCoMo 评测 + 认知科学架构 详细探索报告 |
 | [session-experience-review.md](session-experience-review.md) | 会话体验审视：架构不足及其 chat 后果 |
 | [dsh-plugin-evolution.md](dsh-plugin-evolution.md) | DSH 插件 / QQ-bot 接入演进方案 |
 | [dsh-mcp-setup.md](dsh-mcp-setup.md) | DSH MCP 挂载指南（Phase A） |
