@@ -163,6 +163,7 @@ def run_evaluation(
     conversation_idx: int = 0,
     max_sessions: int = None,
     db_path: str = None,
+    keep_db_path: str = None,
 ) -> dict:
     """对一段 LoCoMo 对话运行完整评测。"""
     
@@ -180,10 +181,14 @@ def run_evaluation(
     speaker_b = conv.get("speaker_b", "SpeakerB")
     
     # 设置隔离库
+    tmp = None
     if db_path is None:
         import tempfile
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        db_path = str(Path(tmp.name) / "memory.db")
+        if keep_db_path:
+            db_path = keep_db_path
+        else:
+            tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+            db_path = str(Path(tmp.name) / "memory.db")
     
     import memory_agent.db as memory_db
     memory_db.close()
@@ -278,6 +283,8 @@ def run_evaluation(
             ground_truth = str(qa.get("answer", ""))
             category = qa.get("category", 0)
             try:
+                hits = search_memories(question, top_k=5)
+                hit_slugs = [h["slug"] for h in hits]
                 answer = await llm_with_retry(lambda: answer_question_async(question, speaker=speaker_a))
                 judgment = fast_judge(answer, ground_truth, category)
                 if judgment is None:
@@ -290,6 +297,8 @@ def run_evaluation(
                     "ground_truth": ground_truth[:60],
                     "category": category,
                     "judgment": "incorrect",
+                    "evidence": qa.get("evidence", []),
+                    "hit_slugs": [],
                 }
             return {
                 "question": question[:60],
@@ -297,6 +306,8 @@ def run_evaluation(
                 "ground_truth": ground_truth[:60],
                 "category": category,
                 "judgment": judgment,
+                "evidence": qa.get("evidence", []),
+                "hit_slugs": hit_slugs,
             }
     
     async def run_qa():
@@ -343,6 +354,8 @@ def main():
     parser.add_argument("--max-sessions", type=int, default=None)
     parser.add_argument("--data", type=str, default=str(ROOT / "data" / "locomo" / "locomo10.json"))
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--keep-db", type=str, default=None, help="保留记忆库到指定路径（供归因诊断）")
+    parser.add_argument("--max-qa", type=int, default=None, help="限制 QA 数量（调试用）")
     args = parser.parse_args()
     
     data_path = args.data
@@ -350,7 +363,7 @@ def main():
         print(f"数据文件不存在: {data_path}")
         return 1
     
-    report = run_evaluation(data_path, args.conversation, args.max_sessions)
+    report = run_evaluation(data_path, args.conversation, args.max_sessions, keep_db_path=args.keep_db)
     
     output = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
