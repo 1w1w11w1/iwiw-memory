@@ -1,8 +1,9 @@
 # 换装验收清单（cutover 后逐项检查）
 
 ## 启动
-- [ ] DSH 启动日志出现 `[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook`
+- [ ] DSH 启动日志出现 `[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + dream scheduler`
 - [ ] 无 `memory backend warmup failed` / `hit injection failed` 告警
+- [ ] 无 `declares no dsh.bundle` 报错（2026-09-08 曾因缺 dsh.bundle.patch 声明启动崩溃，已修复）
 - [ ] meow-memory 的启动日志**不再出现**（确认已卸载）
 
 ## 记忆注入
@@ -22,8 +23,8 @@
 - [ ] 输入区 dock 出现（MemoryFoldDock）
 
 ## 记忆库
-- [ ] `data/memory.db` 有 meow 迁移条目（slug 前缀 meow-*，共 42 条）
-- [ ] mutation 留痕：`memory_history('meow-...')` 可查
+- [ ] `data/memory.db` 有 meow 迁移条目（slug 前缀 meow-*，共 42 条：fact21/lesson11/profile2/project7/rules1）
+- [ ] mutation 留痕：meow-* 条目为新 upsert，history 为空属预期；对其做一次 /mem edit 后 `memory_history` 应有版本
 
 ## 回滚
 出现问题时：`powershell -File scripts\cutover-iwiw.ps1 -Rollback` → 重启 DSH → 恢复 meow
