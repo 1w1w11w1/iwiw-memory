@@ -8,16 +8,21 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml"
   ],
   "scripts": {
     "build": "tsc && node build.mjs",
     "build:client": "node build.mjs"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }

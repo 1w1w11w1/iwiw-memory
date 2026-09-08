@@ -1,0 +1,10 @@
+# dsh-iwiw-memory bundle patch: inserts this plugin into a profile's layer stack.
+# Applied when a profile lists this bundle (or copied by hand for manual installs).
+# `name` is the npm package specifier — Node resolution finds the installed code
+# (junction node_modules/@iwiw/dsh-iwiw-memory); `id` is the entry identity that
+# profile-level patches use for config overrides.
+- insert:
+    - id: '@iwiw/dsh-iwiw-memory'
+      name: '@iwiw/dsh-iwiw-memory'
+      config:
+        enabled: true
