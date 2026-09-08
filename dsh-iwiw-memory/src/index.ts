@@ -170,6 +170,32 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回，后续实现）。
   const hitTopK = config.hitTopK ?? 3;
   const injectedBySession = new Map<string, Set<string>>();
+  // 压缩后补回：compaction 释放去重并快照本会话已注入 slugs，compaction/end 后 pre-step 补回
+  const reinjectArmed = new Map<string, string[]>();
+  disposers.push(
+    ctx.on("session/event", (session: any, event: any) => {
+      const t = event?.type;
+      const sid = typeof session?.id === "string" ? session.id : null;
+      if (!sid) return;
+      if (t === "compaction/start" || t === "compaction/summary") {
+        const seen = injectedBySession.get(sid);
+        if (seen?.size) {
+          reinjectArmed.set(sid, [...seen]);
+          injectedBySession.delete(sid);
+          ctx.logger.info(`[dsh-iwiw-memory] compaction signal: released seen for session, ${seen.size} slugs armed`);
+        }
+        return;
+      }
+      if (t === "compaction/end") {
+        const err = event?.data?.error;
+        if ((err === undefined || err === null || err === "") && reinjectArmed.has(sid)) {
+          ctx.logger.info("[dsh-iwiw-memory] compaction finished, re-injection armed");
+        } else if (err) {
+          reinjectArmed.delete(sid);
+        }
+      }
+    }),
+  );
   const snapshotMessage = (text: string, meta: { kind: string; ids: string[] }) => ({
     id: crypto.randomUUID(),
     role: "user",
@@ -197,6 +223,27 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         .trim();
       if (text.length < 4) return decision;
       const sid = typeof agent?.session?.header?.id === "string" ? agent.session.header.id : "default";
+      // 压缩后补回：本会话已注入过的记忆重新进入上下文
+      const pendingSlugs = reinjectArmed.get(sid);
+      if (pendingSlugs?.length) {
+        reinjectArmed.delete(sid);
+        const lines = ["## 相关记忆（压缩后补回）", ""];
+        for (const slug of pendingSlugs) {
+          try {
+            const mem = (await tools.read({ slug })) as { content?: string } | null;
+            if (mem?.content) {
+              lines.push(`- **${slug}**`);
+              lines.push(`  ${mem.content}`);
+            }
+          } catch {}
+        }
+        if (lines.length > 2) {
+          const rewritten = [...decision.messages];
+          rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(lines.join("\n"), { kind: "reinjection", ids: pendingSlugs }));
+          ctx.logger.info(`[dsh-iwiw-memory] post-compaction re-injected: ${pendingSlugs.join(", ")}`);
+          return { ...decision, messages: rewritten };
+        }
+      }
       try {
         const raw = await tools.search({ query: text, top_k: hitTopK });
         const hits = (Array.isArray(raw) ? raw : ((raw as any)?.hits ?? [])) as Array<{

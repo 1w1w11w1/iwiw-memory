@@ -119,6 +119,27 @@ const hitOk = snap1.length >= 1 && hitAsthma;
 const stepOk = hitOk && dedupOk && unrelatedOk;
 console.log("pre-step 断言:", stepOk ? "PASS" : "FAIL", JSON.stringify({ hitOk, dedupOk, unrelatedOk }));
 
+console.log("\n=== 5.5 压缩后补回（reinject）===");
+const sessionEvt = (handlers["session/event"] ?? [])[0];
+if (!sessionEvt) { console.log("SMOKE FAILED: no session/event handler"); process.exit(1); }
+const sessMock = { id: "smoke-sess", header: { id: "smoke-sess", cwd: "E:/desktop/111", origin: "main" } };
+sessionEvt(sessMock, { type: "compaction/start" });
+sessionEvt(sessMock, { type: "compaction/end" });
+// 压缩后新消息：应补回本会话注入过的记忆（哮喘 + 花生）
+currentDecision = mkDecision("我们继续刚才的话题");
+const out4 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snap4 = out4.messages.filter((m) => m.source?.kind === "plugin");
+const reinj = snap4.find((m) => m.source?.memory?.kind === "reinjection");
+const reinjOk = !!reinj && JSON.stringify(reinj).includes("哮喘") && JSON.stringify(reinj).includes("花生");
+console.log("补回快照:", snap4.length, "条, kind=reinjection 且含已注入内容:", reinjOk);
+// 补回后去重重新武装：同主题再次提问应命中（释放后的重新注入）
+currentDecision = mkDecision("哮喘的诱因有哪些");
+const out5 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snap5 = out5.messages.filter((m) => m.source?.kind === "plugin" && m.source?.memory?.kind === "hit");
+console.log("补回后重新命中:", snap5.length, "条 hit 快照");
+const reinjStepOk = reinjOk;
+console.log("reinject 断言:", reinjStepOk ? "PASS" : "FAIL");
+
 console.log("\n=== 6. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
