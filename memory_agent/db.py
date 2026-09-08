@@ -651,7 +651,7 @@ def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
     """获取适合维护审查的记忆候选（访问最少、更新最早的 active）。"""
     conn = connect()
     rows = conn.execute(
-        """SELECT slug, description, priority, access_count, updated_at, content
+        """SELECT slug, description, mem_type, priority, access_count, last_access_at, updated_at, content
             FROM memories
             WHERE priority = 'active'
             ORDER BY access_count ASC, updated_at ASC
@@ -659,6 +659,39 @@ def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_recent_changed(since_iso: str, limit: int = 20) -> list[dict[str, Any]]:
+    """获取窗口内创建/更新的 active 记忆（dream 审查范围）。"""
+    conn = connect()
+    rows = conn.execute(
+        """SELECT slug, description, mem_type, priority, access_count, last_access_at, updated_at, content
+            FROM memories
+            WHERE priority = 'active' AND updated_at >= ?
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+        (since_iso, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def touch_memories(slugs: list[str]) -> int:
+    """命中自增（使用强化）：记忆被联想注入/读取时更新访问统计。
+
+    统计字段非内容变更，不走 version/audit：mutation 契约约束的是内容与
+    生命周期，访问计数可再生且只服务维护排序，进审计只会稀释信噪比。
+    """
+    slugs = [s for s in dict.fromkeys(slugs or []) if s]
+    if not slugs:
+        return 0
+    conn = connect()
+    cur = conn.execute(
+        "UPDATE memories SET access_count = access_count + 1, last_access_at = ? "
+        f"WHERE slug IN ({','.join('?' * len(slugs))})",
+        (_now(), *slugs),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def get_stats() -> dict[str, Any]:

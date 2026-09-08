@@ -21,6 +21,7 @@ chat.py — 记忆系统 CLI 工作台（独立 chat 功能）
   /pending approve <id>      审批通过
   /pending reject <id>       拒绝
   /maintain                  审查记忆维护候选（生成归档待确认动作）
+  /dream                     空闲整理：审查近期记忆（低风险修正自动留痕执行）
   /stats                     记忆库统计
   /help                      帮助
   /quit                      退出
@@ -45,6 +46,7 @@ from .config import (
     CHAT_RECALL_TOP_K,
     CHAT_MAX_REPLY_TOKENS,
     LLM_MODEL,
+    REFLECT_TURNS,
     STANDING_LAYERS,
     TOOL_MAX_TOKENS,
     TOOL_TEMPERATURE,
@@ -55,6 +57,7 @@ from .db import (
     get_memory,
     list_memories,
     upsert_memory,
+    touch_memories,
     list_pending_actions,
     approve_pending_action_result,
     reject_pending_action,
@@ -356,6 +359,26 @@ async def _handle_command(cmd: str, rest: str, state: dict[str, Any]) -> bool:
             print("  使用 /pending approve <id> 或 /pending reject <id> 处理")
         return True
 
+    if c == "dream":
+        print("（dream 整理中……）")
+        from .maintenance import run_dream
+        r = await run_dream()
+        if r.get("error"):
+            print(f"✗ dream 失败: {r['error']}")
+            return True
+        print(f"✓ 审查了 {r['reviewed']} 条近期记忆")
+        for f in r["auto_fixed"]:
+            print(f"  自动修正: {f['slug']} -> {f['action']}" + (f" ({f.get('mem_type')})" if f.get("mem_type") else ""))
+        for p in r["pending"]:
+            print(f"  [待审批] archive -> {p['slug']}  {p['reason']}")
+        for s in r["suggestions"]:
+            print(f"  [合并建议] {s['slug']} → {s['target_slug']}  {s['reason']}")
+        if not (r["auto_fixed"] or r["pending"] or r["suggestions"]):
+            print("  无需整理")
+        if r["pending"]:
+            print("  使用 /pending approve <id> 或 /pending reject <id> 处理")
+        return True
+
     if c == "stats":
         s = get_stats()
         print(f"记忆总数: {s['total_memories']}")
@@ -384,7 +407,7 @@ async def run() -> None:
     session.build_word_index(list_memories())
     state: dict[str, Any] = {
         "last_user_message": "", "injected_slugs": {}, "_turn": 0, "topic_freq": {},
-        "session": session, "compacted": "",
+        "session": session, "compacted": "", "since_write": 0,
     }
 
     while True:
@@ -406,6 +429,16 @@ async def run() -> None:
             continue
 
         # ── 组装上下文（联想注入 → system 层，模型当作已知背景）──
+        # reflect steering：连续 REFLECT_TURNS 轮未写入 → 注入一次性回顾提示
+        reflect_nudge = ""
+        if REFLECT_TURNS > 0 and state.get("since_write", 0) >= REFLECT_TURNS:
+            reflect_nudge = (
+                "（会话回顾提示：最近多轮未写入记忆。若此前对话出现值得长期保存的稳定事实、"
+                "决策或偏好，请在本次回复前调用 memory_remember；确认没有则忽略本提示。）"
+            )
+            state["since_write"] = 0
+            if ECHO_STATE:
+                print("[reflect steering] 注入回顾提示")
         system = BASE_SYSTEM_PROMPT
         # 每轮重算常驻层与词面索引：会话中新写入的记忆立即生效（A2 一致性）
         always_load = _always_load_text()
@@ -455,10 +488,13 @@ async def run() -> None:
             for s in injected:
                 state["injected_slugs"][s] = state["_turn"]
             session.note_recalled(injected)
+            touch_memories(sorted(injected))
             if ECHO_STATE:
                 print(f"[联想注入] {', '.join(sorted(injected))}")
         if state.get("compacted"):
             system += "\n\n" + state["compacted"]
+        if reflect_nudge:
+            system += "\n\n" + reflect_nudge
         user_prompt = line
 
         messages = [{"role": "system", "content": system}]
@@ -468,6 +504,7 @@ async def run() -> None:
 
         # ── 记忆工具轮（回复前，非流式；模型自主决定写入/检索/读取）──
         tool_round_msgs: list[dict[str, Any]] = []
+        wrote_memory = False
         try:
             for _ in range(TOOL_MAX_LOOPS):
                 result = await complete_with_tools(
@@ -485,6 +522,8 @@ async def run() -> None:
                 for tc in result["message"].get("tool_calls") or []:
                     tool_msg, echo = await _execute_memory_tool(tc)
                     tool_round_msgs.append(tool_msg)
+                    if (tc.get("function") or {}).get("name") == "memory_remember":
+                        wrote_memory = True
                     if ECHO_STATE:
                         print(f"[记忆工具] {echo}")
             messages.extend(tool_round_msgs)
@@ -492,6 +531,8 @@ async def run() -> None:
             print(f"[记忆工具不可用: {exc}]")
         except Exception as exc:
             print(f"[记忆工具失败: {exc}]")
+        finally:
+            state["since_write"] = 0 if wrote_memory else state.get("since_write", 0) + 1
 
         # ── 流式回复 ──
         try:

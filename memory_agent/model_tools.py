@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from .db import get_memory, list_memories, upsert_memory
+from .db import get_memory, list_memories, upsert_memory, touch_memories
 from .retrieval import search_memories
 
 REMEMBER_GUIDE = (
@@ -150,6 +150,7 @@ def execute_memory_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             else:
                 result = {"ok": True, "memory": mem}
                 echo = f"read {slug} ✓"
+                touch_memories([slug])
         elif name == "memory_list":
             priority = args.get("priority") if args.get("priority") in ("active", "archived") else None
             mem_type = args.get("mem_type") if args.get("mem_type") in ("profile", "fact", "lesson", "rules", "project") else None
