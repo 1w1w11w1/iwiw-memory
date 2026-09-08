@@ -2,11 +2,18 @@ import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
 import { MemoryBackend } from "./backend.js";
 
-/** 5 个 memory_* 工具：纯转给 Python memory_agent.mcp_server，结果转 JSON。
- *  模型既能主动调用（检索/维护），又能在 register 时声明给 harness 内部用。
+/** 4 个 memory_* 工具：桥接到 Python memory_agent.mcp_server，
+ *  与 CLI chat 的模型工具面同源（执行逻辑单源在内核 model_tools.py）。
  */
 export class MemoryTools {
   constructor(private readonly backend: MemoryBackend) {}
+
+  async remember(params: { description: string; body: string; slug?: string; priority?: string }): Promise<JsonValue> {
+    const args: Record<string, unknown> = { description: params.description, body: params.body };
+    if (params.slug) args.slug = params.slug;
+    if (params.priority) args.priority = params.priority;
+    return this.parse(await this.backend.callTool("memory_remember", args));
+  }
 
   async search(params: { query: string; top_k?: number }): Promise<JsonValue> {
     return this.parse(await this.backend.callTool("search_memories", {
@@ -15,31 +22,15 @@ export class MemoryTools {
     }));
   }
 
-  async extract(params: { message: string; context?: string }): Promise<JsonValue> {
-    return this.parse(await this.backend.callTool("extract_and_save", {
-      message: params.message,
-      context: params.context ?? "",
-    }));
+  async read(params: { slug: string }): Promise<JsonValue> {
+    return this.parse(await this.backend.callTool("read_memory", params));
   }
 
-  async list(params: { priority?: "core" | "normal" | "archive"; limit?: number }): Promise<JsonValue> {
+  async list(params: { priority?: string; limit?: number }): Promise<JsonValue> {
     return this.parse(await this.backend.callTool("list_memories", {
       priority: params.priority,
       limit: params.limit ?? 20,
     }));
-  }
-
-  async update(params: { slug: string; description: string; body: string; priority?: string }): Promise<JsonValue> {
-    return this.parse(await this.backend.callTool("memory_update", {
-      slug: params.slug,
-      description: params.description,
-      body: params.body,
-      priority: params.priority ?? "normal",
-    }));
-  }
-
-  async stats(): Promise<JsonValue> {
-    return this.parse(await this.backend.callTool("memory_stats", {}));
   }
 
   private parse(text: string): JsonValue {
@@ -48,7 +39,7 @@ export class MemoryTools {
 }
 
 /** 构造 model-facing 文本块，保留 MCP 原始 JSON。 */
-export function textContent(value: JsonValue): ContentBlock[] {
+export function toTextBlocks(value: unknown): ContentBlock[] {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return [{ type: "text", text }];
 }

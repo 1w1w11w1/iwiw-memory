@@ -2,6 +2,7 @@
 mcp_server.py — 记忆系统 MCP 服务器（DSH 接入桥）
 
 提供工具：
+- memory_remember  : 模型写入记忆（upsert 全文替换；查重提示随结果返回）
 - search_memories  : 确定性搜索（FTS5 词面 + 会话状态联想 + 时间衰减 + 优先级）
 - list_memories    : 列出记忆（按 priority/type 过滤）
 - read_memory      : 读取单条记忆
@@ -44,6 +45,7 @@ from .db import (
     get_stats,
 )
 from .retrieval import search_memories
+from .model_tools import TOOL_GUIDES, execute_memory_tool
 
 server = Server("memory-system")
 
@@ -63,6 +65,17 @@ def _tool(name: str, description: str, props: dict[str, Any], required: list[str
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        _tool(
+            "memory_remember",
+            TOOL_GUIDES["memory_remember"],
+            {
+                "description": {"type": "string", "description": "一句话描述"},
+                "body": {"type": "string", "description": "完整正文（整体替换，不是追加）"},
+                "slug": {"type": "string", "description": "可选。更新已有记忆时填其 slug；新建可自动生成"},
+                "priority": {"type": "string", "description": "core|normal|archive，默认 normal"},
+            },
+            ["description", "body"],
+        ),
         _tool(
             "search_memories",
             "搜索记忆库（确定性：FTS5 关键词 + 同义词扩展 + 会话状态联想 + 时间衰减 + Priority 加权）。",
@@ -171,6 +184,10 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     def ok(data: Any) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2, default=str))]
+
+    if name == "memory_remember":
+        out = execute_memory_tool("memory_remember", arguments)
+        return ok(out["result"])
 
     if name == "search_memories":
         results = search_memories(arguments.get("query", ""), top_k=int(arguments.get("top_k", 10)))
