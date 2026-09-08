@@ -16,13 +16,27 @@ interface PluginConfig {
   coreMaxChars?: number;
   /** 每消息命中注入的条数上限（默认 3）。 */
   hitTopK?: number;
+  /** 常驻层集合（模式配置，类型轴保持纯净）：这些 mem_type 全量注入；
+   *  rules 层单独包装为「准则」段。chat 模式默认 ["profile","rules"]，dev 模式建议 ["rules"]。 */
+  standingLayers?: string[];
+  /** reflect steering：连续 N 个模型步未写入记忆后注入一次性回顾提示；0 关闭（默认 7）。 */
+  reflectTurns?: number;
+  /** dream 空闲整理：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
+  dreamIdleMinutes?: number;
   /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
   env?: Record<string, string>;
 }
 
+const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_PYTHON = "E:/desktop/111/.venv/Scripts/python.exe";
 const DEFAULT_CWD = "E:/desktop/111";
 const DEFAULT_CORE_MAX_CHARS = 2500;
+
+/** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
+export function isPeakTime(d: Date): boolean {
+  const h = d.getHours() + d.getMinutes() / 60;
+  return (h >= 8.75 && h < 12) || (h >= 13.75 && h < 18);
+}
 
 function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
   return {
@@ -102,14 +116,18 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   const python = config.python ?? DEFAULT_PYTHON;
   const cwd = config.cwd ?? DEFAULT_CWD;
   const coreMaxChars = config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS;
+  const standingLayers = (config.standingLayers ?? ["profile", "rules"]).filter((t) => VALID_MEM_TYPES.has(t));
+  const reflectTurns = config.reflectTurns ?? 7;
+  const dreamIdleMinutes = config.dreamIdleMinutes ?? 180;
   const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
   const tools = new MemoryTools(backend);
 
   // 1) 启动时预热后端（避免首次工具调用才连接）。
   try { await backend.callTool("list_memories", { limit: 1 }); } catch (e) { ctx.logger.warn("memory backend warmup failed", e); }
 
-  // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）。
-  const defs = makeDefinition(tools, () => { refreshCore().catch(() => {}); });
+  // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）+ reflect 计数归零。
+  let stepSinceWrite = 0;
+  const defs = makeDefinition(tools, () => { stepSinceWrite = 0; refreshCore().catch(() => {}); });
   const disposers = [
     ctx.tools.register(defs.memory_remember),
     ctx.tools.register(defs.memory_search),
@@ -120,27 +138,29 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   // 3) 静态工具使用提示。
   disposers.push(ctx.systemPrompt.section(toolGuideSection));
 
-  // 4) 动态 core 段：list 拿 slug + 逐条 read 拿全文，字符预算内拼装。
+  // 4) 动态 core 段：standingLayers 各层（rules 除外）list + 逐条 read，字符预算内拼装。
   const fetchCoreText = async (): Promise<string> => {
     try {
-      // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
-      const raw = (await tools.list({ priority: "active", mem_type: "profile", limit: 50 })) as
-        | Array<{ slug: string; description: string }>
-        | { items?: Array<{ slug: string; description: string }> };
-      const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
-      if (items.length === 0) return "（暂无必读长期记忆）";
+      const layers = standingLayers.filter((t) => t !== "rules");
       let budget = coreMaxChars;
       const lines: string[] = [];
-      for (const it of items) {
-        if (budget <= 0) break;
-        const mem = (await tools.read({ slug: it.slug })) as { content?: string } | null;
-        let body = mem?.content ?? "";
-        if (body.length > budget) body = body.slice(0, budget) + "...";
-        budget -= body.length;
-        lines.push(`- **${it.slug}** — ${it.description}`);
-        lines.push(`  ${body}`);
+      for (const layer of layers) {
+        // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
+        const raw = (await tools.list({ priority: "active", mem_type: layer, limit: 50 })) as
+          | Array<{ slug: string; description: string }>
+          | { items?: Array<{ slug: string; description: string }> };
+        const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
+        for (const it of items) {
+          if (budget <= 0) break;
+          const mem = (await tools.read({ slug: it.slug })) as { content?: string } | null;
+          let body = mem?.content ?? "";
+          if (body.length > budget) body = body.slice(0, budget) + "...";
+          budget -= body.length;
+          lines.push(`- **${it.slug}** — ${it.description}`);
+          lines.push(`  ${body}`);
+        }
       }
-      return lines.join("\n");
+      return lines.length > 0 ? lines.join("\n") : "（暂无必读长期记忆）";
     } catch (e) {
       ctx.logger.warn("fetch core memory failed", e);
       return `（core 记忆拉取失败：${String(e)}）`;
@@ -152,7 +172,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   let refreshing = false;
   let pending = false;
   const fetchRulesText = async (): Promise<string> => {
-    // rules 类准则全量注入（archived 退役不注入）
+    // rules 类准则全量注入（archived 退役不注入）；未配置 rules 层则无准则段
+    if (!standingLayers.includes("rules")) return "";
     try {
       const raw = (await tools.list({ priority: "active", mem_type: "rules", limit: 50 })) as
         | Array<{ slug: string; description: string }> | { items?: Array<{ slug: string; description: string }> };
@@ -204,11 +225,16 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
 
   // 5) 每消息命中注入（agent/pre-step）：最后一条 user 消息触发检索，
   //    命中且未注入过的记忆以快照消息插入其前（meow 同款机制）。
-  //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回，后续实现）。
+  //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回）。
+  //    检索带 session_id + context（内核 per-session SessionState，回指联想）
+  //    并排除常驻层（已在 system 注入，命中注入防重复）。
   const hitTopK = config.hitTopK ?? 3;
   const injectedBySession = new Map<string, Set<string>>();
   // 压缩后补回：compaction 释放去重并快照本会话已注入 slugs，compaction/end 后 pre-step 补回
   const reinjectArmed = new Map<string, string[]>();
+  // dream 活动时间戳：任何 pre-step 活动都刷新
+  const lastActivityAt = { value: Date.now() };
+  let dreamRunning = false;
   disposers.push(
     ctx.on("session/event", (session: any, event: any) => {
       const t = event?.type;
@@ -251,6 +277,7 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
       if (decision === undefined || decision?.kind !== "enter" || signal?.aborted) return decision;
       if (!Array.isArray(decision.messages) || decision.messages.length === 0) return decision;
       if (agent?.session?.header?.origin === "subagent") return decision;
+      lastActivityAt.value = Date.now();
       const lastUser = [...decision.messages].reverse().find((m: any) => m.source?.kind === "user");
       if (!lastUser) return decision;
       const text = (lastUser.content ?? [])
@@ -260,7 +287,21 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         .trim();
       if (text.length < 4) return decision;
       const sid = typeof agent?.session?.header?.id === "string" ? agent.session.header.id : "default";
-      // 压缩后补回：本会话已注入过的记忆重新进入上下文
+      // ── reflect steering：连续 N 步未写入 → 注入一次性回顾提示（优先于命中注入）──
+      if (reflectTurns > 0 && stepSinceWrite >= reflectTurns) {
+        stepSinceWrite = 0;
+        const reflectText = [
+          "## 会话回顾（reflect）",
+          "",
+          "最近多轮对话没有写入记忆。若此前对话出现值得长期保存的稳定事实、决策或偏好，请在本次回复前调用 memory_remember（新建前先 memory_search 查重）；确认没有则忽略本提示。",
+        ].join("\n");
+        const rewritten = [...decision.messages];
+        rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(reflectText, { kind: "reflect", ids: [] }));
+        ctx.logger.info("[dsh-iwiw-memory] reflect steering injected");
+        return { ...decision, messages: rewritten };
+      }
+      stepSinceWrite += 1;
+      // ── 压缩后补回：本会话已注入过的记忆重新进入上下文 ──
       const pendingSlugs = reinjectArmed.get(sid);
       if (pendingSlugs?.length) {
         reinjectArmed.delete(sid);
@@ -281,8 +322,23 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
           return { ...decision, messages: rewritten };
         }
       }
+      // ── 命中注入：回指联想（session_id + context）+ 常驻层排除 ──
       try {
-        const raw = await tools.search({ query: text, top_k: hitTopK });
+        const userTexts: string[] = [];
+        for (const m of decision.messages) {
+          if (m.source?.kind !== "user") continue;
+          const t = (m.content ?? [])
+            .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+            .map((b: any) => b.text)
+            .join(" ")
+            .trim();
+          if (t) userTexts.push(t);
+        }
+        const context = userTexts.slice(-4, -1);
+        const raw = await tools.search({
+          query: text, top_k: hitTopK, session_id: sid,
+          context, exclude_mem_types: standingLayers,
+        });
         const hits = (Array.isArray(raw) ? raw : ((raw as any)?.hits ?? [])) as Array<{
           slug: string; description: string; priority: string; content: string;
         }>;
@@ -298,6 +354,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         }
         const rewritten = [...decision.messages];
         rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(lines.join("\n"), { kind: "hit", ids: fresh.map((h) => h.slug) }));
+        // 使用强化：注入命中自增（fire-and-forget，不阻塞注入）
+        void tools.touch(fresh.map((h) => h.slug)).catch(() => {});
         ctx.logger.info(`[dsh-iwiw-memory] hit injected: ${fresh.map((h) => h.slug).join(", ")}`);
         return { ...decision, messages: rewritten };
       } catch (e) {
@@ -307,9 +365,36 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
     }),
   );
 
-  ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook");
+  // 6) dream 空闲整理：空闲 dreamIdleMinutes 且非峰时 → 调内核 run_dream（低风险修正留痕自愈，归档进待审批）。
+  const dreamTimer = dreamIdleMinutes > 0
+    ? setInterval(() => {
+        if (dreamRunning) return;
+        if (Date.now() - lastActivityAt.value < dreamIdleMinutes * 60_000) return;
+        if (isPeakTime(new Date())) return;
+        dreamRunning = true;
+        ctx.logger.info("[dsh-iwiw-memory] dream: idle threshold reached, running consolidation");
+        tools.dream()
+          .then((r: any) => {
+            const d = (r && typeof r === "object") ? r as Record<string, any> : {};
+            ctx.logger.info(
+              `[dsh-iwiw-memory] dream done: reviewed=${d.reviewed ?? 0} auto_fixed=${d.auto_fixed?.length ?? 0}`
+              + ` pending=${d.pending?.length ?? 0} suggestions=${d.suggestions?.length ?? 0}`
+              + (d.error ? ` error=${d.error}` : ""),
+            );
+          })
+          .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] dream failed", e))
+          .finally(() => {
+            dreamRunning = false;
+            // 重置活动时间戳：下一轮 dream 需重新积累完整空闲期
+            lastActivityAt.value = Date.now();
+          });
+      }, 10 * 60_000)
+    : null;
+
+  ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + dream scheduler");
 
   return async () => {
+    if (dreamTimer) clearInterval(dreamTimer);
     for (const d of disposers) { try { d(); } catch {} }
     await backend.close();
     ctx.logger.info("[dsh-iwiw-memory] disposed");

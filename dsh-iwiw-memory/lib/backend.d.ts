@@ -19,5 +19,6 @@ export declare class MemoryBackend {
     env?: Record<string, string> | undefined);
     ensureConnected(): Promise<void>;
     callTool(name: string, args: Record<string, unknown>): Promise<string>;
+    private _call;
     close(): Promise<void>;
 }

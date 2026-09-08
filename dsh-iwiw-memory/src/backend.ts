@@ -32,6 +32,17 @@ export class MemoryBackend {
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+    try {
+      return await this._call(name, args);
+    } catch (e) {
+      // 子进程崩溃/管道断开后 client 仍非 null，不重置会永久失败——
+      // 重置连接重试一次；重试仍失败则向上抛（调用方按工具错误处理）。
+      await this.close().catch(() => {});
+      return await this._call(name, args);
+    }
+  }
+
+  private async _call(name: string, args: Record<string, unknown>): Promise<string> {
     await this.ensureConnected();
     const result = await this.client!.callTool({ name, arguments: args });
     // content 可能是 text 块或带 format 的块；宽容提取文本

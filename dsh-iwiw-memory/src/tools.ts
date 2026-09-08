@@ -16,11 +16,29 @@ export class MemoryTools {
     return this.parse(await this.backend.callTool("memory_remember", args));
   }
 
-  async search(params: { query: string; top_k?: number }): Promise<JsonValue> {
-    return this.parse(await this.backend.callTool("search_memories", {
-      query: params.query,
-      top_k: params.top_k ?? 5,
-    }));
+  async search(params: {
+    query: string; top_k?: number;
+    session_id?: string; context?: string[]; exclude_mem_types?: string[];
+  }): Promise<JsonValue> {
+    const args: Record<string, unknown> = { query: params.query, top_k: params.top_k ?? 5 };
+    if (params.session_id) args.session_id = params.session_id;
+    if (params.context?.length) args.context = params.context;
+    if (params.exclude_mem_types?.length) args.exclude_mem_types = params.exclude_mem_types;
+    return this.parse(await this.backend.callTool("search_memories", args));
+  }
+
+  /** 命中自增（使用强化）：记忆被实际注入时调用，供维护排序。 */
+  async touch(slugs: string[]): Promise<JsonValue> {
+    if (!slugs.length) return { ok: true, touched: 0 };
+    return this.parse(await this.backend.callTool("touch_memories", { slugs }));
+  }
+
+  /** 空闲整理（dream）：低风险修正自动留痕执行，归档走审批。 */
+  async dream(sinceHours?: number, limit?: number): Promise<JsonValue> {
+    const args: Record<string, unknown> = {};
+    if (sinceHours !== undefined) args.since_hours = sinceHours;
+    if (limit !== undefined) args.limit = limit;
+    return this.parse(await this.backend.callTool("run_dream", args));
   }
 
   async read(params: { slug: string }): Promise<JsonValue> {

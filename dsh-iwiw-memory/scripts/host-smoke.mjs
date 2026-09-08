@@ -10,8 +10,19 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { apply } from "../lib/index.js";
+import { apply, isPeakTime } from "../lib/index.js";
+import { MemoryBackend } from "../lib/backend.js";
 import { computeInjectionGroups } from "../lib/client-fold.js";
+
+// B 管道捕获：截获 pre-step 发往 MCP 的 search_memories 调用参数
+const searchCalls = [];
+const origCallTool = MemoryBackend.prototype.callTool;
+MemoryBackend.prototype.callTool = async function (name, args) {
+  if (name === "search_memories" && args?.session_id !== undefined) {
+    searchCalls.push({ args: JSON.parse(JSON.stringify(args)) });
+  }
+  return origCallTool.call(this, name, args);
+};
 
 // 隔离库：显式经 config.env 传给 MCP 子进程（MCP SDK 不继承完整父进程 env）
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "iwiw-smoke-"));
@@ -144,8 +155,9 @@ sessionEvt(sessMock, { type: "compaction/end" });
 currentDecision = mkDecision("我们继续刚才的话题");
 const out4 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
 const snap4 = out4.messages.filter((m) => m.source?.kind === "plugin");
+// 补回断言：本会话注入过的记忆（哮喘）应补回；花生（profile）从不进 hit 注入，不含属预期（A 生效）
 const reinj = snap4.find((m) => m.source?.memory?.kind === "reinjection");
-const reinjOk = !!reinj && JSON.stringify(reinj).includes("哮喘") && JSON.stringify(reinj).includes("花生");
+const reinjOk = !!reinj && JSON.stringify(reinj).includes("哮喘") && !JSON.stringify(reinj).includes("花生");
 console.log("补回快照:", snap4.length, "条, kind=reinjection 且含已注入内容:", reinjOk);
 // 补回后去重重新武装：同主题再次提问应命中（释放后的重新注入）
 currentDecision = mkDecision("哮喘的诱因有哪些");
@@ -154,6 +166,69 @@ const snap5 = out5.messages.filter((m) => m.source?.kind === "plugin" && m.sourc
 console.log("补回后重新命中:", snap5.length, "条 hit 快照");
 const reinjStepOk = reinjOk;
 console.log("reinject 断言:", reinjStepOk ? "PASS" : "FAIL");
+
+// A 断言：常驻层（profile 花生过敏）不应通过 hit 注入重复（system core 段已有）；
+// 双消息 decision 同时验证 context 携带（B）
+const multiDecision = {
+  kind: "enter",
+  messages: [
+    { id: "u-prev", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "之前我们聊过哮喘的事情" }] },
+    { id: "u-cur", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "花生过敏能吃什么药" }] },
+  ],
+};
+currentDecision = multiDecision;
+const outA = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snapA = outA.messages.filter((m) => m.source?.kind === "plugin");
+const excludeOk = snapA.every((m) => !JSON.stringify(m).includes("花生"));
+console.log("A 常驻层排除:", snapA.length, "条快照, 不含 profile 重复:", excludeOk);
+
+// B 断言：search 调用携带 session_id / exclude_mem_types；多轮 decision 时携带非空 context
+const searchArgsOk = searchCalls.length > 0
+  && searchCalls.every((c) =>
+    typeof c.args.session_id === "string"
+    && Array.isArray(c.args.exclude_mem_types)
+    && c.args.exclude_mem_types.includes("profile"))
+  && searchCalls.some((c) => Array.isArray(c.args.context) && c.args.context.length > 0);
+console.log(`B 回指管道: 捕获 ${searchCalls.length} 次 search, 参数断言:`, searchArgsOk ? "PASS" : "FAIL",
+  searchCalls[0] ? JSON.stringify({ session_id: searchCalls[0].args.session_id, exclude: searchCalls[0].args.exclude_mem_types, context_len: searchCalls[0].args.context?.length }) : "");
+
+console.log("\n=== 5.7 reflect steering（独立 apply 实例，reflectTurns=2）===");
+let reflectOk = false;
+{
+  const registered2 = [];
+  const handlers2 = {};
+  const ctx2 = {
+    logger: { info: () => {}, warn: (...a) => console.log("[warn2]", ...a), error: (...a) => console.log("[error2]", ...a) },
+    tools: { register: (def) => { registered2.push(def); return () => {}; } },
+    systemPrompt: { section: () => () => {} },
+    on: (event, handler) => { (handlers2[event] ??= []).push(handler); return () => {}; },
+  };
+  const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, dreamIdleMinutes: 0 });
+  const preStep2 = (handlers2["agent/pre-step"] ?? [])[0];
+  const agent2 = { session: { header: { id: "reflect-sess", origin: "main" } } };
+  const run2 = async (text) => {
+    currentDecision = mkDecision(text);
+    return preStep2({ agent: agent2, messages: currentDecision.messages, signal }, next);
+  };
+  const s1 = await run2("问题一：今天中午吃什么好");
+  const s2 = await run2("问题二：外面天气怎么样");
+  const s3 = await run2("问题三：帮我汇总一下情况");
+  const reflectSnaps = s3.messages.filter((m) => m.source?.memory?.kind === "reflect");
+  const noEarly = !s1.messages.some((m) => m.source?.memory?.kind === "reflect")
+    && !s2.messages.some((m) => m.source?.memory?.kind === "reflect");
+  reflectOk = reflectSnaps.length === 1 && noEarly && JSON.stringify(reflectSnaps[0]).includes("memory_remember");
+  console.log("reflect 断言（前两步不触发，第三步触发）:", reflectOk ? "PASS" : "FAIL");
+  await dispose2();
+}
+
+console.log("\n=== 5.8 dream 峰时抑制（纯函数）===");
+const peakOk = isPeakTime(new Date(2026, 0, 1, 9, 0)) === true
+  && isPeakTime(new Date(2026, 0, 1, 8, 50)) === true
+  && isPeakTime(new Date(2026, 0, 1, 8, 40)) === false
+  && isPeakTime(new Date(2026, 0, 1, 13, 50)) === true
+  && isPeakTime(new Date(2026, 0, 1, 12, 30)) === false
+  && isPeakTime(new Date(2026, 0, 1, 18, 5)) === false;
+console.log("isPeakTime 断言:", peakOk ? "PASS" : "FAIL");
 
 console.log("\n=== 6. client-fold 识别断言（纯计算）===");
 const snapOf = (kind, text) => ({
@@ -217,5 +292,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(a2ok && stepOk && clientOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
-process.exit(a2ok && stepOk && clientOk ? 0 : 1);
+const allOk = a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && clientOk;
+console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
+process.exit(allOk ? 0 : 1);

@@ -19,7 +19,14 @@ export declare class MemoryTools {
     search(params: {
         query: string;
         top_k?: number;
+        session_id?: string;
+        context?: string[];
+        exclude_mem_types?: string[];
     }): Promise<JsonValue>;
+    /** 命中自增（使用强化）：记忆被实际注入时调用，供维护排序。 */
+    touch(slugs: string[]): Promise<JsonValue>;
+    /** 空闲整理（dream）：低风险修正自动留痕执行，归档走审批。 */
+    dream(sinceHours?: number, limit?: number): Promise<JsonValue>;
     read(params: {
         slug: string;
     }): Promise<JsonValue>;

@@ -10,8 +10,17 @@ interface PluginConfig {
     coreMaxChars?: number;
     /** 每消息命中注入的条数上限（默认 3）。 */
     hitTopK?: number;
+    /** 常驻层集合（模式配置，类型轴保持纯净）：这些 mem_type 全量注入；
+     *  rules 层单独包装为「准则」段。chat 模式默认 ["profile","rules"]，dev 模式建议 ["rules"]。 */
+    standingLayers?: string[];
+    /** reflect steering：连续 N 个模型步未写入记忆后注入一次性回顾提示；0 关闭（默认 7）。 */
+    reflectTurns?: number;
+    /** dream 空闲整理：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
+    dreamIdleMinutes?: number;
     /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
     env?: Record<string, string>;
 }
+/** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
+export declare function isPeakTime(d: Date): boolean;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;
 export {};
