@@ -8,6 +8,8 @@ interface PluginConfig {
     cwd?: string;
     /** core 注入段总字符预算（与内核 MEMORY_RECALL_MAX_CHARS 对齐）。 */
     coreMaxChars?: number;
+    /** 每消息命中注入的条数上限（默认 3）。 */
+    hitTopK?: number;
     /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
     env?: Record<string, string>;
 }

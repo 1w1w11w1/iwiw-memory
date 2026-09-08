@@ -92,7 +92,7 @@ export const apply = async (ctx, config = {}) => {
         ctx.logger.warn("memory backend warmup failed", e);
     }
     // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）。
-    const defs = makeDefinition(tools, () => { ctx.logger.info("[dbg] onRemember fired"); refreshCore().catch((e) => ctx.logger.warn("[dbg] refreshCore err", String(e))); });
+    const defs = makeDefinition(tools, () => { refreshCore().catch(() => { }); });
     const disposers = [
         ctx.tools.register(defs.memory_remember),
         ctx.tools.register(defs.memory_search),
@@ -107,7 +107,6 @@ export const apply = async (ctx, config = {}) => {
             // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
             const raw = (await tools.list({ priority: "core", limit: 50 }));
             const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
-            ctx.logger.info("[dbg] fetchCore list items=" + items.length);
             if (items.length === 0)
                 return "（暂无必读长期记忆）";
             let budget = coreMaxChars;
@@ -156,7 +155,68 @@ export const apply = async (ctx, config = {}) => {
         order: -50,
         text: () => cachedCore || "（core 记忆加载中…）",
     }));
-    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections");
+    // 5) 每消息命中注入（agent/pre-step）：最后一条 user 消息触发检索，
+    //    命中且未注入过的记忆以快照消息插入其前（meow 同款机制）。
+    //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回，后续实现）。
+    const hitTopK = config.hitTopK ?? 3;
+    const injectedBySession = new Map();
+    const snapshotMessage = (text, meta) => ({
+        id: crypto.randomUUID(),
+        role: "user",
+        content: [{ type: "text", text }],
+        source: {
+            kind: "plugin",
+            plugin: "dsh-iwiw-memory",
+            form: "snapshot",
+            memory: meta,
+            sections: [{ name: "相关记忆", text }],
+        },
+    });
+    disposers.push(ctx.on("agent/pre-step", async ({ agent, signal }, next) => {
+        const decision = await next();
+        if (decision === undefined || decision?.kind !== "enter" || signal?.aborted)
+            return decision;
+        if (!Array.isArray(decision.messages) || decision.messages.length === 0)
+            return decision;
+        if (agent?.session?.header?.origin === "subagent")
+            return decision;
+        const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === "user");
+        if (!lastUser)
+            return decision;
+        const text = (lastUser.content ?? [])
+            .filter((b) => b?.type === "text" && typeof b.text === "string")
+            .map((b) => b.text)
+            .join(" ")
+            .trim();
+        if (text.length < 4)
+            return decision;
+        const sid = typeof agent?.session?.header?.id === "string" ? agent.session.header.id : "default";
+        try {
+            const raw = await tools.search({ query: text, top_k: hitTopK });
+            const hits = (Array.isArray(raw) ? raw : (raw?.hits ?? []));
+            const seen = injectedBySession.get(sid) ?? new Set();
+            const fresh = hits.filter((h) => h.slug && !seen.has(h.slug));
+            if (fresh.length === 0)
+                return decision;
+            for (const h of fresh)
+                seen.add(h.slug);
+            injectedBySession.set(sid, seen);
+            const lines = ["## 相关记忆（命中）", ""];
+            for (const h of fresh) {
+                lines.push(`- **${h.slug}** (${h.priority}) — ${h.description}`);
+                lines.push(`  ${h.content}`);
+            }
+            const rewritten = [...decision.messages];
+            rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(lines.join("\n"), { kind: "hit", ids: fresh.map((h) => h.slug) }));
+            ctx.logger.info(`[dsh-iwiw-memory] hit injected: ${fresh.map((h) => h.slug).join(", ")}`);
+            return { ...decision, messages: rewritten };
+        }
+        catch (e) {
+            ctx.logger.warn("[dsh-iwiw-memory] hit injection failed", e);
+            return decision;
+        }
+    }));
+    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook");
     return async () => {
         for (const d of disposers) {
             try {

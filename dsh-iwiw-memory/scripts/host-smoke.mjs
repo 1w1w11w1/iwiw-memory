@@ -21,6 +21,7 @@ const cwd = process.env.SMOKE_CWD ?? "E:/desktop/111";
 
 const registered = [];
 const sections = [];
+const handlers = {};
 const ctx = {
   logger: {
     info: (...a) => console.log("[info]", ...a),
@@ -29,6 +30,7 @@ const ctx = {
   },
   tools: { register: (def) => { registered.push(def); return () => {}; } },
   systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
+  on: (event, handler) => { (handlers[event] ??= []).push(handler); return () => {}; },
 };
 
 console.log("=== 1. apply ===");
@@ -72,7 +74,53 @@ const recheck = await byName.memory_list.execute({ priority: "core" });
 console.log("[debug] 复检 MCP list:", JSON.stringify(recheck).slice(0, 200));
 console.log("[debug] 此刻 coreText:", JSON.stringify(coreText()).slice(0, 200));
 
-console.log("\n=== 5. dispose ===");
+console.log("\n=== 5. pre-step 每消息命中注入 ===");
+const preStep = (handlers["agent/pre-step"] ?? [])[0];
+if (!preStep) { console.log("SMOKE FAILED: no pre-step handler"); process.exit(1); }
+const mkDecision = (text) => ({
+  kind: "enter",
+  messages: [{ id: "u-" + Math.random().toString(36).slice(2), role: "user", source: { kind: "user" }, content: [{ type: "text", text }] }],
+});
+const agentMock = { session: { header: { id: "smoke-sess", origin: "main" } } };
+const signal = { aborted: false };
+// 真实 cordis 的 next() 无参返回 pipeline decision；mock 用外部变量承载
+let currentDecision;
+const next = async () => currentDecision;
+
+// 播种一条 normal 记忆（供命中）
+await byName.memory_remember.execute({
+  description: "用户有哮喘",
+  body: "用户有哮喘病史，剧烈运动或冷空气刺激易诱发，随身携带缓解药物。",
+  priority: "normal",
+});
+
+// 第一次提问：应命中哮喘记忆并插入快照消息
+currentDecision = mkDecision("我的哮喘平时要注意什么");
+const out1 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snap1 = out1.messages.filter((m) => m.source?.kind === "plugin");
+const hitAsthma = snap1.some((m) => JSON.stringify(m).includes("哮喘"));
+console.log("首次注入:", snap1.length, "条快照, 含哮喘:", hitAsthma);
+
+// 同会话二次提问（同主题）：去重后不应再注入
+currentDecision = mkDecision("哮喘发作怎么办");
+const out2 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snap2 = out2.messages.filter((m) => m.source?.kind === "plugin");
+const dedupOk = snap2.length === 0;
+console.log("二次注入（应去重为 0）:", snap2.length, "条快照");
+
+// 无关提问：不应注入
+currentDecision = mkDecision("帮我写一个 python 快速排序");
+const out3 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
+const snap3 = out3.messages.filter((m) => m.source?.kind === "plugin");
+const unrelatedOk = snap3.length === 0;
+console.log("无关提问（应 0）:", snap3.length, "条快照");
+
+const hitOk = snap1.length >= 1 && hitAsthma;
+const stepOk = hitOk && dedupOk && unrelatedOk;
+console.log("pre-step 断言:", stepOk ? "PASS" : "FAIL", JSON.stringify({ hitOk, dedupOk, unrelatedOk }));
+
+console.log("\n=== 6. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(a2ok ? "SMOKE ALL PASS" : "SMOKE FAILED");
+console.log(a2ok && stepOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
+process.exit(a2ok && stepOk ? 0 : 1);
