@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { apply } from "../lib/index.js";
+import { computeInjectionGroups } from "../lib/client-fold.js";
 
 // 隔离库：显式经 config.env 传给 MCP 子进程（MCP SDK 不继承完整父进程 env）
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "iwiw-smoke-"));
@@ -140,7 +141,32 @@ console.log("补回后重新命中:", snap5.length, "条 hit 快照");
 const reinjStepOk = reinjOk;
 console.log("reinject 断言:", reinjStepOk ? "PASS" : "FAIL");
 
-console.log("\n=== 6. dispose ===");
+console.log("\n=== 6. client-fold 识别断言（纯计算）===");
+const snapOf = (kind, text) => ({
+  kind: "context",
+  data: {
+    source: { kind: "plugin", plugin: "dsh-iwiw-memory", form: "snapshot", memory: { kind } },
+    content: [{ type: "text", text }],
+  },
+  location: { kind: "turn", turn: { turn: 1 } },
+});
+const snapshot = {
+  chat: {
+    order: ["k1", "k2", "k3", "k4"],
+    nodes: new Map([
+      ["k1", { kind: "user", data: { content: [{ type: "text", text: "我的哮喘平时要注意什么" }] } }],
+      ["k2", snapOf("hit", "## 相关记忆（命中）\n- **user-asthma** (normal) — 用户有哮喘\n  用户有哮喘病史。")],
+      ["k3", { kind: "user", data: { content: [{ type: "text", text: "我们继续刚才的话题" }] } }],
+      ["k4", snapOf("reinjection", "## 相关记忆（压缩后补回）\n- **user-asthma**\n  用户有哮喘病史。")],
+    ]),
+    locations: { getTurn: () => [] },
+  },
+};
+const groups = computeInjectionGroups(snapshot);
+const foldOk = groups.length === 2 && groups[0].kind === "hit" && groups[1].kind === "first";
+console.log("识别组:", groups.map((g) => g.id + ":" + g.kind).join(", "), "| 断言:", foldOk ? "PASS" : "FAIL");
+
+console.log("\n=== 7. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(a2ok && stepOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
