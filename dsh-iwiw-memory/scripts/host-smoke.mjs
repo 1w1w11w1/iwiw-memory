@@ -166,8 +166,42 @@ const groups = computeInjectionGroups(snapshot);
 const foldOk = groups.length === 2 && groups[0].kind === "hit" && groups[1].kind === "first";
 console.log("识别组:", groups.map((g) => g.id + ":" + g.kind).join(", "), "| 断言:", foldOk ? "PASS" : "FAIL");
 
-console.log("\n=== 7. dispose ===");
+console.log("\n=== 7. client bundle 冒烟（minimal DOM stub）===");
+let clientOk = false;
+try {
+  const client = await import("../lib/client.js");
+  // 万能 Proxy stub：任何属性访问/调用都返回自身（可无限链式）。
+  // 只用于验证 bundle 加载与 apply 主路径不抛错——DOM 行为真验证在换装阶段。
+  const universal = new Proxy(function () {}, {
+    get: (_t, prop) => {
+      if (prop === Symbol.toPrimitive) return () => "";
+      if (prop === Symbol.iterator) return function* () {};
+      if (prop === "length") return 0;
+      return universal;
+    },
+    apply: () => universal,
+    construct: () => universal,
+    set: () => true,
+  });
+  globalThis.document = universal;
+  globalThis.window = universal;
+  globalThis.MutationObserver = universal;
+  const slots = {
+    inject: (name, factory) => { factory(); return () => {}; },
+    register: () => ({}),
+  };
+  const clientCtx = { slots, sessions: {} };
+  const clientDispose = client.apply(clientCtx);
+  console.log("client.apply 执行 OK, dispose 可调:", typeof clientDispose === "function");
+  await clientDispose();
+  clientOk = true;
+} catch (e) {
+  console.log("client 冒烟失败:", String(e).slice(0, 200));
+}
+console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
+
+console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(a2ok && stepOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
-process.exit(a2ok && stepOk ? 0 : 1);
+console.log(a2ok && stepOk && clientOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
+process.exit(a2ok && stepOk && clientOk ? 0 : 1);

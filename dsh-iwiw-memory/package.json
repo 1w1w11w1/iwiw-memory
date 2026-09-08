@@ -5,9 +5,23 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "lib"
   ],
+  "scripts": {
+    "build": "tsc && node build.mjs",
+    "build:client": "node build.mjs"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -23,6 +37,8 @@
     "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
     "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
     "@types/node": "^26.4.1",
+    "esbuild": "^0.28.2",
+    "react": "^18.3.1",
     "typescript": "^5.5.0"
   }
 }

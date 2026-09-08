@@ -12,5 +12,15 @@
   },
   "include": [
     "src"
+  ],
+  "exclude": [
+    "src/client.ts",
+    "src/client-fold.ts",
+    "src/client-delegate-vanish.ts",
+    "src/client-delegate-notice.ts",
+    "src/client-dream-events.ts",
+    "src/client-dream-icon.ts",
+    "src/client-dream-skip.ts",
+    "src/settings-page.ts"
   ]
 }
