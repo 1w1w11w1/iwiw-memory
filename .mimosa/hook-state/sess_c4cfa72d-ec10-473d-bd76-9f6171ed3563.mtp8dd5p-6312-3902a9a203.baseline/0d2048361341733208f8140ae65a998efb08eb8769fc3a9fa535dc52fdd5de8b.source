@@ -1,5 +1,0 @@
-/** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆 / 自动学习 / 自动反省。 */
-export const name = "dsh-iwiw-memory";
-export const apply = (ctx) => {
-    ctx.logger.info("[dsh-iwiw-memory] 记忆插件已加载");
-};

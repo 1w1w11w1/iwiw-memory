@@ -14,3 +14,7 @@ __pycache__/
 *.db
 .DS_Store
 Thumbs.db
+.dsh-meow/
+.mimosa/
+*.egg-info/
+node_modules/
