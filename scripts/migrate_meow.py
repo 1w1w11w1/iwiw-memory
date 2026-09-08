@@ -40,10 +40,22 @@ def make_content(row):
     return body
 
 
+# v3 分类映射（mem_type 五层 × 生命周期二态）：meow 的七层标签归入 v3；
+# topic（事件脉络叙事）归 project，metadata 保留 meow_level 可追溯；
+# soul 当前为空集，兜底归 profile。priority 一律 active（生命周期不再表达重要性）。
+TYPE_MAP = {
+    "user": "profile",
+    "soul": "profile",
+    "rules": "rules",
+    "lesson": "lesson",
+    "fact": "fact",
+    "project": "project",
+    "topic": "project",
+}
+
+
 def map_type_level(level):
-    mem_type = {"project": "project", "lesson": "feedback"}.get(level, "user")
-    priority = "core" if level in ("rules", "user") else "normal"
-    return mem_type, priority
+    return TYPE_MAP.get(level, "fact"), "active"
 
 
 def main():

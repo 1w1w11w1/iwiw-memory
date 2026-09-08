@@ -29,16 +29,16 @@ from memory_agent.config import MEMORY_RECALL_MAX_CHARS
 from tests._conversation_data import build_conversation
 
 
-# ── 播种记忆（模拟提取产物：core + normal 混合）──
+# ── 播种记忆（模拟写入产物：常驻层 profile + 检索层 fact 混合）──
 SEED_MEMORIES = [
-    ("health-asthma", "core", "哮喘病史", "用户有哮喘，避免剧烈运动，随身携带吸入剂。"),
-    ("work-python", "core", "职业", "用户是软件工程师，主用 Python 做后端。"),
-    ("hobby-piano", "normal", "学钢琴", "用户每周三晚上七点上钢琴课，老师姓陈，学了一年。"),
-    ("plan-marathon", "normal", "跑步计划", "用户计划三个月后参加半程马拉松，目前每周跑三次五公里。"),
-    ("relation-brother", "normal", "弟弟", "用户弟弟在上海同济读建筑，明年毕业。"),
-    ("food-spicy", "normal", "饮食习惯", "用户爱吃辣，但肠胃敏感，吃多会胃疼。"),
-    ("study-german", "normal", "学德语", "用户最近开始学德语，目标明年去柏林出差能日常交流。"),
-    ("ref-feedback", "feedback", "交流偏好", "用户不喜欢长篇大论，希望直接给结论。"),
+    ("health-asthma", "profile", "哮喘病史", "用户有哮喘，避免剧烈运动，随身携带吸入剂。"),
+    ("work-python", "profile", "职业", "用户是软件工程师，主用 Python 做后端。"),
+    ("hobby-piano", "fact", "学钢琴", "用户每周三晚上七点上钢琴课，老师姓陈，学了一年。"),
+    ("plan-marathon", "fact", "跑步计划", "用户计划三个月后参加半程马拉松，目前每周跑三次五公里。"),
+    ("relation-brother", "fact", "弟弟", "用户弟弟在上海同济读建筑，明年毕业。"),
+    ("food-spicy", "fact", "饮食习惯", "用户爱吃辣，但肠胃敏感，吃多会胃疼。"),
+    ("study-german", "fact", "学德语", "用户最近开始学德语，目标明年去柏林出差能日常交流。"),
+    ("ref-feedback", "fact", "交流偏好", "用户不喜欢长篇大论，希望直接给结论。"),
 ]
 
 class IsolatedMemoryDb:
@@ -62,11 +62,11 @@ def main() -> int:
     print(f"对话规模: {len(conversation)} 轮, {total_chars} 字符")
 
     with IsolatedMemoryDb():
-        for slug, priority, desc, content in SEED_MEMORIES:
-            memory_db.upsert_memory(slug=slug, description=desc, content=content, priority=priority, mem_type="user")
+        for slug, mem_type, desc, content in SEED_MEMORIES:
+            memory_db.upsert_memory(slug=slug, description=desc, content=content, mem_type=mem_type)
 
         always_load = _always_load_text()
-        print(f"常驻注入(core): {len(always_load)} 字符")
+        print(f"常驻注入(standing): {len(always_load)} 字符")
 
         history: list[dict[str, str]] = []
         state_injected: dict[str, int] = {}   # slug -> turn（窗口去重）
@@ -84,7 +84,11 @@ def main() -> int:
         for _i, _t in enumerate(conversation):
             if _t.get("topic"):
                 last_discussed[_t["topic"]] = _i
-        core_slugs = {m["slug"] for m in memory_db.list_memories(priority="core")}
+        from memory_agent.config import STANDING_LAYERS
+        core_slugs = {
+            m["slug"] for layer in STANDING_LAYERS
+            for m in memory_db.list_memories(priority="active", mem_type=layer)
+        }
         from memory_agent.query_builder import extract_topic_grams, filter_topic_words
         from memory_agent.chat import CHAT_CONTEXT_TURNS
 

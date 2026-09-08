@@ -42,7 +42,7 @@ async def review_maintenance(limit: int = 20, timeout: float = 20.0) -> dict[str
         return {"reviewed": 0, "pending": [], "error": None}
 
     catalog = "\n".join(
-        "- {} ({}) -- {}".format(m["slug"], m.get("priority", "normal"), m.get("description", ""))
+        "- {} ({}) -- {}".format(m["slug"], m.get("priority", "active"), m.get("description", ""))
         for m in candidates[:15]
     )
 

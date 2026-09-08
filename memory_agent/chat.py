@@ -4,7 +4,7 @@ chat.py — 记忆系统 CLI 工作台（独立 chat 功能）
 用法：python -m memory_agent.chat
 
 能力：
-- 对话：LLM 回复，启动时注入 core（必须载入）记忆全文，
+- 对话：LLM 回复，启动时注入常驻层（STANDING_LAYERS）记忆全文，
   每轮按话题联想相关记忆注入上下文。
 - 记忆工具：模型可在对话中自主调用记忆工具（记住/检索/读取/项目全景）。
 - 命令：
@@ -45,6 +45,7 @@ from .config import (
     CHAT_RECALL_TOP_K,
     CHAT_MAX_REPLY_TOKENS,
     LLM_MODEL,
+    STANDING_LAYERS,
     TOOL_MAX_TOKENS,
     TOOL_TEMPERATURE,
     TOOL_TIMEOUT,
@@ -74,7 +75,7 @@ from .llm import stream_text, complete_with_tools, LLMConfigurationError
 BASE_SYSTEM_PROMPT = """你是一个「记忆工作台」里的对话助手，服务于一个拥有长期记忆系统的个人用户。
 
 规则：
-1. 记忆分级（三值）：core 必须载入（启动注入）；normal 按话题检索注入；archive 为归档状态。
+1. 记忆分类：类型五层（profile/fact/lesson/rules/project）× 生命周期（active/archived）；profile 与 rules 常驻注入，其余按话题检索召回。
 2. 回复中如涉及记忆内容，直接自然引用，不要提及内部机制（如 slug、检索分数）。
 3. 你可以在回复前自主调用记忆工具：
    - 出现值得长期保存的稳定事实（身份、偏好、决策、健康、关系、计划）时调用 memory_remember；
@@ -106,30 +107,49 @@ async def _execute_memory_tool(tc: dict[str, Any]) -> tuple[dict[str, str], str]
 
 
 def _always_load_text() -> str:
-    """组装必须载入（core）记忆全文（启动时注入系统提示）。
+    """组装常驻记忆全文（STANDING_LAYERS 各层，启动时注入系统提示）。
 
-    受 MEMORY_RECALL_MAX_CHARS 字符预算约束：超出按记录截断，
-    避免常驻层无限膨胀（上下文预算管理，见 docs/context-management.md）。
+    按层分节：profile 等身份层进「长期记忆」；rules 层进「准则」
+    （准则的"严格遵守"包装是行为生效的关键）。受 MEMORY_RECALL_MAX_CHARS
+    字符预算约束：超出按记录截断，避免常驻层无限膨胀。
     """
-    core = list_memories(priority="core")
-    if not core:
-        return ""
     from .config import MEMORY_RECALL_MAX_CHARS
-    lines = ["## 长期记忆（core，必须载入）"]
+    memory_lines: list[str] = []
+    rule_lines: list[str] = []
     budget = MEMORY_RECALL_MAX_CHARS
-    for mem in core:
-        header = f"- **{mem['slug']}** ({mem['mem_type']}) — {mem.get('description', '')}"
-        body = mem.get("content", "")
-        if len(body) > budget:
-            body = body[:budget] + "..."
-            budget = 0
+
+    def _collect(target: list[str], mems: list[dict]) -> None:
+        nonlocal budget
+        for mem in mems:
+            header = f"- **{mem['slug']}** ({mem['mem_type']}) — {mem.get('description', '')}"
+            body = mem.get("content", "")
+            if len(body) > budget:
+                body = body[:budget] + "..."
+                budget = 0
+            else:
+                budget -= len(body)
+            if budget < 0:
+                break
+            target.append(header)
+            target.append(f"  {body}")
+
+    for layer in STANDING_LAYERS:
+        mems = list_memories(priority="active", mem_type=layer)
+        if layer == "rules":
+            _collect(rule_lines, mems)
         else:
-            budget -= len(body)
-        if budget < 0:
-            break
-        lines.append(header)
-        lines.append(f"  {body}")
-    return "\n".join(lines)
+            _collect(memory_lines, mems)
+
+    sections: list[str] = []
+    if memory_lines:
+        sections.append("\n".join(["## 长期记忆（常驻）", *memory_lines]))
+    if rule_lines:
+        sections.append("\n".join([
+            "## 准则（用户要求持续遵守）",
+            "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
+            *rule_lines,
+        ]))
+    return "\n\n".join(sections)
 
 
 def _related_text(
@@ -257,7 +277,7 @@ async def _handle_command(cmd: str, rest: str, state: dict[str, Any]) -> bool:
                 return True
             result = replace_memory_result(
                 slug=slug, description=mem.get("description", ""), body=body,
-                mem_type=mem.get("mem_type", "user"), priority=mem.get("priority", "normal"),
+                mem_type=mem.get("mem_type", "profile"), priority=mem.get("priority", "active"),
                 event_date=mem.get("event_date"), reason="chat edit", audit_action="chat_edit",
             )
             print(_fmt_result(result))
@@ -392,9 +412,13 @@ async def run() -> None:
         if always_load:
             system += "\n\n" + always_load
             if ECHO_STATE:
-                print("[core 注入] " + ", ".join(m["slug"] for m in list_memories(priority="core")))
+                print("[standing 注入] " + ", ".join(
+                    m["slug"] for layer in STANDING_LAYERS for m in list_memories(priority="active", mem_type=layer)
+                ))
         session.build_word_index(list_memories())
-        core_slugs = {m["slug"] for m in list_memories(priority="core")}
+        core_slugs = {
+            m["slug"] for layer in STANDING_LAYERS for m in list_memories(priority="active", mem_type=layer)
+        }
         # 窗口内去重：只排除"最近 W 轮内注入过"的记忆（已滑出窗口的允许重新联想）
         state["_turn"] = int(state.get("_turn", 0)) + 1
         # 注入只进 system（每轮重建），不驻留上下文；窗口仅防高频重复（话题通常连续几轮）

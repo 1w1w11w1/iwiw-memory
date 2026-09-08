@@ -23,13 +23,6 @@ DEFAULT_WEIGHTS = {
     "bm25": 0.6,      # FTS 词面命中
     "state": 0.4,     # 会话状态候选（回指联想）
     "time": 0.15,     # 时间衰减
-    "priority": 0.15,  # Priority 加权
-}
-
-PRIORITY_BOOST = {
-    "core": 1.2,
-    "normal": 1.0,
-    "archive": 0.8,
 }
 
 TIME_HALF_LIFE_DAYS = 90  # 90 天半衰期
@@ -108,7 +101,8 @@ def search_memories(
     if not scores:
         return []
 
-    # ── Stage 3：时间衰减 × 优先级 → 排序 → 阈值过滤 ──
+    # ── Stage 3：时间衰减 → 排序 → 阈值过滤（单因子：排序不按重要程度标签，
+    #  召回交给场景相关性；常驻性由 mem_type=profile/rules 的全量注入承担）──
     scored: list[tuple[float, dict[str, Any]]] = []
     for slug, base in scores.items():
         mem = get_memory(slug)
@@ -116,14 +110,12 @@ def search_memories(
             continue
         td = _time_decay(mem.get("updated_at"))
         time_factor = 1.0 - w["time"] + w["time"] * td
-        p_boost = PRIORITY_BOOST.get(mem.get("priority", "normal"), 1.0)
-        priority_factor = 1.0 + (p_boost - 1.0) * w["priority"]
-        final_score = base * time_factor * priority_factor
+        final_score = base * time_factor
         scored.append((final_score, {
             "slug": slug,
             "description": mem.get("description", ""),
-            "priority": mem.get("priority", "normal"),
-            "mem_type": mem.get("mem_type", "user"),
+            "priority": mem.get("priority", "active"),
+            "mem_type": mem.get("mem_type", "profile"),
             "content": mem.get("content", "")[:500],
             "recorded_date": mem.get("recorded_date", ""),
             "score": round(final_score, 4),

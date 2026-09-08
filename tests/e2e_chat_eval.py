@@ -58,16 +58,6 @@ def db_count(db_path):
         conn.close()
 
 
-def db_rows(db_path):
-    import sqlite3
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        return [dict(r) for r in conn.execute('SELECT slug, priority, content FROM memories')]
-    finally:
-        conn.close()
-
-
 def injected_per_turn(stdout):
     """从 [联想注入] 锚点行提取每轮注入的 slug 列表。"""
     out = []
@@ -86,7 +76,7 @@ def stats_counts(stdout):
 
 def sc_trigger_coverage():
     """E2E-01 工具写入闭环：自然事实句由模型自主调用记忆工具写入（选择性记忆，至少一条），
-    且随后的相关提问能让写入的记忆回流注入层（[core 注入] 或 [联想注入]，A2 一致性）。"""
+    且随后的相关提问能让写入的记忆回流注入层（[standing 注入] 或 [联想注入]，A2 一致性）。"""
     facts = [
         '我对芒果过敏',
         '我把烟戒了',
@@ -108,7 +98,8 @@ def sc_trigger_coverage():
             checks.append({'fact': f, 'count_after': got, 'written': got > 0})
         tool_used = '[记忆工具]' in out
         written = bool(counts) and counts[-1] >= 1
-        inj_lines = [l for l in out.splitlines() if l.startswith('[core 注入]') or l.startswith('[联想注入]')]
+        # 注入 echo 与 "你> " 提示符同行交错（CLI 时序），必须子串匹配而非行首匹配
+        inj_lines = [l for l in out.splitlines() if '[standing 注入]' in l or '[联想注入]' in l]
         injected_back = len(inj_lines) >= 1
         return {
             'name': 'trigger_coverage',
@@ -138,7 +129,7 @@ def sc_inject_relevance():
         now = datetime.now().isoformat(timespec='seconds')
         conn.execute(
             'INSERT INTO memories (id, slug, description, content, mem_type, priority, recorded_date, content_hash, created_at, updated_at, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            ('seed-1', 'user-piano-lesson', '学钢琴', '用户每周三晚上七点上钢琴课，老师姓陈。', 'user', 'normal', now, 'x', now, now, '{}'),
+            ('seed-1', 'user-piano-lesson', '学钢琴', '用户每周三晚上七点上钢琴课，老师姓陈。', 'fact', 'active', now, 'x', now, now, '{}'),
         )
         conn.commit()
         conn.close()

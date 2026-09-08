@@ -71,14 +71,15 @@ async def list_tools() -> list[Tool]:
             {
                 "description": {"type": "string", "description": "一句话描述"},
                 "body": {"type": "string", "description": "完整正文（整体替换，不是追加）"},
+                "level": {"type": "string", "description": "profile|fact|lesson|rules|project，默认 fact；profile 与 rules 类将全量注入每轮"},
                 "slug": {"type": "string", "description": "可选。更新已有记忆时填其 slug；新建可自动生成"},
-                "priority": {"type": "string", "description": "core|normal|archive，默认 normal"},
+                "priority": {"type": "string", "description": "active|archived，默认 active"},
             },
             ["description", "body"],
         ),
         _tool(
             "search_memories",
-            "搜索记忆库（确定性：FTS5 关键词 + 同义词扩展 + 会话状态联想 + 时间衰减 + Priority 加权）。",
+            "搜索记忆库（确定性：FTS5 关键词 + 同义词扩展 + 会话状态联想 + 时间衰减）。",
             {
                 "query": {"type": "string", "description": "搜索查询"},
                 "top_k": {"type": "integer", "description": "返回结果数（默认 10）"},
@@ -87,7 +88,7 @@ async def list_tools() -> list[Tool]:
         ),
         _tool(
             "list_memories",
-            "列出记忆，支持按 priority（core/normal/archive）或 mem_type（user/feedback/project/reference）过滤。",
+            "列出记忆，支持按 priority（active/archived）或 mem_type（profile/fact/lesson/rules/project）过滤。",
             {
                 "priority": {"type": "string"},
                 "mem_type": {"type": "string"},
@@ -120,7 +121,7 @@ async def list_tools() -> list[Tool]:
         ),
         _tool(
             "memory_archive",
-            "归档一条记忆（priority → archive，保留内容与历史）。",
+            "归档一条记忆（priority → archived，保留内容与历史）。",
             {"slug": {"type": "string"}},
             ["slug"],
         ),
@@ -157,7 +158,7 @@ async def list_tools() -> list[Tool]:
         ),
         _tool(
             "pending_actions",
-            "列出待确认的记忆维护动作（archive/delete/downgrade 候选）。",
+            "列出待确认的记忆维护动作（archive/delete 候选）。",
             {"status": {"type": "string", "description": "pending/approved/rejected/executed，默认 pending"}},
         ),
         _tool(
@@ -174,7 +175,7 @@ async def list_tools() -> list[Tool]:
         ),
         _tool(
             "maintenance_review",
-            "审查记忆维护候选（访问最少、更新最早的 normal），生成归档待确认动作（不自动执行）。",
+            "审查记忆维护候选（访问最少、更新最早的 active），生成归档待确认动作（不自动执行）。",
             {"limit": {"type": "integer", "description": "候选数量，默认 20"}},
         ),
     ]
@@ -194,7 +195,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return ok([
             {
                 "slug": r["slug"], "description": r.get("description", ""),
-                "priority": r.get("priority", "normal"), "mem_type": r.get("mem_type", "user"),
+                "priority": r.get("priority", "active"), "mem_type": r.get("mem_type", "profile"),
                 "score": r.get("score", 0), "content": r.get("content", "")[:300],
             }
             for r in results
@@ -208,7 +209,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return ok([
             {
                 "slug": m["slug"], "description": m.get("description", ""),
-                "priority": m.get("priority", "normal"), "mem_type": m.get("mem_type", "user"),
+                "priority": m.get("priority", "active"), "mem_type": m.get("mem_type", "profile"),
                 "updated_at": m.get("updated_at", ""),
             }
             for m in mems
@@ -226,7 +227,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "memory_update":
         r = replace_memory_result(
             slug=arguments["slug"], description=arguments["description"], body=arguments["body"],
-            mem_type=arguments.get("mem_type", "user"), priority=arguments.get("priority", "normal"),
+            mem_type=arguments.get("mem_type", "profile"), priority=arguments.get("priority", "active"),
             event_date=arguments.get("event_date"),
             reason="mcp update", audit_action="mcp_update",
         )

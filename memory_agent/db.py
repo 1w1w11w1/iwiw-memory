@@ -30,10 +30,10 @@ CREATE TABLE IF NOT EXISTS memories (
     slug            TEXT UNIQUE NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
     content         TEXT NOT NULL,
-    mem_type        TEXT NOT NULL DEFAULT 'user'
-                    CHECK(mem_type IN ('user','feedback','project','reference')),
-    priority        TEXT NOT NULL DEFAULT 'normal'
-                    CHECK(priority IN ('core','normal','archive')),
+    mem_type        TEXT NOT NULL DEFAULT 'fact'
+                    CHECK(mem_type IN ('profile','fact','lesson','rules','project')),
+    priority        TEXT NOT NULL DEFAULT 'active'
+                    CHECK(priority IN ('active','archived')),
     event_date      TEXT,
     recorded_date   TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS memory_pending_actions (
     session_id      TEXT,
     cycle_no        INTEGER,
     action          TEXT NOT NULL
-                    CHECK(action IN ('archive','merge','delete','downgrade')),
+                    CHECK(action IN ('archive','merge','delete')),
     target_memory_id TEXT,
     source_memory_ids TEXT,
     reason          TEXT,
@@ -68,8 +68,8 @@ CREATE TABLE IF NOT EXISTS memory_versions (
     slug            TEXT NOT NULL,
     content         TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
-    mem_type        TEXT NOT NULL DEFAULT 'user',
-    priority        TEXT NOT NULL DEFAULT 'normal',
+    mem_type        TEXT NOT NULL DEFAULT 'fact',
+    priority        TEXT NOT NULL DEFAULT 'active',
     event_date      TEXT,
     saved_at        TEXT NOT NULL,
     reason          TEXT NOT NULL DEFAULT ''
@@ -134,6 +134,52 @@ def _ensure_data_dir() -> None:
     MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _migrate_classify(conn: sqlite3.Connection) -> None:
+    """分类体系 v3 幂等迁移（用户 2026-09-08 拍板：废除重要程度分类，全标签化）。
+
+    - mem_type 五层：profile（身份画像，全量注入）/ fact / lesson / rules / project
+    - priority 降为生命周期二态：active（在役，可被检索/注入）/ archived（归档留痕）
+    - 旧值映射：v1 user→profile、feedback→lesson、reference→fact；v2 直通
+      priority：core/standing/normal/important→active，archive→archived
+    重建表后 FTS rowid 映射失效，由 rebuild 修复；触发器随旧表删除后重建。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+    ).fetchone()
+    if row is None:
+        return  # 空库：首次建表直接走新 SCHEMA
+    if "'archived'" in (row[0] or ""):
+        return  # 已是 v3（CHECK 含 archived 值）
+    conn.executescript("ALTER TABLE memories RENAME TO memories_old;")
+    conn.executescript(SCHEMA)
+    # mem_type 映射：v1 feedback→lesson、reference→fact；v2 直通；user/fact/lesson/rules/project 直通
+    mem_type_expr = (
+        "CASE mem_type WHEN 'user' THEN 'profile' WHEN 'feedback' THEN 'lesson' WHEN 'reference' THEN 'fact' ELSE mem_type END"
+    )
+    # priority 映射：v1/v2 的 core/standing/normal/important → active，archive → archived
+    status_expr = (
+        "CASE priority WHEN 'archive' THEN 'archived' ELSE 'active' END"
+    )
+    conn.execute(
+        f"""
+        INSERT INTO memories (
+            id, slug, description, content, mem_type, priority,
+            event_date, recorded_date, content_hash, access_count, last_access_at,
+            created_at, updated_at, metadata
+        )
+        SELECT
+            id, slug, description, content, {mem_type_expr}, {status_expr},
+            event_date, recorded_date, content_hash, access_count, last_access_at,
+            created_at, updated_at, metadata
+        FROM memories_old
+        """
+    )
+    conn.execute("DROP TABLE memories_old")
+    # external-content FTS：rowid 映射随表重建失效，全量重建索引
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+    conn.commit()
+
+
 def connect() -> sqlite3.Connection:
     """
     获取或创建到 data/memory.db 的连接（单一真源）。
@@ -160,8 +206,9 @@ def connect() -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.commit()
 
-    # 幂等迁移：三级分级（旧数据 important → core，两者都是必须载入）
-    conn.execute("UPDATE memories SET priority = 'core' WHERE priority = 'important'")
+    # 幂等迁移：分类体系 v3（用户拍板废除重要程度分类，全标签化：profile/fact/lesson/rules/project × active/archived）
+    # 旧值映射见 _migrate_classify
+    _migrate_classify(conn)
     # 幂等清理：旧库残留的向量表（去向量化）
     conn.execute("DROP TABLE IF EXISTS memory_chunks")
     try:
@@ -225,15 +272,18 @@ class MemoryMutationResult:
 
 
 def _valid_priority(p: str) -> str:
-    # 三值分级：core=必须载入 / normal=按需载入 / archive=归档状态
-    # 旧数据中的 'important' 兼容映射为 'core'（两者都是必须载入）
-    if p == "important":
-        return "core"
-    return p if p in {"core", "normal", "archive"} else "normal"
+    # 生命周期二态：active=在役（可被检索/注入）/ archived=归档（留痕可回滚）
+    # 旧值兼容映射：core/standing/normal/important → active，archive → archived
+    p = {"core": "active", "standing": "active", "normal": "active",
+         "important": "active", "archive": "archived"}.get(p, p)
+    return p if p in {"active", "archived"} else "active"
 
 
 def _valid_type(t: str) -> str:
-    return t if t in {"user", "feedback", "project", "reference"} else "user"
+    # 类型五层：profile=身份画像（模式常驻）/ fact=事实 / lesson=教训 / rules=准则 / project=项目
+    # 旧值兼容映射：user → profile，feedback → lesson，reference → fact
+    t = {"feedback": "lesson", "reference": "fact", "user": "profile"}.get(t, t)
+    return t if t in {"profile", "fact", "lesson", "rules", "project"} else "fact"
 
 
 def upsert_memory(
@@ -241,8 +291,8 @@ def upsert_memory(
     slug: str,
     description: str,
     content: str,
-    mem_type: str = "user",
-    priority: str = "normal",
+    mem_type: str = "fact",
+    priority: str = "active",
     event_date: str | None = None,
     content_hash: str = "",
     metadata: dict[str, Any] | None = None,
@@ -403,78 +453,6 @@ def delete_memory_result(
         return MemoryMutationResult(False, audit_action, slug, error=str(exc))
 
 
-def save_memory_candidate(candidate: dict[str, Any]) -> tuple[str, str] | None:
-    """
-    保存 LLM 返回的一条记忆维护动作到 SQLite。
-
-    支持动作：create / update / archive / merge / ignore。
-    - create  : 新建记忆（content 为完整正文）。
-    - update  : 全文替换目标记忆（content 必须是更新后的完整正文，
-                不再使用追加语义，避免正文无限膨胀）。
-    - archive : 归档目标记忆（priority → archive）。
-    - merge   : 将 content 全文替换进 target_slug，可选归档 source_slug。
-
-    所有动作都走带版本快照 + 审计的 mutation 入口；
-    失败记录日志并返回 None（调用方不应把 None 当作成功）。
-
-    Returns:
-        (action, slug) 或 None（跳过/失败）
-    """
-    action = (candidate.get("action") or "create").strip().lower()
-    if action == "ignore":
-        return None
-
-    slug = (candidate.get("target_slug") or candidate.get("slug") or "memory").strip()
-    content = candidate.get("content") or ""
-    description = candidate.get("description") or ""
-    mem_type = candidate.get("mem_type") or "user"
-    priority = candidate.get("priority") or "normal"
-    event_date = candidate.get("event_date")
-
-    try:
-        if action == "archive":
-            result = archive_memory_result(slug, reason=candidate.get("reason") or "extract archive")
-            return ("archive", slug) if result.ok else None
-
-        if action == "merge":
-            if not content:
-                return None
-            result = replace_memory_result(
-                slug=slug, description=description, body=content,
-                mem_type=mem_type, priority=priority, event_date=event_date,
-                reason="merge from extraction", audit_action="extract_merge",
-            )
-            if not result.ok:
-                return None
-            source = candidate.get("source_slug")
-            if source and source != slug:
-                archive_memory_result(source, reason=f"merged into {slug}")
-            return ("merge", slug)
-
-        # create / update：先尝试替换（slug 已存在），不存在则创建
-        # _recorded_date：提取方显式指定的记录日期（如 LoCoMo session 日期），用于时间锚定
-        recorded = candidate.get("_recorded_date") or None
-        result = replace_memory_result(
-            slug=slug, description=description, body=content,
-            mem_type=mem_type, priority=priority, event_date=event_date,
-            reason="extract write", audit_action=f"extract_{action}",
-        )
-        if result.ok:
-            return (action, slug)
-        record = upsert_memory(
-            slug=slug, description=description, content=content,
-            mem_type=mem_type, priority=priority, event_date=event_date,
-            content_hash="",
-            recorded_date=recorded,
-        )
-        return (action, record["slug"])
-    except Exception as exc:
-        logging.getLogger("memory_agent.db").warning(
-            "save_memory_candidate failed (%s %s): %s", action, slug, exc
-        )
-        return None
-
-
 def create_pending_action(
     action: str,
     target_memory_slug: str | None = None,
@@ -599,21 +577,12 @@ def approve_pending_action_result(pending_id: str) -> MemoryMutationResult:
         changed_rows = 0
         if action == 'archive':
             cur = conn.execute(
-                'UPDATE memories SET priority = "archive", updated_at = ? WHERE id = ?',
+                "UPDATE memories SET priority = 'archived', updated_at = ? WHERE id = ?",
                 (_now(), target_id),
             )
             changed_rows = cur.rowcount
         elif action == 'delete':
             cur = conn.execute('DELETE FROM memories WHERE id = ?', (target_id,))
-            changed_rows = cur.rowcount
-        elif action == 'downgrade':
-            next_priority = _valid_priority(str(details.get("priority") or "normal"))
-            if next_priority == "archive":
-                next_priority = "normal"
-            cur = conn.execute(
-                'UPDATE memories SET priority = ?, updated_at = ? WHERE id = ?',
-                (next_priority, _now(), target_id),
-            )
             changed_rows = cur.rowcount
         else:
             conn.rollback()
@@ -679,12 +648,12 @@ def reject_pending_action(pending_id: str) -> bool:
 
 
 def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
-    """获取适合维护审查的记忆候选（访问最少、更新最早的 normal）。"""
+    """获取适合维护审查的记忆候选（访问最少、更新最早的 active）。"""
     conn = connect()
     rows = conn.execute(
         """SELECT slug, description, priority, access_count, updated_at, content
             FROM memories
-            WHERE priority = 'normal'
+            WHERE priority = 'active'
             ORDER BY access_count ASC, updated_at ASC
             LIMIT ?""",
         (limit,),
@@ -882,8 +851,8 @@ def replace_memory_result(
     slug: str,
     description: str,
     body: str,
-    mem_type: str = "user",
-    priority: str = "normal",
+    mem_type: str = "fact",
+    priority: str = "active",
     event_date: str | None = None,
     reason: str = "",
     audit_action: str = "manual_edit",
@@ -947,7 +916,7 @@ def replace_memory_result(
 
 
 def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: str = "archive") -> MemoryMutationResult:
-    """设置 priority = 'archive'，并返回审计结果。"""
+    """设置 priority = 'archived'，并返回审计结果。"""
     old = get_memory(slug)
     if not old:
         return MemoryMutationResult(False, audit_action, slug, error="memory not found")
@@ -958,7 +927,7 @@ def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: s
             conn.rollback()
             return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
         cur = conn.execute(
-            "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
+            "UPDATE memories SET priority = 'archived', updated_at = ? WHERE slug = ?",
             (_now(), slug),
         )
         changed_rows = cur.rowcount
@@ -1008,8 +977,8 @@ def merge_memories_result(
     if not target or not source:
         return MemoryMutationResult(False, "merge", target_slug, error="target or source memory not found")
 
-    new_priority = _valid_priority(priority or target.get("priority", "normal"))
-    new_type = _valid_type(mem_type or target.get("mem_type", "user"))
+    new_priority = _valid_priority(priority or target.get("priority", "active"))
+    new_type = _valid_type(mem_type or target.get("mem_type", "profile"))
     conn = connect()
     now = _now()
     content_hash = _simple_hash(merged_body)
@@ -1031,7 +1000,7 @@ def merge_memories_result(
         source_rows = 0
         if archive_source:
             source_cur = conn.execute(
-                "UPDATE memories SET priority = 'archive', updated_at = ? WHERE slug = ?",
+                "UPDATE memories SET priority = 'archived', updated_at = ? WHERE slug = ?",
                 (now, source_slug),
             )
             source_rows = source_cur.rowcount
@@ -1141,8 +1110,8 @@ def restore_memory_from_history_result(slug: str, version: str, reason: str = ""
     target_slug = str(record.get("slug") or slug).strip().lower().replace(" ", "-")[:50] or "memory"
     body = record.get("content") or ""
     description = record.get("description") or ""
-    mem_type = _valid_type(record.get("mem_type") or "user")
-    priority = _valid_priority(record.get("priority") or "normal")
+    mem_type = _valid_type(record.get("mem_type") or "profile")
+    priority = _valid_priority(record.get("priority") or "active")
     event_date = record.get("event_date")
 
     if get_memory(target_slug):

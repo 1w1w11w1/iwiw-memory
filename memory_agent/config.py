@@ -86,30 +86,13 @@ TOOL_TEMPERATURE = _env_float("MEMORY_AGENT_TOOL_TEMPERATURE", 0.2)
 TOOL_TIMEOUT = _env_float("MEMORY_AGENT_TOOL_TIMEOUT", 30.0)
 TOOL_MAX_LOOPS = _env_int("MEMORY_AGENT_TOOL_MAX_LOOPS", 3)
 
-# ── 记忆分级（三值）──
-# core   = 必须载入：对话前注入上下文（身份、健康、关系、重大决策）
-# normal = 按需载入：话题触发检索（日常信息、一般偏好、阶段计划）
-# archive = 归档状态：过时/冗余后保留但降权、不参与维护候选（可回滚）
-PRIORITY_TIERS = {
-    "core": {
-        "description": "必须载入 — 对话前注入的身份/健康/关系/决策",
-        "max_chars": 800,
-        "always_load": True,
-    },
-    "normal": {
-        "description": "按需载入 — 话题触发检索的日常信息",
-        "max_chars": 5000,
-        "always_load": False,
-    },
-    "archive": {
-        "description": "归档状态 — 保留但降权，不参与常规检索与维护候选",
-        "max_chars": 10000,
-        "always_load": False,
-    },
-}
-
-# ── Hash 去重 ──
-HASH_ALGORITHM = "md5"  # 速度优先，不涉及安全场景
+# ── 常驻层（模式配置）──
+# 常驻层的记忆每轮全量注入 system（类型 × 模式的策略外置）：
+#   chat 模式（默认）: profile + rules —— 身份画像与准则每轮在场
+#   dev 模式: ["rules"] —— 身份降级为检索召回，不污染开发上下文
+# 其余层（fact/lesson/project）一律按话题检索召回。
+STANDING_LAYERS = _env("MEMORY_AGENT_STANDING_LAYERS", "profile,rules").split(",")
+STANDING_LAYERS = [s.strip() for s in STANDING_LAYERS if s.strip() in ("profile", "fact", "lesson", "rules", "project")]
 
 # ── 检索 ──
 # 分数尺度：base = Σ(FTS 命中数×bm25 权重) + 状态候选×state 权重，再乘时间/优先级因子

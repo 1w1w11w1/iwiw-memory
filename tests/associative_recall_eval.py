@@ -27,14 +27,14 @@ from memory_agent.retrieval import search_memories
 from memory_agent.query_builder import build_queries
 
 SEED_MEMORIES = [
-    ("health-asthma", "core", "哮喘病史", "用户有哮喘，避免剧烈运动，随身带药。"),
-    ("work-python", "core", "职业", "用户是软件工程师，主用 Python。"),
-    ("hobby-piano", "normal", "学钢琴", "用户每周三晚上七点上钢琴课，老师姓陈。"),
-    ("plan-marathon", "normal", "跑步计划", "用户计划三个月后参加半程马拉松，每周跑三次。"),
-    ("relation-brother", "normal", "弟弟", "用户弟弟在上海读大学，学建筑。"),
-    ("food-spicy", "normal", "饮食习惯", "用户爱吃辣，但肠胃不好，吃辣后容易胃疼。"),
-    ("study-german", "normal", "学德语", "用户最近开始学德语，目标是明年去柏林出差能日常交流。"),
-    ("ref-feedback", "feedback", "交流偏好", "用户不喜欢长篇大论的回答，希望直接给结论。"),
+    ("health-asthma", "profile", "哮喘病史", "用户有哮喘，避免剧烈运动，随身带药。"),
+    ("work-python", "profile", "职业", "用户是软件工程师，主用 Python。"),
+    ("hobby-piano", "fact", "学钢琴", "用户每周三晚上七点上钢琴课，老师姓陈。"),
+    ("plan-marathon", "fact", "跑步计划", "用户计划三个月后参加半程马拉松，每周跑三次。"),
+    ("relation-brother", "profile", "弟弟", "用户弟弟在上海读大学，学建筑。"),
+    ("food-spicy", "profile", "饮食习惯", "用户爱吃辣，但肠胃不好，吃辣后容易胃疼。"),
+    ("study-german", "fact", "学德语", "用户最近开始学德语，目标是明年去柏林出差能日常交流。"),
+    ("ref-feedback", "profile", "交流偏好", "用户不喜欢长篇大论的回答，希望直接给结论。"),
 ]
 
 
@@ -56,10 +56,10 @@ class IsolatedMemoryDb:
 
 
 def seed() -> None:
-    for slug, priority, desc, content in SEED_MEMORIES:
+    for slug, mem_type, desc, content in SEED_MEMORIES:
         memory_db.upsert_memory(
             slug=slug, description=desc, content=content,
-            priority=priority, mem_type="user",
+            mem_type=mem_type,
         )
 
 
