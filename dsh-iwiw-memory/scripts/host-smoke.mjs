@@ -50,7 +50,7 @@ const byName = Object.fromEntries(registered.map((d) => [d.name, d]));
 const r1 = await byName.memory_remember.execute({
   description: "用户对花生过敏",
   body: "用户对花生及花生制品过敏，误食会出现皮疹与呼吸困难。",
-  priority: "core",
+  level: "profile",
 });
 const slug = r1?.result?.slug;
 console.log("memory_remember →", JSON.stringify(r1).slice(0, 200));
@@ -61,7 +61,7 @@ console.log("memory_search →", JSON.stringify(r2).slice(0, 200));
 const r3 = await byName.memory_read.execute({ slug });
 console.log("memory_read →", JSON.stringify(r3).slice(0, 160));
 
-const r4 = await byName.memory_list.execute({ priority: "core", limit: 10 });
+const r4 = await byName.memory_list.execute({ priority: "active", limit: 10 });
 console.log("memory_list →", JSON.stringify(r4).slice(0, 200));
 
 console.log("\n=== 4. core 注入段刷新验证（A2）===");
@@ -70,8 +70,22 @@ const refreshed = coreText();
 console.log("core 刷新后:", refreshed.slice(0, 300));
 const a2ok = refreshed.includes(slug);
 console.log("A2 写入可见:", a2ok ? "PASS" : "FAIL");
+
+console.log("\n=== 4.5 rules 准则段（双轴分类）===");
+const rRules = await byName.memory_remember.execute({
+  description: "体验优先、简洁有效的规则",
+  body: "体验感是第一目标；拒收因子堆叠，排序公式保持两因子。",
+  level: "rules",
+});
+console.log("rules 写入:", JSON.stringify(rRules).slice(0, 160));
+await new Promise((res) => setTimeout(res, 600));
+const rulesSection = sections.find((sec) => sec.name === "iwiw-memory:rules");
+const rulesText = rulesSection ? (typeof rulesSection.text === "function" ? rulesSection.text() : rulesSection.text) : "";
+const rulesOk = rulesText.includes("准则") && rulesText.includes("因子堆叠");
+console.log("rules 段文本:", JSON.stringify(rulesText.slice(0, 160)));
+console.log("rules 注入断言:", rulesOk ? "PASS" : "FAIL");
 // 判别调试：MCP 数据 vs 缓存链路
-const recheck = await byName.memory_list.execute({ priority: "core" });
+const recheck = await byName.memory_list.execute({ priority: "active" });
 console.log("[debug] 复检 MCP list:", JSON.stringify(recheck).slice(0, 200));
 console.log("[debug] 此刻 coreText:", JSON.stringify(coreText()).slice(0, 200));
 
@@ -92,7 +106,7 @@ const next = async () => currentDecision;
 await byName.memory_remember.execute({
   description: "用户有哮喘",
   body: "用户有哮喘病史，剧烈运动或冷空气刺激易诱发，随身携带缓解药物。",
-  priority: "normal",
+  priority: "active",
 });
 
 // 第一次提问：应命中哮喘记忆并插入快照消息
@@ -110,7 +124,7 @@ const dedupOk = snap2.length === 0;
 console.log("二次注入（应去重为 0）:", snap2.length, "条快照");
 
 // 无关提问：不应注入
-currentDecision = mkDecision("帮我写一个 python 快速排序");
+currentDecision = mkDecision("今天天气怎么样");
 const out3 = await preStep({ agent: agentMock, messages: currentDecision.messages, signal }, next);
 const snap3 = out3.messages.filter((m) => m.source?.kind === "plugin");
 const unrelatedOk = snap3.length === 0;

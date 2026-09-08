@@ -11,12 +11,13 @@ function makeDefinition(tools, onRemember) {
     return {
         memory_remember: defineTool({
             name: "memory_remember",
-            description: "把值得长期保存的稳定事实写入记忆（身份、偏好、决策、健康、关系、计划）。写入即全文替换；新建前先 memory_search 查重。",
+            description: "把值得长期保存的稳定信息写入记忆，按内容类型选 level。写入即全文替换；新建前先 memory_search 查重。",
             parameters: {
                 description: { type: "string", required: true, description: "一句话描述" },
                 body: { type: "string", required: true, description: "完整正文（整体替换旧内容，不是追加）" },
+                level: { type: "string", description: "记忆类型：profile=用户身份画像/健康/偏好；fact=一般事实（默认）；lesson=教训与经验；rules=用户要求持续遵守的准则；project=项目脉络与决策" },
                 slug: { type: "string", description: "可选。更新已有记忆时填其 slug；新建建议用简短英文连字符命名，不填则自动生成" },
-                priority: { type: "string", description: "core|normal|archive，默认 normal；身份/健康/重大决策用 core" },
+                priority: { type: "string", description: "active|archived，默认 active（在役）；archived=归档退役，一般不手动用" },
             },
             output: {
                 schema: { type: "object", additionalProperties: false, properties: { result: { type: "json" } } },
@@ -62,9 +63,10 @@ function makeDefinition(tools, onRemember) {
         }),
         memory_list: defineTool({
             name: "memory_list",
-            description: "列出记忆条目（可按 core/normal/archive 过滤）。",
+            description: "列出记忆条目（可按 active/archived 与类型过滤）。",
             parameters: {
-                priority: { type: "string", description: "core|normal|archive" },
+                priority: { type: "string", description: "active|archived" },
+                mem_type: { type: "string", description: "profile|fact|lesson|rules|project" },
                 limit: { type: "integer", description: "条数（默认 20）" },
             },
             output: {
@@ -73,7 +75,7 @@ function makeDefinition(tools, onRemember) {
             },
             async execute(args) {
                 const a = args;
-                return { items: await tools.list({ priority: a.priority, limit: a.limit ?? 20 }) };
+                return { items: await tools.list({ priority: a.priority, mem_type: a.mem_type, limit: a.limit ?? 20 }) };
             },
         }),
     };
@@ -105,7 +107,7 @@ export const apply = async (ctx, config = {}) => {
     const fetchCoreText = async () => {
         try {
             // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
-            const raw = (await tools.list({ priority: "core", limit: 50 }));
+            const raw = (await tools.list({ priority: "active", mem_type: "profile", limit: 50 }));
             const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
             if (items.length === 0)
                 return "（暂无必读长期记忆）";
@@ -129,10 +131,31 @@ export const apply = async (ctx, config = {}) => {
             return `（core 记忆拉取失败：${String(e)}）`;
         }
     };
-    // A2 一致性：core 段缓存 + 写入后异步刷新（pending 重跑，刷新期间的请求不丢失）。
+    // A2 一致性：core/rules 段缓存 + 写入后异步刷新（pending 重跑，刷新期间的请求不丢失）。
     let cachedCore = "";
+    let cachedRules = "";
     let refreshing = false;
     let pending = false;
+    const fetchRulesText = async () => {
+        // rules 类准则全量注入（archived 退役不注入）
+        try {
+            const raw = (await tools.list({ priority: "active", mem_type: "rules", limit: 50 }));
+            const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
+            if (items.length === 0)
+                return "";
+            const lines = [];
+            for (const it of items) {
+                const mem = (await tools.read({ slug: it.slug }));
+                if (mem?.content)
+                    lines.push(`- ${mem.content}`);
+            }
+            return lines.length > 0 ? lines.join("\n") : "";
+        }
+        catch (e) {
+            ctx.logger.warn("fetch rules failed", e);
+            return "";
+        }
+    };
     const refreshCore = async () => {
         if (refreshing) {
             pending = true;
@@ -143,6 +166,7 @@ export const apply = async (ctx, config = {}) => {
             do {
                 pending = false;
                 cachedCore = await fetchCoreText();
+                cachedRules = await fetchRulesText();
             } while (pending);
         }
         finally {
@@ -154,6 +178,22 @@ export const apply = async (ctx, config = {}) => {
         name: MEMORY_SECTION_NAME,
         order: -50,
         text: () => cachedCore || "（core 记忆加载中…）",
+    }));
+    // rules 准则段：用户要求持续遵守的准则每轮生效（meow rules 层验证过的机制）
+    disposers.push(ctx.systemPrompt.section({
+        name: "iwiw-memory:rules",
+        order: -45,
+        text: () => {
+            if (!cachedRules)
+                return "";
+            return [
+                "## 准则（用户要求持续遵守）",
+                "",
+                "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
+                "",
+                cachedRules,
+            ].join("\n");
+        },
     }));
     // 5) 每消息命中注入（agent/pre-step）：最后一条 user 消息触发检索，
     //    命中且未注入过的记忆以快照消息插入其前（meow 同款机制）。

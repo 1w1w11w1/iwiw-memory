@@ -8,6 +8,8 @@ export class MemoryTools {
     }
     async remember(params) {
         const args = { description: params.description, body: params.body };
+        if (params.level)
+            args.level = params.level;
         if (params.slug)
             args.slug = params.slug;
         if (params.priority)
@@ -24,10 +26,12 @@ export class MemoryTools {
         return this.parse(await this.backend.callTool("read_memory", params));
     }
     async list(params) {
-        return this.parse(await this.backend.callTool("list_memories", {
-            priority: params.priority,
-            limit: params.limit ?? 20,
-        }));
+        const args = { limit: params.limit ?? 20 };
+        if (params.priority)
+            args.priority = params.priority;
+        if (params.mem_type)
+            args.mem_type = params.mem_type;
+        return this.parse(await this.backend.callTool("list_memories", args));
     }
     parse(text) {
         try {

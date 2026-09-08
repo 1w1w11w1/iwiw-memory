@@ -8,8 +8,9 @@ import { MemoryBackend } from "./backend.js";
 export class MemoryTools {
   constructor(private readonly backend: MemoryBackend) {}
 
-  async remember(params: { description: string; body: string; slug?: string; priority?: string }): Promise<JsonValue> {
+  async remember(params: { description: string; body: string; level?: string; slug?: string; priority?: string }): Promise<JsonValue> {
     const args: Record<string, unknown> = { description: params.description, body: params.body };
+    if (params.level) args.level = params.level;
     if (params.slug) args.slug = params.slug;
     if (params.priority) args.priority = params.priority;
     return this.parse(await this.backend.callTool("memory_remember", args));
@@ -26,11 +27,11 @@ export class MemoryTools {
     return this.parse(await this.backend.callTool("read_memory", params));
   }
 
-  async list(params: { priority?: string; limit?: number }): Promise<JsonValue> {
-    return this.parse(await this.backend.callTool("list_memories", {
-      priority: params.priority,
-      limit: params.limit ?? 20,
-    }));
+  async list(params: { priority?: string; mem_type?: string; limit?: number }): Promise<JsonValue> {
+    const args: Record<string, unknown> = { limit: params.limit ?? 20 };
+    if (params.priority) args.priority = params.priority;
+    if (params.mem_type) args.mem_type = params.mem_type;
+    return this.parse(await this.backend.callTool("list_memories", args));
   }
 
   private parse(text: string): JsonValue {

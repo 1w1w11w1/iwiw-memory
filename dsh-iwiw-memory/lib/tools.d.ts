@@ -12,6 +12,7 @@ export declare class MemoryTools {
     remember(params: {
         description: string;
         body: string;
+        level?: string;
         slug?: string;
         priority?: string;
     }): Promise<JsonValue>;
@@ -24,6 +25,7 @@ export declare class MemoryTools {
     }): Promise<JsonValue>;
     list(params: {
         priority?: string;
+        mem_type?: string;
         limit?: number;
     }): Promise<JsonValue>;
     private parse;
