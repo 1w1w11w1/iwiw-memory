@@ -9,7 +9,7 @@
 ## 当前架构
 
 - 数据真源：data/memory.db（SQLite，含 memories、memory_versions、memory_audit、memory_pending_actions、memories_fts）。
-- 记忆核心：memory_agent/db.py（schema、mutation、版本/审计、FTS）、retrieval.py（确定性检索）、extractor.py（LLM 提取）、triggers.py（实时触发）、query_builder.py / session_state.py（确定性检索与状态）、llm.py（多轮 LLM 调用）。
+- 记忆核心：memory_agent/db.py（schema、mutation、版本/审计、FTS）、retrieval.py（确定性检索）、query_builder.py / session_state.py（确定性检索与状态）、llm.py（多轮 LLM 调用与工具调用）。记忆写入 = 模型在对话中自主调用记忆工具（chat.py 注册 memory_remember/search/read/list 四个 function calling 工具），无独立提取管线。
 - 界面：chat.py（CLI）、mcp_server.py（MCP 工具）。
 
 ## 记忆系统不变量

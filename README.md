@@ -16,9 +16,7 @@
 - `memory_agent/`：记忆系统核心（自包含，零外部项目依赖）
   - `db.py`：SQLite 存储、mutation 入口（版本/审计/回滚）、FTS 索引同步
   - `retrieval.py`：确定性检索（FTS 词面 + 会话状态联想 + 时间衰减 + 优先级加权）
-  - `extractor.py`：LLM 提取（create/update/archive/merge，update 为全文替换）
-  - `triggers.py`：高信号实时触发检测（纯规则）
-  - `llm.py`：LLM 调用封装（Anthropic/OpenAI 兼容，支持多轮）
+  - `llm.py`：LLM 调用封装（Anthropic/OpenAI 兼容，支持多轮与工具调用）
   - `query_builder.py`：查询扩展
   - `chat.py`：CLI 对话工作台（`python -m memory_agent.chat`）
   - `mcp_server.py`：MCP 工具服务器（`python -m memory_agent.mcp_server`）
@@ -64,7 +62,7 @@
 
 | 命令 | 说明 |
 |---|---|
-| 普通输入 | 对话（启动注入 core 记忆，每轮话题检索注入相关记忆；高信号实时提取） |
+| 普通输入 | 对话（启动注入 core 记忆，每轮话题检索注入相关记忆；模型可自主调用记忆工具写入） |
 | `/mem list [priority]` | 列出记忆 |
 | `/mem search <q>` | 搜索记忆 |
 | `/mem read <slug>` | 读取记忆正文 |
@@ -72,13 +70,14 @@
 | `/mem archive|delete|merge|history|rollback` | 归档/删除/合并/历史/回滚 |
 | `/pending [status]` `/pending approve|reject <id>` | 待确认维护动作审批 |
 | `/maintain` | 审查记忆维护候选（生成归档待确认动作） |
-| `/extract` | 对最近一条消息强制提取 |
 | `/stats` | 记忆库统计 |
 | `/quit` | 退出 |
 
 ## MCP 工具面（DSH 接入桥）
 
-`mcp_server.py` 提供 16 个工具：extract_and_save / search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / memory_trigger / maintenance_review。
+`mcp_server.py` 提供 14 个工具：search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / maintenance_review。
+
+记忆写入由模型在对话中自主调用记忆工具完成（CLI chat 注册 memory_remember / memory_search / memory_read / memory_list 四个 function calling 工具），不再使用独立提取管线。
 
 第二阶段可通过 DSH 的 `@deepseek-ai/dsh-mcp-client` 挂载，使记忆工具进入任意 DSH 会话。
 

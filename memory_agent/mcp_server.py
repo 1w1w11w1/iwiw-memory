@@ -2,7 +2,6 @@
 mcp_server.py — 记忆系统 MCP 服务器（DSH 接入桥）
 
 提供工具：
-- extract_and_save : 从对话文本提取记忆并保存（每轮自动，带对话上下文）
 - search_memories  : 确定性搜索（FTS5 词面 + 会话状态联想 + 时间衰减 + 优先级）
 - list_memories    : 列出记忆（按 priority/type 过滤）
 - read_memory      : 读取单条记忆
@@ -44,7 +43,6 @@ from .db import (
     reject_pending_action,
     get_stats,
 )
-from .extractor import extract_and_save
 from .retrieval import search_memories
 
 server = Server("memory-system")
@@ -65,15 +63,6 @@ def _tool(name: str, description: str, props: dict[str, Any], required: list[str
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        _tool(
-            "extract_and_save",
-            "分析对话文本，识别值得跨会话保存的个人信息（身份、偏好、困难、决策、反馈等），提取并保存到长期记忆。ADD 语义：已有记忆全文替换。",
-            {
-                "message": {"type": "string", "description": "待分析的用户消息"},
-                "context": {"type": "string", "description": "可选的对话上下文（前几轮）"},
-            },
-            ["message"],
-        ),
         _tool(
             "search_memories",
             "搜索记忆库（确定性：FTS5 关键词 + 同义词扩展 + 会话状态联想 + 时间衰减 + Priority 加权）。",
@@ -182,10 +171,6 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     def ok(data: Any) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2, default=str))]
-
-    if name == "extract_and_save":
-        saved = await extract_and_save(arguments.get("message", ""), arguments.get("context", ""))
-        return ok({"new_memories": saved, "count": len(saved)})
 
     if name == "search_memories":
         results = search_memories(arguments.get("query", ""), top_k=int(arguments.get("top_k", 10)))

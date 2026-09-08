@@ -13,7 +13,7 @@ python -m memory_agent.chat
 ## 对话
 
 - 普通输入即对话。启动时自动注入 core（必须载入）记忆全文；每轮按话题检索相关记忆注入上下文。
-- 高信号消息（偏好声明、决策、反馈、重要事件、明确要求记忆）会自动触发提取，控制台提示写入结果。
+- 模型可在回复前自主调用记忆工具（memory_remember/search/read/list）写入与检索；写入在控制台以 `[记忆工具]` 回显（需 MEMORY_AGENT_ECHO_STATE=1）。
 - 会话上下文只保存在内存（最近 N 轮，默认 12），退出即清空；持久化会话由外部 harness 承担。
 
 ## 命令参考
@@ -45,7 +45,6 @@ python -m memory_agent.chat
 
 | 命令 | 说明 |
 |---|---|
-| /extract | 对最近一条用户消息强制提取 |
 | /stats | 记忆库统计（总数/分级/类型） |
 
 | /help | 帮助 |
@@ -53,13 +52,13 @@ python -m memory_agent.chat
 
 ## 典型使用流程
 
-1. 聊天中自然积累记忆（高信号自动提取）。
+1. 聊天中自然积累记忆（模型自主调用 memory_remember 写入，值得记才写）。
 2. 定期 `/maintain` 审查 → `/pending` 查看候选 → `/pending approve|reject` 处理。
 3. 手动纠错：`/mem read <slug>` 查看 → `/mem edit <slug>` 修正，或 `/mem rollback <slug> <版本>` 回退。
 4. 清理：`/mem archive <slug>` 归档过时内容，`/mem merge <目标> <来源>` 合并重复。
 
 ## MCP 工具面
 
-`python -m memory_agent.mcp_server` 以 stdio 提供 16 个工具（供 DSH 等 harness 挂载）：
+`python -m memory_agent.mcp_server` 以 stdio 提供 14 个工具（供 DSH 等 harness 挂载）：
 
-extract_and_save / search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / memory_trigger / maintenance_review
+search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / maintenance_review

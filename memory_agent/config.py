@@ -80,10 +80,11 @@ LLM_BASE_URL = _env("MEMORY_AGENT_LLM_BASE_URL", "https://api.deepseek.com/anthr
 LLM_API_KEY = _env("MEMORY_AGENT_LLM_API_KEY", _env("DEEPSEEK_API_KEY", ""))
 LLM_MODEL = _env("MEMORY_AGENT_LLM_MODEL", "deepseek-v4-flash")
 
-# ── 提取配置 ──
-EXTRACT_MAX_TOKENS = _env_int("MEMORY_AGENT_EXTRACT_MAX_TOKENS", 1200)
-EXTRACT_TEMPERATURE = _env_float("MEMORY_AGENT_EXTRACT_TEMPERATURE", 0.2)
-EXTRACT_TIMEOUT = _env_float("MEMORY_AGENT_EXTRACT_TIMEOUT", 60.0)
+# ── 记忆工具轮（模型自主 function calling；回复前执行，失败降级为纯文本对话）──
+TOOL_MAX_TOKENS = _env_int("MEMORY_AGENT_TOOL_MAX_TOKENS", 400)
+TOOL_TEMPERATURE = _env_float("MEMORY_AGENT_TOOL_TEMPERATURE", 0.2)
+TOOL_TIMEOUT = _env_float("MEMORY_AGENT_TOOL_TIMEOUT", 30.0)
+TOOL_MAX_LOOPS = _env_int("MEMORY_AGENT_TOOL_MAX_LOOPS", 3)
 
 # ── 记忆分级（三值）──
 # core   = 必须载入：对话前注入上下文（身份、健康、关系、重大决策）
@@ -115,9 +116,6 @@ HASH_ALGORITHM = "md5"  # 速度优先，不涉及安全场景
 # （权重真源是 retrieval.DEFAULT_WEIGHTS）。单次 FTS 命中约 0.6，阈值默认 0.15 过滤无关结果。
 SEARCH_RELEVANCE_THRESHOLD = _env_float("MEMORY_AGENT_SEARCH_RELEVANCE_THRESHOLD", 0.15)
 MEMORY_RECALL_MAX_CHARS = _env_int("MEMORY_AGENT_RECALL_MAX_CHARS", 2500)
-
-# ── 日志 ──
-LOG_FILE = DATA_DIR / "logs" / "extractor.log"
 
 # ── 会话（chat 工作台）──
 CHAT_CONTEXT_TURNS = _env_int("MEMORY_AGENT_CHAT_CONTEXT_TURNS", 12)

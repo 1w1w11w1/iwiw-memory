@@ -1,49 +1,39 @@
 # 数据流
 
-本文件描述记忆系统内五条核心数据流：提取流、检索流、写入（mutation）流、维护流、启动流。
+本文件描述记忆系统内五条核心数据流：工具写入流、检索流、写入（mutation）流、维护流、启动流。
 
 ## 总览
 
 ```
-用户 ──▶ CLI chat ──▶ 提取流 ──▶ SQLite（记忆真源）
+用户 ──▶ CLI chat ──▶ 工具写入流 ──▶ SQLite（记忆真源）
    │        │                        ▲
    │        └──▶ 检索流 ─────────────┘（注入回对话）
    └──▶ 命令 ──▶ mutation 流 / 维护流 / 审批
 
 SQLite ──▶ 启动流（core 注入）──▶ 对话上下文
 
-MCP 工具 ──▶ 同一套 提取流 / mutation 流 / 检索流 / 维护流
+MCP 工具 ──▶ 同一套 mutation 流 / 检索流 / 维护流
 ```
 
-## 1. 提取流（对话 → 记忆）
+## 1. 工具写入流（对话 → 记忆）
 
-一条高价值消息如何变成长期记忆：
+模型在对话中自主调用记忆工具完成写入（无独立提取管线、无触发词表）：
 
 ```
 用户消息
   │
-  ├─ 实时路径：chat 主循环调用 triggers.should_trigger(message)
-  │     高信号（偏好/决策/反馈/事件/明确要求记忆）→ 触发 extract_and_save
-  │     低信号（技术提问/简短确认/含代码符号）→ 跳过
-  │
-  └─ 手动路径：/extract 命令 / MCP extract_and_save 工具
-        │
-        ▼
-extractor.extract_and_save(message, context)
-  │  1. _should_skip：短消息/IDE 注入/纯命令 → 直接跳过
-  │  2. _memory_catalog_text：加载已有记忆目录（slug/类型/级别/描述）
-  │  3. _related_memories_text：search_memories 检索与消息相关的已有记忆全文
-  │     （模型据此精准 update 与去重）
-  │  4. 组装 prompt → llm.complete_text（提取系统提示）
-  │  5. _parse_extraction_result：容错解析 JSON 候选
+  ▼
+chat 主循环（回复前）→ llm.complete_with_tools（非流式，带 4 个记忆工具）
+  │  模型自主决策：
+  │    ├─ memory_remember：写入稳定事实（slug 可选；写入即 upsert 全文替换）
+  │    │    新建前模型可先 memory_search 查重（工具描述引导）
+  │    ├─ memory_search / memory_read / memory_list：检索与读取
+  │  工具结果以 role=tool 消息回传（tool_call_id 一一对应），最多 TOOL_MAX_LOOPS 轮
   │
   ▼
-db.save_memory_candidate(candidate)   ← 每条候选
-  │  create  → upsert_memory（插入）
-  │  update  → replace_memory_result（全文替换，变更前快照进版本表）
-  │  archive → archive_memory_result
-  │  merge   → replace_memory_result 到目标 + 归档来源
-  │  ignore  → 丢弃
+db.upsert_memory(slug, description, content, ...)
+  │  slug 不存在 → 创建（audit: create）
+  │  slug 已存在 → replace_memory_result（全文替换，快照进版本表，audit: upsert_replace）
   │
   ▼
 mutation 契约（详见第 3 节）
@@ -52,6 +42,11 @@ mutation 契约（详见第 3 节）
   │  FTS        → 触发器自动同步
   ▼
 memories 表（真源）
+
+写入准则（工具描述 + system prompt 承载）：
+- 只记稳定事实与用户明确要求记住的内容；一次性/临时话题不写
+- 用户最新表述优先
+- 不向用户承诺"已记住"，除非确实调用了 memory_remember
 ```
 
 ## 2. 检索流（记忆 → 对话）
@@ -81,14 +76,14 @@ chat 组装：相关记忆块 + 用户消息 → llm（注入对话上下文）
 
 两个使用场景：
 - **对话回复**：每轮把检索结果作为『## 相关记忆』块放在用户消息前，让模型基于记忆作答。
-- **提取前置**：extractor 用同一检索把相关记忆全文喂给模型（第 1 节第 3 步）。
+- **工具查重**：模型新建记忆前可用同一检索（memory_search）查重（第 1 节）。
 
 ## 3. 写入（mutation）流
 
 所有破坏性/可见变更统一走 *_result 入口，保证版本与审计不缺失：
 
 ```
-调用方（chat 命令 / MCP 工具 / extractor / maintenance 审批）
+调用方（chat 命令 / MCP 工具 / 模型记忆工具 / maintenance 审批）
   │
   ├─ replace_memory_result   全文替换
   ├─ archive_memory_result   归档（priority → archive）
@@ -146,8 +141,8 @@ python -m memory_agent.chat
 
 | 数据流 | 入口 | 关键函数 |
 |---|---|---|
-| 提取 | chat.py / mcp_server.py | extract_and_save → save_memory_candidate |
-| 检索 | chat.py / extractor.py | search_memories → build_queries |
+| 工具写入 | chat.py | complete_with_tools → upsert_memory |
+| 检索 | chat.py | search_memories → build_queries |
 | 写入 | 各 *result | replace/archive/delete/merge/approve/restore |
 | 维护 | chat.py / mcp_server.py | review_maintenance → create_pending_action |
 | 启动 | chat.py | _always_load_text |

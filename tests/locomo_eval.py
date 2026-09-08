@@ -28,7 +28,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import memory_agent.db as memory_db
-from memory_agent.extractor import extract_and_save
 from memory_agent.retrieval import search_memories
 from memory_agent.query_builder import extract_topic_grams
 from memory_agent.session_state import SessionState
@@ -55,21 +54,6 @@ def get_sessions(conversation: dict) -> list[tuple[int, list[dict]]]:
 
 
 # ── 记忆管线 ──
-
-def process_turn(msg: str, session_state: SessionState, db_path: str) -> dict:
-    """处理一轮用户消息：提取 + 入库。返回提取结果。"""
-    from memory_agent.extractor import extract_and_save
-    saved = {}
-    try:
-        import asyncio
-        loop = asyncio.new_event_loop()
-        saved_list = loop.run_until_complete(extract_and_save(msg))
-        loop.close()
-        saved = {"saved": saved_list}
-    except Exception as exc:
-        saved = {"error": str(exc)}
-    return saved
-
 
 async def answer_question_async(
     question: str,
@@ -199,47 +183,25 @@ def run_evaluation(
     session_state = SessionState()
     session_state.build_word_index(memory_db.list_memories())
     
-    # Phase 1: 批量提取（每 BATCH_SIZE 轮合并一次 LLM 调用，A/B 实验验证质量不降）
-    BATCH_SIZE = 8
+    # Phase 1: 会话遍历（SessionState 更新，确定性免费）。
+    # 提取管线已移除（范式修正：模型自主调用记忆工具）——建库为空，
+    # 本评测当前不可用，待按新范式重建评测管线。
     turn_count = 0
-    extraction_count = 0
     errors = []
     
     async def run_extraction():
-        nonlocal extraction_count, turn_count
-        buffer = []
-        for sess_num, turns in sessions:
+        nonlocal turn_count
+        for _sess_num, turns in sessions:
             # session 日期（LoCoMo 的 session_N_date_time）
             sess_date = conv.get(f"session_{sess_num}_date_time", "")
             sess_date = str(sess_date)[:10] if sess_date else ""
             for turn in turns:
-                speaker = turn.get("speaker", "")
                 text = turn.get("text", "").strip()
                 if not text:
                     continue
                 turn_count += 1
-                buffer.append(text)
-                # SessionState 每轮更新（确定性，免费）
                 grams = extract_topic_grams(text)
                 session_state.update(text, grams)
-                if len(buffer) >= BATCH_SIZE:
-                    merged = chr(10).join(f"[消息{j+1}]: {m}" for j, m in enumerate(buffer))
-                    try:
-                        saved = await llm_with_retry(lambda: extract_and_save(merged, session_date=sess_date))
-                        if saved:
-                            extraction_count += len(saved)
-                    except Exception as exc:
-                        errors.append(f"batch extraction error: {exc}")
-                    buffer = []
-        # flush 剩余
-        if buffer:
-            merged = chr(10).join(f"[消息{j+1}]: {m}" for j, m in enumerate(buffer))
-            try:
-                saved = await extract_and_save(merged, session_date=sess_date)
-                if saved:
-                    extraction_count += len(saved)
-            except Exception as exc:
-                errors.append(f"final extraction error: {exc}")
     
     loop = asyncio.new_event_loop()
     loop.run_until_complete(run_extraction())

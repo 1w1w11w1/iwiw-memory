@@ -78,10 +78,6 @@ def injected_per_turn(stdout):
     return out
 
 
-def extraction_flag(stdout):
-    return any('[自动提取]' in l for l in stdout.splitlines())
-
-
 def stats_counts(stdout):
     return [int(l.split('记忆总数:')[1].strip()) for l in stdout.splitlines() if '记忆总数' in l]
 
@@ -89,7 +85,8 @@ def stats_counts(stdout):
 # ── 场景 ──
 
 def sc_trigger_coverage():
-    """E2E-01 写入捕获覆盖率：自然事实句后库计数应增长（触发词表覆盖不足则 FAIL）。"""
+    """E2E-01 工具写入闭环：自然事实句由模型自主调用记忆工具写入（选择性记忆，至少一条），
+    且随后的相关提问能让写入的记忆回流注入层（[core 注入] 或 [联想注入]，A2 一致性）。"""
     facts = [
         '我对芒果过敏',
         '我把烟戒了',
@@ -99,6 +96,8 @@ def sc_trigger_coverage():
     for f in facts:
         turns.append(f)
         turns.append('/stats')
+    # 隔离库内只有本次写入的记忆：相关提问出现任何注入行 = 写入已回流
+    turns.append('那我平时能吃芒果吗？')
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = str(Path(tmp) / 'memory.db')
         out = run_chat(turns, db)['stdout']
@@ -107,12 +106,17 @@ def sc_trigger_coverage():
         for i, f in enumerate(facts):
             got = counts[i] if i < len(counts) else -1
             checks.append({'fact': f, 'count_after': got, 'written': got > 0})
-        covered = sum(1 for c in checks if c['written'])
+        tool_used = '[记忆工具]' in out
+        written = bool(counts) and counts[-1] >= 1
+        inj_lines = [l for l in out.splitlines() if l.startswith('[core 注入]') or l.startswith('[联想注入]')]
+        injected_back = len(inj_lines) >= 1
         return {
             'name': 'trigger_coverage',
-            'ok': covered == len(facts),
-            'covered': covered,
-            'total': len(facts),
+            'ok': tool_used and written and injected_back,
+            'tool_used': tool_used,
+            'written': written,
+            'injected_back': injected_back,
+            'inj_lines': inj_lines[:3],
             'checks': checks,
             'stdout_tail': out[-1200:],
         }
@@ -142,28 +146,6 @@ def sc_inject_relevance():
         inj = injected_per_turn(out)
         hit = any('user-piano-lesson' in slugs for slugs in inj)
         return {'name': 'inject_relevance', 'ok': hit, 'injected': inj, 'stdout_tail': out[-1000:]}
-
-
-def sc_extraction_context():
-    """E2E-03 提取上下文质量：铺垫两轮后决策，记忆正文应含决策依据（成都）。"""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        db = str(Path(tmp) / 'memory.db')
-        turns = [
-            '我在纠结五一去哪玩，一个是去青岛海边，一个是去成都吃美食。',
-            '青岛可以看海，成都是吃喝，我都挺感兴趣，拿不定主意。',
-            '行，那就定成都吧，五一一家人去成都玩。',
-        ]
-        out = run_chat(turns, db)['stdout']
-        extracted = extraction_flag(out)
-        rows = db_rows(db)
-        chengdu = [r for r in rows if '成都' in r['content']]
-        return {
-            'name': 'extraction_context',
-            'ok': extracted and len(chengdu) > 0,
-            'extracted': extracted,
-            'memories': [(r['slug'], r['content'][:60]) for r in rows],
-            'stdout_tail': out[-1000:],
-        }
 
 
 def sc_commands():
@@ -196,7 +178,6 @@ def sc_llm_failure():
 SCENARIOS = [
     sc_trigger_coverage,
     sc_inject_relevance,
-    sc_extraction_context,
     sc_commands,
     sc_llm_failure,
 ]
@@ -226,7 +207,7 @@ def main():
     passed = sum(1 for r in results if r.get('ok'))
     for r in results:
         print('  ' + ('PASS' if r.get('ok') else 'FAIL') + '  ' + r['name'])
-        for k in ('covered', 'total', 'injected', 'extracted', 'memories', 'per_turn_hi', 'per_turn_lo', 'delta_per_turn', 'checks', 'exit', 'error'):
+        for k in ('covered', 'total', 'injected', 'extracted', 'memories', 'per_turn_hi', 'per_turn_lo', 'delta_per_turn', 'tool_used', 'written', 'injected_back', 'inj_lines', 'checks', 'exit', 'error'):
             if k in r:
                 print('        ' + k + ': ' + str(r[k]))
     print()
