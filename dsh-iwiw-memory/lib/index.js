@@ -7,7 +7,7 @@ export const name = "dsh-iwiw-memory";
 const DEFAULT_PYTHON = "E:/desktop/111/.venv/Scripts/python.exe";
 const DEFAULT_CWD = "E:/desktop/111";
 const DEFAULT_CORE_MAX_CHARS = 2500;
-function makeDefinition(tools) {
+function makeDefinition(tools, onRemember) {
     return {
         memory_remember: defineTool({
             name: "memory_remember",
@@ -24,7 +24,9 @@ function makeDefinition(tools) {
             },
             async execute(args) {
                 const a = args;
-                return { result: await tools.remember(a) };
+                const out = { result: await tools.remember(a) };
+                onRemember?.();
+                return out;
             },
         }),
         memory_search: defineTool({
@@ -80,7 +82,7 @@ export const apply = async (ctx, config = {}) => {
     const python = config.python ?? DEFAULT_PYTHON;
     const cwd = config.cwd ?? DEFAULT_CWD;
     const coreMaxChars = config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS;
-    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd);
+    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
     const tools = new MemoryTools(backend);
     // 1) 启动时预热后端（避免首次工具调用才连接）。
     try {
@@ -89,8 +91,8 @@ export const apply = async (ctx, config = {}) => {
     catch (e) {
         ctx.logger.warn("memory backend warmup failed", e);
     }
-    // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）。
-    const defs = makeDefinition(tools);
+    // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）。
+    const defs = makeDefinition(tools, () => { ctx.logger.info("[dbg] onRemember fired"); refreshCore().catch((e) => ctx.logger.warn("[dbg] refreshCore err", String(e))); });
     const disposers = [
         ctx.tools.register(defs.memory_remember),
         ctx.tools.register(defs.memory_search),
@@ -102,8 +104,10 @@ export const apply = async (ctx, config = {}) => {
     // 4) 动态 core 段：list 拿 slug + 逐条 read 拿全文，字符预算内拼装。
     const fetchCoreText = async () => {
         try {
-            const list = (await tools.list({ priority: "core", limit: 50 }));
-            const items = list?.items ?? [];
+            // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
+            const raw = (await tools.list({ priority: "core", limit: 50 }));
+            const items = Array.isArray(raw) ? raw : (raw?.items ?? []);
+            ctx.logger.info("[dbg] fetchCore list items=" + items.length);
             if (items.length === 0)
                 return "（暂无必读长期记忆）";
             let budget = coreMaxChars;
@@ -126,8 +130,27 @@ export const apply = async (ctx, config = {}) => {
             return `（core 记忆拉取失败：${String(e)}）`;
         }
     };
+    // A2 一致性：core 段缓存 + 写入后异步刷新（pending 重跑，刷新期间的请求不丢失）。
     let cachedCore = "";
-    fetchCoreText().then((t) => { cachedCore = t; }).catch(() => { });
+    let refreshing = false;
+    let pending = false;
+    const refreshCore = async () => {
+        if (refreshing) {
+            pending = true;
+            return;
+        }
+        refreshing = true;
+        try {
+            do {
+                pending = false;
+                cachedCore = await fetchCoreText();
+            } while (pending);
+        }
+        finally {
+            refreshing = false;
+        }
+    };
+    refreshCore().catch(() => { });
     disposers.push(ctx.systemPrompt.section({
         name: MEMORY_SECTION_NAME,
         order: -50,

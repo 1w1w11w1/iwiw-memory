@@ -8,12 +8,18 @@ export class MemoryBackend {
     command;
     args;
     cwd;
+    env;
     client = null;
     transport = null;
-    constructor(command, args, cwd) {
+    constructor(command, args, cwd, 
+    /** 覆盖子进程环境变量（如 MEMORY_AGENT_DB_PATH 隔离库）。
+     *  注意：MCP SDK 默认不继承完整父进程 env（白名单机制），
+     *  必须显式合并 process.env，否则 DB 路径等覆盖静默失效。 */
+    env) {
         this.command = command;
         this.args = args;
         this.cwd = cwd;
+        this.env = env;
     }
     async ensureConnected() {
         if (this.client)
@@ -22,6 +28,7 @@ export class MemoryBackend {
             command: this.command,
             args: this.args,
             cwd: this.cwd,
+            env: { ...process.env, ...(this.env ?? {}) },
         });
         this.client = new Client({ name: "dsh-iwiw-memory", version: "0.1.0" });
         await this.client.connect(this.transport);
