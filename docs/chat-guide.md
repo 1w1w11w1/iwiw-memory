@@ -12,7 +12,7 @@ python -m memory_agent.chat
 
 ## 对话
 
-- 普通输入即对话。启动时自动注入 core（必须载入）记忆全文；每轮按话题检索相关记忆注入上下文。
+- 普通输入即对话。启动时自动注入常驻层（profile/rules）记忆全文；每轮按话题检索相关记忆注入上下文。
 - 模型可在回复前自主调用记忆工具（memory_remember/search/read/list）写入与检索；写入在控制台以 `[记忆工具]` 回显（需 MEMORY_AGENT_ECHO_STATE=1）。
 - 会话上下文只保存在内存（最近 N 轮，默认 12），退出即清空；持久化会话由外部 harness 承担。
 
@@ -22,11 +22,11 @@ python -m memory_agent.chat
 
 | 命令 | 说明 |
 |---|---|
-| /mem list [priority] | 列出记忆（可按 core/normal/archive 过滤） |
+| /mem list [priority] | 列出记忆（可按 active/archived 过滤） |
 | /mem search <关键词> | 搜索记忆（关键词 + 同义词 + 会话状态联想） |
 | /mem read <slug> | 读取记忆正文 |
 | /mem edit <slug> | 编辑记忆：显示当前正文，输入新正文，单独一行 __END__ 结束 |
-| /mem archive <slug> | 归档（priority → archive，可回滚） |
+| /mem archive <slug> | 归档（priority → archived，可回滚） |
 | /mem delete <slug> | 删除（先快照，可回滚，需确认 y） |
 | /mem merge <目标> <来源> | 合并：显示两条内容，输入合并后正文，来源默认归档 |
 | /mem history <slug> | 版本历史 |
@@ -36,7 +36,7 @@ python -m memory_agent.chat
 
 | 命令 | 说明 |
 |---|---|
-| /maintain | 审查维护候选（访问最少/更新最早的 normal），生成归档待确认动作 |
+| /maintain | 审查维护候选（访问最少/更新最早的 active），生成归档待确认动作 |
 | /pending [status] | 查看待确认动作（pending/approved/rejected/executed） |
 | /pending approve <id> | 审批通过并执行（走版本/审计） |
 | /pending reject <id> | 拒绝 |

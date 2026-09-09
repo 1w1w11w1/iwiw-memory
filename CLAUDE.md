@@ -15,7 +15,7 @@
 ## 记忆系统不变量
 
 1. SQLite 为唯一真源；无 Markdown 真源。
-2. 分级三值：core 必须载入（启动注入）；normal 按需检索；archive 为归档状态。
+2. 分类体系 v3：五层类型（profile/fact/lesson/rules/project）× 生命周期二态（active/archived）；profile 与 rules 常驻注入，其余按话题检索；archived 归档留痕、可回滚。
 3. 所有破坏性/可见变更走 *_result mutation 入口，返回 version_id/audit_id/changed_rows。
 4. 删除保留版本，可回滚。
 5. 更新是全文替换（非追加）。

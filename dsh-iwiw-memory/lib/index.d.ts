@@ -9,7 +9,7 @@ interface PluginConfig {
     python?: string;
     /** memory_agent 工作目录。 */
     cwd?: string;
-    /** core 注入段总字符预算（与内核 MEMORY_RECALL_MAX_CHARS 对齐）。 */
+    /** 常驻层注入段总字符预算（与内核 MEMORY_RECALL_MAX_CHARS 对齐）。 */
     coreMaxChars?: number;
     /** 每消息命中注入的条数上限（默认 3）。 */
     hitTopK?: number;
@@ -20,6 +20,12 @@ interface PluginConfig {
     reflectTurns?: number;
     /** 记忆巩固（consolidate）：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
     consolidateIdleMinutes?: number;
+    /** 感知与通知：记忆写入系统通知（60s 窗口合并，默认关）。 */
+    notifyRemember?: boolean;
+    /** 感知与通知：空闲巩固完成系统通知（默认开）。 */
+    notifyConsolidate?: boolean;
+    /** 感知与通知：后台异常（巩固失败/内核连接异常）系统通知（默认开）。 */
+    notifyOnFailure?: boolean;
     /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
     env?: Record<string, string>;
 }
@@ -33,12 +39,18 @@ export declare const SETTINGS_SCHEMA: Schema<Schemastery.ObjectS<{
     reflectTurns: Schema<number, number>;
     consolidateIdleMinutes: Schema<number, number>;
     standingLayers: Schema<string, string>;
+    notifyRemember: Schema<boolean, boolean>;
+    notifyConsolidate: Schema<boolean, boolean>;
+    notifyOnFailure: Schema<boolean, boolean>;
 }>, Schemastery.ObjectT<{
     hitTopK: Schema<number, number>;
     coreMaxChars: Schema<number, number>;
     reflectTurns: Schema<number, number>;
     consolidateIdleMinutes: Schema<number, number>;
     standingLayers: Schema<string, string>;
+    notifyRemember: Schema<boolean, boolean>;
+    notifyConsolidate: Schema<boolean, boolean>;
+    notifyOnFailure: Schema<boolean, boolean>;
 }>>;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;
 export {};

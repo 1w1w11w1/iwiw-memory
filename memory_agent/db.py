@@ -1,9 +1,10 @@
 """
 SQLite storage for long-term memory.
 
-The source of truth is selfecho_data/sessions.db. Markdown files under
-memory/ are legacy/export caches only; runtime writes must go through this
-module so versions, audit events, FTS, and vector chunks stay in sync.
+The single source of truth is data/memory.db（见 config.MEMORY_DB_PATH）.
+All mutations (create/replace/archive/delete/merge/rollback) must go through
+the *_result entries in this module so version snapshots, audit events, and
+the FTS index stay in sync.
 """
 
 from __future__ import annotations

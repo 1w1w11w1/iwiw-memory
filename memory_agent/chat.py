@@ -164,7 +164,7 @@ def _related_text(
 ) -> tuple[str, set[str]]:
     """按话题联想相关记忆，返回 (注入文本, 注入的记忆 slug 集合)。
 
-    - exclude_slugs：排除已注入过的记忆（core 常驻 + 窗口内已联想）。
+    - exclude_slugs：排除已注入过的记忆（常驻层 + 窗口内已联想）。
     - topic_words：会话主题轨迹（高频话题词）。
     - session_state：SessionState（DSC）——回指联想的确定性来源：
       "那件事/那个兴趣班"无关键词时，从会话状态里最近/高频讨论的话题召回记忆。
