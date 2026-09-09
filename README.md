@@ -2,7 +2,6 @@
 
 一个带长期记忆系统的 chat：核心是 SQLite 标签记忆内核（五层类型 profile/fact/lesson/rules/project × active/archived 生命周期 + 版本/审计/回滚），自带 CLI 对话工作台用于日常使用与机制验证，并通过 MCP 对外提供完整工具面；对话能力经多端接入（CLI / DSH 插件，QQ-bot 规划中）复用同一内核。
 
-> 项目早期为个人智能体原型（含自研 harness 与 Web 界面），现已转型为独立的记忆系统核心，移除 harness、会话层与界面层。
 
 ## 系统亮点
 
@@ -11,7 +10,7 @@
 - **完整 mutation 契约**：所有破坏性操作走统一入口，返回 `version_id` / `audit_id` / `changed_rows`，变更前快照进版本表——删除永不丢历史，一切可回滚；审计事件全量留痕。
 - **会话状态回指联想**：`session_state` 记录会话话题/决策/任务检查点，"那件事怎么样了"这类指代可经回指通道命中记忆。
 - **全确定性检索**：FTS 词面（jieba 分词 + 同义词扩展 + CJK 兜底）+ 会话回指 + 时间衰减，零向量零模型依赖；检索结果可解释、可复现，部署轻量。
-- **感知与通知体系**：巩固完成 / 写入确认 / 内核异常经 DSH 原生桌面通知（聚焦自动静默、点击唤起），触发点全覆盖且逐项可在设置页开关（[设计文档](docs/notification-design.md)）。
+- **感知与通知体系**：巩固完成 / 写入确认 / 内核异常经 DSH 原生桌面通知（聚焦自动静默、点击唤起），触发点全覆盖且逐项可在设置页开关。
 
 **能力清单**
 
@@ -26,19 +25,19 @@
 
 **设计取舍（明确不做）**
 
-- 向量/BM25 混合检索：与确定性检索路线冲突，已定量论证为联想的错配工具（[论证](docs/associative-recall-architecture.md)），不引入
+- 向量/BM25 混合检索：与确定性检索路线冲突，已定量论证为联想的错配工具，不引入
 - 实体图谱：个人记忆量级下收益未证实，以 event_date 字段化元数据探路
 
-演进待办见 [roadmap](docs/roadmap.md)。
+演进待办见 dev-docs/roadmap.md（本地维护）。
 
 ## 文档
 
-- [架构总览](docs/architecture.md) — 分层、模块职责、不变量
-- [数据流](docs/data-flow.md) — 检索 / 写入 / 维护 / 启动链路
+仓库手册（docs/）：
 - [CLI 使用指南](docs/chat-guide.md) — 命令参考与典型流程
-- [感知与通知体系](docs/notification-design.md) — 触发点矩阵与系统通知设计
-- [演进路线](docs/roadmap.md) — 独立演进待办
-- [多端接入演进](docs/dsh-plugin-evolution.md) — 路线图：DSH 插件已落地，QQ-bot 规划中
+- [DSH 插件安装指南](docs/plugin-setup.md) — 跨会话记忆快速开始
+- [DSH MCP 挂载指南](docs/dsh-mcp-setup.md) — 直挂记忆工具面接入
+
+开发文档（dev-docs/，本地维护不入库）：架构总览、数据流、感知与通知设计、联想架构论证、演进路线。
 
 ## 结构
 
@@ -77,7 +76,7 @@
 |---|---|---|
 | CLI 工作台（`memory_agent/chat.py`） | ✅ 可用 | 内置对话界面，日常使用与机制验证 |
 | DSH 插件（`dsh-iwiw-memory/`） | ✅ 可用 | 让任意 DSH agent 获得跨会话记忆，安装与配置见[插件 README](dsh-iwiw-memory/README.md) |
-| QQ-bot | 🚧 规划中 | 多端复用方案见[演进文档](docs/dsh-plugin-evolution.md) |
+| QQ-bot | 🚧 规划中 | 复用同一记忆内核，演进待办见 dev-docs/roadmap.md |
 
 ## 记忆分类与生命周期
 
