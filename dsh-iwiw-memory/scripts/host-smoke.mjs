@@ -34,19 +34,51 @@ const cwd = process.env.SMOKE_CWD ?? "E:/desktop/111";
 const registered = [];
 const sections = [];
 const handlers = {};
-const ctx = {
-  logger: {
-    info: (...a) => console.log("[info]", ...a),
-    warn: (...a) => console.log("[warn]", ...a),
-    error: (...a) => console.log("[error]", ...a),
+// settings 服务 mock：与 dsh-settings 的 register 契约同形（schema 归一化 + get/watch）
+const makeSettingsService = () => ({
+  registered: {},
+  register(ns, schema, options) {
+    if (this.registered[ns]) throw new Error(`settings namespace "${ns}" is already registered`);
+    const resolved = schema(options?.base);
+    const entry = { ns, schema, resolved, watchers: new Set() };
+    this.registered[ns] = entry;
+    return {
+      get: () => entry.resolved,
+      watch: (cb) => { entry.watchers.add(cb); return () => entry.watchers.delete(cb); },
+    };
   },
-  tools: { register: (def) => { registered.push(def); return () => {}; } },
-  systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
-  on: (event, handler) => { (handlers[event] ??= []).push(handler); return () => {}; },
+});
+const makeCtx = (handlersMap = handlers) => {
+  const settingsService = makeSettingsService();
+  return {
+    settingsService,
+    logger: {
+      info: (...a) => console.log("[info]", ...a),
+      warn: (...a) => console.log("[warn]", ...a),
+      error: (...a) => console.log("[error]", ...a),
+    },
+    tools: { register: (def) => { registered.push(def); return () => {}; } },
+    systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
+    on: (event, handler) => { (handlersMap[event] ??= []).push(handler); return () => {}; },
+    inject: (services, cb) => {
+      if (services.includes("settings")) cb({ settings: settingsService });
+      return () => {};
+    },
+  };
 };
+const ctx = makeCtx();
 
 console.log("=== 1. apply ===");
 const dispose = await apply(ctx, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath } });
+
+console.log("\n=== 1.5 settings section 注册 ===");
+const settingsEntry = ctx.settingsService.registered["dsh-iwiw-memory"];
+const settingsOk = !!settingsEntry
+  && settingsEntry.resolved.hitTopK === 3
+  && settingsEntry.resolved.reflectTurns === 7
+  && settingsEntry.resolved.dreamIdleMinutes === 180
+  && settingsEntry.resolved.standingLayers === "profile,rules";
+console.log("settings 注册断言:", settingsOk ? "PASS" : "FAIL", JSON.stringify(settingsEntry?.resolved));
 
 console.log("\n=== 2. 注册结果 ===");
 console.log("tools:", registered.map((d) => d.name).join(", "));
@@ -197,12 +229,10 @@ let reflectOk = false;
 {
   const registered2 = [];
   const handlers2 = {};
-  const ctx2 = {
-    logger: { info: () => {}, warn: (...a) => console.log("[warn2]", ...a), error: (...a) => console.log("[error2]", ...a) },
-    tools: { register: (def) => { registered2.push(def); return () => {}; } },
-    systemPrompt: { section: () => () => {} },
-    on: (event, handler) => { (handlers2[event] ??= []).push(handler); return () => {}; },
-  };
+  const ctx2 = makeCtx(handlers2);
+  ctx2.logger = { info: () => {}, warn: (...a) => console.log("[warn2]", ...a), error: (...a) => console.log("[error2]", ...a) };
+  ctx2.tools = { register: (def) => { registered2.push(def); return () => {}; } };
+  ctx2.systemPrompt = { section: () => () => {} };
   const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, dreamIdleMinutes: 0 });
   const preStep2 = (handlers2["agent/pre-step"] ?? [])[0];
   const agent2 = { session: { header: { id: "reflect-sess", origin: "main" } } };
@@ -328,6 +358,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-const allOk = a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && foldOk && kindOk && clientOk;
+const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && foldOk && kindOk && clientOk;
 console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
 process.exit(allOk ? 0 : 1);

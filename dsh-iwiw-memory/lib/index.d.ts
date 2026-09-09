@@ -24,5 +24,16 @@ interface PluginConfig {
 }
 /** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
 export declare function isPeakTime(d: Date): boolean;
+/** settings.yaml 可调字段的默认值（settings.section 页编辑；patch config 为 base 覆盖在先）。 */
+export declare const SETTINGS_DEFAULTS: {
+    readonly coreMaxChars: 2500;
+    readonly hitTopK: 3;
+    readonly reflectTurns: 7;
+    readonly dreamIdleMinutes: 180;
+    readonly standingLayers: "profile,rules";
+};
+/** settings schema（纯函数归一化）：白名单字段 + 类型纠偏，未知字段丢弃。
+ *  standingLayers 以字符串存储（UI 逗号分隔编辑），兼容 patch 传入的数组形式。 */
+export declare function settingsSchema(merged: unknown): Record<string, unknown>;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;
 export {};

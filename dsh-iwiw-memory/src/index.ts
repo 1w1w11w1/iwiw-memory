@@ -126,13 +126,77 @@ function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
   } as const;
 }
 
+/** settings.yaml 可调字段的默认值（settings.section 页编辑；patch config 为 base 覆盖在先）。 */
+export const SETTINGS_DEFAULTS = {
+  coreMaxChars: 2500,
+  hitTopK: 3,
+  reflectTurns: 7,
+  dreamIdleMinutes: 180,
+  standingLayers: "profile,rules",
+} as const;
+
+/** settings schema（纯函数归一化）：白名单字段 + 类型纠偏，未知字段丢弃。
+ *  standingLayers 以字符串存储（UI 逗号分隔编辑），兼容 patch 传入的数组形式。 */
+export function settingsSchema(merged: unknown): Record<string, unknown> {
+  const m = (merged && typeof merged === "object") ? merged as Record<string, unknown> : {};
+  const out: Record<string, unknown> = {};
+  for (const [key, def] of Object.entries(SETTINGS_DEFAULTS)) {
+    const v = m[key];
+    if (typeof def === "number") {
+      const n = Number(v ?? def);
+      out[key] = Number.isFinite(n) && n >= 0 ? n : def;
+    } else if (key === "standingLayers") {
+      out[key] = typeof v === "string" ? v : (Array.isArray(v) ? v.join(",") : def);
+    } else {
+      out[key] = typeof v === "string" ? v : def;
+    }
+  }
+  return out;
+}
+
+const SETTINGS_NS = "dsh-iwiw-memory";
+
 export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   const python = config.python ?? DEFAULT_PYTHON;
   const cwd = config.cwd ?? DEFAULT_CWD;
-  const coreMaxChars = config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS;
-  const standingLayers = (config.standingLayers ?? ["profile", "rules"]).filter((t) => VALID_MEM_TYPES.has(t));
-  const reflectTurns = config.reflectTurns ?? 7;
-  const dreamIdleMinutes = config.dreamIdleMinutes ?? 180;
+  // settings.yaml user 层可调字段：patch config 为初始值，settings 注册后被覆盖；
+  // 消费点读 overrides（大部分字段热生效：下一步/下一轮 dream 间隔即生效）。
+  const overrides: Record<string, any> = {
+    coreMaxChars: config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS,
+    standingLayers: config.standingLayers ?? ["profile", "rules"],
+    reflectTurns: config.reflectTurns ?? 7,
+    dreamIdleMinutes: config.dreamIdleMinutes ?? 180,
+    hitTopK: undefined as number | undefined,
+  };
+  overrides.hitTopK = config.hitTopK ?? 3;
+  const standingLayers = (): string[] => (overrides.standingLayers as string[]).filter((t) => VALID_MEM_TYPES.has(t));
+  const reflectTurns = (): number => overrides.reflectTurns as number;
+  const hitTopK = (): number => overrides.hitTopK as number;
+  ctx.inject(["settings"], (sctx: any) => {
+    try {
+      const scope = sctx.settings.register(
+        SETTINGS_NS,
+        settingsSchema,
+        { base: settingsSchema(config) },
+      );
+      const applySettings = (resolved: Record<string, unknown>): void => {
+        for (const [k, v] of Object.entries(resolved)) {
+          // standingLayers 存储为逗号分隔字符串，运行时消费需要数组
+          overrides[k] = k === "standingLayers"
+            ? String(v).split(",").map((s) => s.trim()).filter((t) => VALID_MEM_TYPES.has(t))
+            : v;
+        }
+      };
+      applySettings(settingsSchema(scope.get()));
+      scope.watch(() => {
+        applySettings(settingsSchema(scope.get()));
+        ctx.logger.info(`[dsh-iwiw-memory] settings updated: ${JSON.stringify(overrides)}`);
+      });
+      ctx.logger.info("[dsh-iwiw-memory] settings section installed");
+    } catch (e) {
+      ctx.logger.warn("[dsh-iwiw-memory] settings registration failed (patch config in effect)", e);
+    }
+  });
   const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
   const tools = new MemoryTools(backend);
 
@@ -155,8 +219,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   // 4) 动态 core 段：standingLayers 各层（rules 除外）list + 逐条 read，字符预算内拼装。
   const fetchCoreText = async (): Promise<string> => {
     try {
-      const layers = standingLayers.filter((t) => t !== "rules");
-      let budget = coreMaxChars;
+      const layers = standingLayers().filter((t) => t !== "rules");
+      let budget = overrides.coreMaxChars as number;
       const lines: string[] = [];
       for (const layer of layers) {
         // MCP list_memories 返回裸数组；execute 层的 {items} 包装不经过这里
@@ -187,7 +251,7 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   let pending = false;
   const fetchRulesText = async (): Promise<string> => {
     // rules 类准则全量注入（archived 退役不注入）；未配置 rules 层则无准则段
-    if (!standingLayers.includes("rules")) return "";
+    if (!standingLayers().includes("rules")) return "";
     try {
       const raw = (await tools.list({ priority: "active", mem_type: "rules", limit: 50 })) as
         | Array<{ slug: string; description: string }> | { items?: Array<{ slug: string; description: string }> };
@@ -242,7 +306,6 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回）。
   //    检索带 session_id + context（内核 per-session SessionState，回指联想）
   //    并排除常驻层（已在 system 注入，命中注入防重复）。
-  const hitTopK = config.hitTopK ?? 3;
   const injectedBySession = new Map<string, Set<string>>();
   // 压缩后补回：compaction 释放去重并快照本会话已注入 slugs，compaction/end 后 pre-step 补回
   const reinjectArmed = new Map<string, string[]>();
@@ -311,7 +374,7 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         return { ...decision, messages: rewritten };
       }
       // ── reflect steering：连续 N 步未写入 → 注入一次性回顾提示（优先于命中注入）──
-      if (reflectTurns > 0 && stepSinceWrite >= reflectTurns) {
+      if (reflectTurns() > 0 && stepSinceWrite >= reflectTurns()) {
         stepSinceWrite = 0;
         const reflectText = [
           "## 会话回顾（reflect）",
@@ -359,8 +422,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         }
         const context = userTexts.slice(-4, -1);
         const raw = await tools.search({
-          query: text, top_k: hitTopK, session_id: sid,
-          context, exclude_mem_types: standingLayers,
+          query: text, top_k: hitTopK(), session_id: sid,
+          context, exclude_mem_types: standingLayers(),
         });
         const hits = (Array.isArray(raw) ? raw : ((raw as any)?.hits ?? [])) as Array<{
           slug: string; description: string; priority: string; content: string;
@@ -390,11 +453,14 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
 
   // 6) dream 空闲整理：空闲 dreamIdleMinutes 且非峰时 → 调内核 run_dream（低风险修正留痕自愈，归档进待审批）。
   //    结果暂存 lastDreamReport，下一次对话 pre-step 一次性注入（渲染端折叠为「梦境整理报告」横条）。
+  //    常驻定时器（10min 检查一次），每次读 overrides.dreamIdleMinutes——settings 改空闲阈值热生效；设 0 即停。
   const lastDreamReport = { value: "" };
-  const dreamTimer = dreamIdleMinutes > 0
+  const dreamIdleMinutes = (): number => overrides.dreamIdleMinutes as number;
+  const dreamTimer = dreamIdleMinutes() > 0
     ? setInterval(() => {
-        if (dreamRunning) return;
-        if (Date.now() - lastActivityAt.value < dreamIdleMinutes * 60_000) return;
+        const idle = dreamIdleMinutes();
+        if (idle <= 0 || dreamRunning) return;
+        if (Date.now() - lastActivityAt.value < idle * 60_000) return;
         if (isPeakTime(new Date())) return;
         dreamRunning = true;
         ctx.logger.info("[dsh-iwiw-memory] dream: idle threshold reached, running consolidation");

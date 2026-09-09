@@ -892,110 +892,57 @@ function startDreamSkipManager() {
 // src/settings-page.ts
 var React = __toESM(require("react"), 1);
 var SETTINGS_NS = "dsh-iwiw-memory";
-var CSS_ID2 = "meow-memory-settings-css";
+var CSS_ID2 = "iwiw-memory-settings-css";
 var CSS2 = `
-.meowmm_set_page{color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:10px;max-width:760px;padding:4px 0}
-.meowmm_set_title{font-size:16px;font-weight:600;margin:0}
-.meowmm_set_subtitle{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.6;margin:0}
-.meowmm_set_card{background:color-mix(in srgb,currentColor 3%,transparent);border:1px solid var(--dsw-alias-border-l3);border-radius:10px;display:flex;flex-direction:column;gap:8px;padding:12px}
-.meowmm_set_group{color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:600;margin-top:2px}
-.meowmm_set_row{align-items:flex-start;display:flex;gap:10px;justify-content:space-between}
-.meowmm_set_rowtext{display:flex;flex-direction:column;gap:2px;min-width:0}
-.meowmm_set_label{font-size:13px;font-weight:500}
-.meowmm_set_hint{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.5}
-.meowmm_set_ctrl{flex:none;padding-top:2px}
-.meowmm_set_input{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:190px}
-.meowmm_set_input_err{border-color:#f43f5e}
-.meowmm_set_input_time{width:230px;font-family:ui-monospace,monospace}
-.meowmm_set_check{cursor:pointer}
-.meowmm_set_badge{border-radius:999px;font-size:11px;line-height:16px;padding:0 8px;flex:none}
-.meowmm_set_badge_override{background:color-mix(in srgb,#f59e0b 18%,transparent);color:#f59e0b}
-.meowmm_set_badge_prefill{background:color-mix(in srgb,#60a5fa 18%,transparent);color:#60a5fa}
-.meowmm_set_reset{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:12px;padding:2px 8px}
-.meowmm_set_reset:hover{border-color:var(--dsw-alias-border-l2);color:inherit}
-.meowmm_set_err{color:#f43f5e;font-size:12px;line-height:1.5;margin:0}
-.meowmm_set_saved{color:#34d399;font-size:12px}
-.meowmm_set_muted{color:var(--dsw-alias-label-caption);font-size:12px}
+.iwiw_set_page{color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:10px;max-width:760px;padding:4px 0}
+.iwiw_set_title{font-size:16px;font-weight:600;margin:0}
+.iwiw_set_subtitle{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.6;margin:0}
+.iwiw_set_card{background:color-mix(in srgb,currentColor 3%,transparent);border:1px solid var(--dsw-alias-border-l3);border-radius:10px;display:flex;flex-direction:column;gap:8px;padding:12px}
+.iwiw_set_group{color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:600;margin-top:2px}
+.iwiw_set_row{align-items:flex-start;display:flex;gap:10px;justify-content:space-between}
+.iwiw_set_rowtext{display:flex;flex-direction:column;gap:2px;min-width:0}
+.iwiw_set_label{font-size:13px;font-weight:500}
+.iwiw_set_hint{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.5}
+.iwiw_set_ctrl{flex:none;padding-top:2px}
+.iwiw_set_input{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:190px}
+.iwiw_set_check{cursor:pointer}
+.iwiw_set_badge{border-radius:999px;font-size:11px;line-height:16px;padding:0 8px;flex:none}
+.iwiw_set_badge_override{background:color-mix(in srgb,#f59e0b 18%,transparent);color:#f59e0b}
+.iwiw_set_badge_prefill{background:color-mix(in srgb,#60a5fa 18%,transparent);color:#60a5fa}
+.iwiw_set_reset{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:12px;padding:2px 8px}
+.iwiw_set_reset:hover{border-color:var(--dsw-alias-border-l2);color:inherit}
+.iwiw_set_err{color:#f43f5e;font-size:12px;line-height:1.5;margin:0}
+.iwiw_set_saved{color:#34d399;font-size:12px}
+.iwiw_set_muted{color:var(--dsw-alias-label-caption);font-size:12px}
 `;
 var el = React.createElement;
 var FIELDS = [
   {
-    title: "\u57FA\u7840",
-    fields: [
-      { key: "enabled", label: "\u603B\u5F00\u5173", type: "bool", hint: "\u5173\u95ED\u540E\u6CE8\u5165\u3001\u53CD\u601D\u3001\u8BB0\u5FC6\u5DE5\u5177\u5168\u90E8\u505C\u7528" },
-      { key: "projectDir", label: "\u8BB0\u5FC6\u76EE\u5F55", type: "str", hint: "\u76F8\u5BF9\u5DE5\u4F5C\u533A\u7684\u6570\u636E\u76EE\u5F55", placeholder: ".dsh-meow" },
-      { key: "autoMigrate", label: "\u81EA\u52A8\u8FC1\u79FB\u65E7\u5E93", type: "bool", hint: "\u9996\u6B21\u6253\u5F00 v1 \u5E93\u65F6\u81EA\u52A8\u8FC1\u79FB PROJECT.md" }
-    ]
-  },
-  {
     title: "\u6CE8\u5165\u4E0E\u547D\u4E2D",
     fields: [
-      { key: "hitTopK", label: "\u6BCF\u6761\u6D88\u606F\u547D\u4E2D\u6761\u6570\u4E0A\u9650", type: "num", hint: "\u5173\u952E\u8BCD\u547D\u4E2D\u6CE8\u5165\u7684\u6761\u76EE\u4E0A\u9650\uFF08fact/lesson/rules/topic\uFF09" },
-      { key: "titleMax", label: "\u5BFC\u5F15\u6807\u9898\u622A\u65AD\u957F\u5EA6", type: "num", hint: "\u8BB0\u5FC6\u5BFC\u5F15\u91CC\u9879\u76EE\u5217\u8868\u7684\u622A\u65AD\u957F\u5EA6\uFF08\u5B57\u7B26\uFF09" }
+      { key: "hitTopK", label: "\u6BCF\u6761\u6D88\u606F\u547D\u4E2D\u6CE8\u5165\u6761\u6570\u4E0A\u9650", type: "num", hint: "\u6BCF\u6761\u7528\u6237\u6D88\u606F\u6700\u591A\u8054\u60F3\u6CE8\u5165\u7684\u8BB0\u5FC6\u6761\u6570\uFF0C\u6539\u5B8C\u4E0B\u4E00\u6761\u6D88\u606F\u751F\u6548" },
+      { key: "coreMaxChars", label: "\u5E38\u9A7B\u8BB0\u5FC6\u6BB5\u5B57\u7B26\u9884\u7B97", type: "num", hint: "\u957F\u671F\u8BB0\u5FC6\uFF08\u5E38\u9A7B\u5C42\uFF09\u6CE8\u5165\u7684\u603B\u5B57\u7B26\u4E0A\u9650\uFF0C\u8D85\u51FA\u6309\u6761\u622A\u65AD" }
     ]
   },
   {
-    title: "\u53CD\u601D",
+    title: "\u56DE\u987E\u4E0E\u6574\u7406",
     fields: [
-      { key: "reflect", label: "\u81EA\u52A8\u53CD\u601D", type: "bool", hint: "\u4EFB\u52A1\u7ED3\u675F\u540E\u81EA\u52A8\u56DE\u987E\u8BB0\u5FC6" },
-      { key: "reflectTurns", label: "\u53CD\u601D\u89E6\u53D1\u8F6E\u6570", type: "num", hint: "\u5355\u4EFB\u52A1\u5185\u8FDE\u7EED\u5DE5\u5177\u6B65\u8FBE\u5230\u8BE5\u503C\u624D\u5728\u7ED3\u675F\u65F6\u89E6\u53D1" }
+      { key: "reflectTurns", label: "\u56DE\u987E\u63D0\u793A\u89E6\u53D1\u6B65\u6570", type: "num", hint: "\u8FDE\u7EED N \u6B65\u672A\u5199\u5165\u8BB0\u5FC6\u65F6\u6CE8\u5165\u4E00\u6B21\u6027\u56DE\u987E\u63D0\u793A\uFF1B0=\u5173\u95ED" },
+      { key: "dreamIdleMinutes", label: "\u7A7A\u95F2\u6574\u7406\u9608\u503C\uFF08\u5206\u949F\uFF09", type: "num", hint: "\u7A7A\u95F2\u6EE1\u8BE5\u5206\u949F\u6570\u4E14\u975E\u5CF0\u65F6\uFF089-12/14-18\uFF09\u89E6\u53D1 dream \u6574\u7406\uFF1B0=\u5173\u95ED" }
     ]
   },
   {
-    title: "\u6574\u7406\u4EFB\u52A1\u6A21\u578B",
+    title: "\u5E38\u9A7B\u5C42\uFF08\u6A21\u5F0F\u914D\u7F6E\uFF09",
     fields: [
-      { key: "model", sub: "delegate", label: "\u53CD\u601D/\u68A6\u5883\u6362\u6A21\u578B", type: "str", hint: "\u7559\u7A7A=\u5168\u7A0B\u4E3B\u6A21\u578B\u3002\u586B\u5199\u540E\u53CD\u601D\u8F6E\u4E0E\u68A6\u5883\u8F6E\u81EA\u52A8\u6362\u7528\u8BE5\u6A21\u578B\u6267\u884C\uFF0C\u8F6E\u6B21\u7ED3\u675F\u81EA\u52A8\u6362\u56DE\u4E3B\u6A21\u578B\uFF08\u5176\u4F59\u5BF9\u8BDD\u4E0D\u53D7\u5F71\u54CD\uFF09\uFF1B'provider/model' \u6307\u5B9A\u8DEF\u7531\uFF0C'model' \u53EA\u6362\u6A21\u578B\u540D", placeholder: "\u5982 zai-coding-cn/glm-5.3-flash" }
-    ]
-  },
-  {
-    title: "\u7A7A\u95F2\u6574\u7406\uFF08dream\uFF09",
-    fields: [
-      { key: "enabled", sub: "dream", label: "\u7A7A\u95F2\u6574\u7406\u5F00\u5173", type: "bool" },
-      { key: "idleMinutes", sub: "dream", label: "\u7A7A\u95F2\u5206\u949F\u6570", type: "num", hint: "\u7A97\u53E3\u7A7A\u95F2\u6EE1\u8BE5\u5206\u949F\u6570\u5373\u5141\u8BB8 dream" },
-      { key: "suppressWindows", sub: "dream", label: "\u5CF0\u65F6\u6291\u5236\u65F6\u6BB5", type: "str", hint: '"HH:MM-HH:MM" \u9017\u53F7\u5206\u9694\uFF1B\u8FD9\u4E9B\u65F6\u6BB5\u5185\u4E0D\u89E6\u53D1 dream', placeholder: "09:00-12:00, 14:00-18:00" },
-      { key: "suppressLeadMinutes", sub: "dream", label: "\u5CF0\u65F6\u524D\u8FFD\u52A0\u6291\u5236\uFF08\u5206\u949F\uFF09", type: "num" },
-      { key: "checkMinutes", sub: "dream", label: "\u68C0\u67E5\u5468\u671F\uFF08\u5206\u949F\uFF09", type: "num" },
-      { key: "timeZone", sub: "dream", label: "\u6291\u5236\u65F6\u6BB5\u65F6\u533A", type: "str", hint: "\u5CF0\u65F6\u7A97\u53E3\u6309\u6B64\u56FA\u5B9A\u65F6\u533A\u8BA1\u7B97\uFF08\u4E0E\u7CFB\u7EDF\u65F6\u949F\u65E0\u5173\uFF09" },
-      { key: "rulesReviewDays", sub: "dream", label: "\u51C6\u5219\u9632 churn \u5929\u6570", type: "num", hint: "updated_at \u8DDD\u4ECA\u8D85\u8BE5\u5929\u6570\u7684\u7A33\u5B9A\u51C6\u5219\u4E0D\u8FDB dream \u7B2C 1 \u8F6E\uFF1B0=\u4E0D\u8FC7\u6EE4" }
-    ]
-  },
-  {
-    title: "\u8BED\u8A00",
-    fields: [
-      { key: "promptLang", label: "prompt \u4E0E\u68C0\u7D22\u8BED\u8A00", type: "str", hint: "\u7559\u7A7A=\u9ED8\u8BA4 zh\uFF08\u672A\u914D\u7F6E\u8FC7\u7684\u4F1A\u8BDD\u4F1A\u6536\u5230\u4E00\u6B21\u9996\u7528\u5F15\u5BFC\uFF09\uFF1B'en'=\u5185\u7F6E\u82F1\u6587\u8BED\u8A00\u5305\u3002\u8BED\u8A00\u5FC5\u987B\u4E0E\u4F60\u8BF4\u7684\u8BDD\u4E00\u81F4\uFF0C\u5426\u5219\u5173\u952E\u8BCD\u547D\u4E2D\u7387\u4E0B\u964D", placeholder: "zh / en" }
+      { key: "standingLayers", label: "\u5E38\u9A7B\u8BB0\u5FC6\u7C7B\u578B", type: "str", hint: "\u9017\u53F7\u5206\u9694\uFF1Aprofile/fact/lesson/rules/project\u3002chat \u6A21\u5F0F=profile,rules\uFF1Bdev \u6A21\u5F0F\u5EFA\u8BAE rules\u3002\u8FD9\u4E9B\u7C7B\u578B\u5168\u91CF\u6CE8\u5165\u6BCF\u8F6E\uFF0C\u5176\u4F59\u6309\u8BDD\u9898\u68C0\u7D22\u53EC\u56DE", placeholder: "profile,rules" }
     ]
   }
 ];
-function parseSuppressWindows(text) {
-  const trimmed = text.trim();
-  if (trimmed === "") return { value: [] };
-  const out = [];
-  for (const part of trimmed.split(/[,，]/)) {
-    const seg = part.trim();
-    if (!seg) continue;
-    const m = /^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/.exec(seg);
-    if (!m) return { error: `\u65F6\u6BB5\u683C\u5F0F\u5E94\u4E3A "HH:MM-HH:MM"\uFF0C\u6536\u5230 "${seg}"` };
-    out.push({ start: m[1], end: m[2] });
-  }
-  if (out.length === 0) return { error: "\u81F3\u5C11\u4E00\u4E2A\u65F6\u6BB5" };
-  return { value: out };
-}
-function serializeSuppressWindows(w) {
-  return (w ?? []).map((x) => `${x.start}-${x.end}`).join(", ");
-}
 function fieldValue(value, spec) {
-  if (spec.sub === void 0) return value?.[spec.key];
-  const parent = value?.[spec.sub];
-  return parent?.[spec.key];
+  return value?.[spec.key];
 }
 function inUserLayer(user, spec) {
-  if (user === void 0) return false;
-  if (spec.sub === void 0) return spec.key in user;
-  const parent = user[spec.sub];
-  return parent !== void 0 && spec.key in parent;
-}
-function draftKey(spec) {
-  return spec.sub === void 0 ? spec.key : `${spec.sub}.${spec.key}`;
+  return user !== void 0 && spec.key in user;
 }
 function jsonEqual(a, b) {
   if (a === b) return true;
@@ -1015,14 +962,13 @@ function MemorySettingsSection(props) {
   const snap = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const [savedAt, setSavedAt] = React.useState(0);
   const [error, setError] = React.useState(null);
-  const [suppressText, setSuppressText] = React.useState(null);
   const [drafts, setDrafts] = React.useState({});
   const flashSaved = () => {
     setSavedAt(Date.now());
     window.setTimeout(() => setSavedAt((t) => t === 0 ? 0 : t), 4e3);
   };
   const clearDraft = (spec) => {
-    const key = draftKey(spec);
+    const key = spec.key;
     setDrafts((prev) => {
       if (!(key in prev)) return prev;
       const next = { ...prev };
@@ -1033,22 +979,14 @@ function MemorySettingsSection(props) {
   const apply2 = async (spec, newValue) => {
     setError(null);
     try {
-      if (spec.sub === void 0) {
-        await scope.set(spec.key, newValue);
-      } else {
-        const user = scope.getSnapshot().user;
-        const parent = { ...user?.[spec.sub] ?? {} };
-        parent[spec.key] = newValue;
-        await scope.set(spec.sub, parent);
-      }
+      await scope.set(spec.key, newValue);
     } catch (e) {
       setError(`\u4FDD\u5B58\u5931\u8D25\uFF1A${e instanceof Error ? e.message : String(e)}`);
       return false;
     }
     const landed = () => {
       const v = scope.getSnapshot().user;
-      const cur = spec.sub === void 0 ? v?.[spec.key] : v?.[spec.sub]?.[spec.key];
-      return jsonEqual(cur, newValue);
+      return jsonEqual(v?.[spec.key], newValue);
     };
     if (landed()) {
       flashSaved();
@@ -1066,19 +1004,10 @@ function MemorySettingsSection(props) {
   const reset = async (spec) => {
     setError(null);
     try {
-      if (spec.sub === void 0) {
-        await scope.unset(spec.key);
-      } else {
-        const user = scope.getSnapshot().user;
-        const parent = { ...user?.[spec.sub] ?? {} };
-        delete parent[spec.key];
-        if (Object.keys(parent).length === 0) await scope.unset(spec.sub);
-        else await scope.set(spec.sub, parent);
-      }
+      await scope.unset(spec.key);
       const gone = () => {
         const v = scope.getSnapshot().user;
-        const cur = spec.sub === void 0 ? v?.[spec.key] : v?.[spec.sub]?.[spec.key];
-        return cur === void 0;
+        return v?.[spec.key] === void 0;
       };
       if (!gone()) await new Promise((resolve) => window.setTimeout(resolve, 300));
       if (gone()) {
@@ -1091,29 +1020,27 @@ function MemorySettingsSection(props) {
     }
   };
   if (snap.status === "loading") {
-    return el("div", { className: "meowmm_set_page" }, el("span", { className: "meowmm_set_muted" }, "\u55B5\u8BB0\u5FC6\u914D\u7F6E\u52A0\u8F7D\u4E2D\u2026"));
+    return el("div", { className: "iwiw_set_page" }, el("span", { className: "iwiw_set_muted" }, "iwiw \u8BB0\u5FC6\u914D\u7F6E\u52A0\u8F7D\u4E2D\u2026"));
   }
   if (snap.status === "unavailable") {
-    return el("div", { className: "meowmm_set_page" }, el("span", { className: "meowmm_set_muted" }, "\u5F53\u524D\u8FDE\u63A5\u4E0D\u652F\u6301\u8BBE\u7F6E\u5199\u5165\uFF08\u4EC5\u672C\u673A\u56DE\u73AF\u8FDE\u63A5\u53EF\u7F16\u8F91\uFF09\u3002"));
+    return el("div", { className: "iwiw_set_page" }, el("span", { className: "iwiw_set_muted" }, "\u5F53\u524D\u8FDE\u63A5\u4E0D\u652F\u6301\u8BBE\u7F6E\u5199\u5165\uFF08\u4EC5\u672C\u673A\u56DE\u73AF\u8FDE\u63A5\u53EF\u7F16\u8F91\uFF09\u3002"));
   }
   const renderField = (spec) => {
     const raw = fieldValue(snap.value, spec);
     const overridden = inUserLayer(snap.user, spec);
-    const isSuppress = spec.sub === "dream" && spec.key === "suppressWindows";
-    const editingSuppress = isSuppress && suppressText !== null;
     const mirrorText = typeof raw === "string" ? raw : spec.type === "num" && typeof raw === "number" ? String(raw) : "";
-    const draft = drafts[draftKey(spec)];
+    const draft = drafts[spec.key];
     let control = null;
     if (spec.type === "bool") {
       const checked = typeof draft === "boolean" ? draft : raw === true;
       control = el("input", {
-        className: "meowmm_set_check",
+        className: "iwiw_set_check",
         type: "checkbox",
         checked,
         disabled: !snap.writable,
         onChange: (e) => {
           const next = e.target.checked;
-          setDrafts((prev) => ({ ...prev, [draftKey(spec)]: next }));
+          setDrafts((prev) => ({ ...prev, [spec.key]: next }));
           void apply2(spec, next).then((ok) => {
             if (ok) clearDraft(spec);
           });
@@ -1122,11 +1049,11 @@ function MemorySettingsSection(props) {
     } else if (spec.type === "num") {
       const text = typeof draft === "string" ? draft : mirrorText;
       control = el("input", {
-        className: "meowmm_set_input",
+        className: "iwiw_set_input",
         type: "number",
         value: text,
         disabled: !snap.writable,
-        onChange: (e) => setDrafts((prev) => ({ ...prev, [draftKey(spec)]: e.target.value })),
+        onChange: (e) => setDrafts((prev) => ({ ...prev, [spec.key]: e.target.value })),
         onBlur: (e) => {
           const v = e.target.value;
           const num = Number(v);
@@ -1139,32 +1066,15 @@ function MemorySettingsSection(props) {
           });
         }
       });
-    } else if (isSuppress) {
-      const text = editingSuppress ? suppressText : serializeSuppressWindows(raw);
-      const parsed = parseSuppressWindows(text);
-      control = el("input", {
-        className: "meowmm_set_input meowmm_set_input_time" + (editingSuppress && parsed.error ? " meowmm_set_input_err" : ""),
-        value: text,
-        disabled: !snap.writable,
-        placeholder: "09:00-12:00, 14:00-18:00",
-        onChange: (e) => setSuppressText(e.target.value),
-        onBlur: () => {
-          if (!editingSuppress) return;
-          const res = parseSuppressWindows(suppressText);
-          setSuppressText(null);
-          if (res.error !== void 0 || res.value === void 0) return;
-          void apply2(spec, res.value);
-        }
-      });
     } else {
       const text = typeof draft === "string" ? draft : mirrorText;
       control = el("input", {
-        className: "meowmm_set_input",
+        className: "iwiw_set_input",
         type: "text",
         value: text,
         placeholder: spec.placeholder,
         disabled: !snap.writable,
-        onChange: (e) => setDrafts((prev) => ({ ...prev, [draftKey(spec)]: e.target.value })),
+        onChange: (e) => setDrafts((prev) => ({ ...prev, [spec.key]: e.target.value })),
         onBlur: (e) => {
           const next = e.target.value;
           if (next === mirrorText) {
@@ -1179,20 +1089,19 @@ function MemorySettingsSection(props) {
     }
     return el(
       "div",
-      { key: spec.key, className: "meowmm_set_row" },
+      { key: spec.key, className: "iwiw_set_row" },
       el(
         "div",
-        { className: "meowmm_set_rowtext" },
-        el("span", { className: "meowmm_set_label" }, spec.label),
-        spec.hint !== void 0 ? el("span", { className: "meowmm_set_hint" }, spec.hint) : null,
-        editingSuppress && parseSuppressWindows(suppressText).error !== void 0 ? el("span", { className: "meowmm_set_err" }, parseSuppressWindows(suppressText).error) : null
+        { className: "iwiw_set_rowtext" },
+        el("span", { className: "iwiw_set_label" }, spec.label),
+        spec.hint !== void 0 ? el("span", { className: "iwiw_set_hint" }, spec.hint) : null
       ),
       el(
         "div",
-        { className: "meowmm_set_ctrl", style: { display: "flex", gap: "8px", alignItems: "center" } },
+        { className: "iwiw_set_ctrl", style: { display: "flex", gap: "8px", alignItems: "center" } },
         control,
-        el("span", { className: `meowmm_set_badge ${overridden ? "meowmm_set_badge_override" : "meowmm_set_badge_prefill"}` }, overridden ? "\u5DF2\u8986\u76D6" : "\u9ED8\u8BA4"),
-        overridden && snap.writable ? el("button", { className: "meowmm_set_reset", onClick: () => {
+        el("span", { className: `iwiw_set_badge ${overridden ? "iwiw_set_badge_override" : "iwiw_set_badge_prefill"}` }, overridden ? "\u5DF2\u8986\u76D6" : "\u9ED8\u8BA4"),
+        overridden && snap.writable ? el("button", { className: "iwiw_set_reset", onClick: () => {
           clearDraft(spec);
           void reset(spec);
         } }, "\u6062\u590D\u9ED8\u8BA4") : null
@@ -1201,21 +1110,21 @@ function MemorySettingsSection(props) {
   };
   return el(
     "div",
-    { className: "meowmm_set_page" },
-    el("h2", { className: "meowmm_set_title" }, "\u55B5\u8BB0\u5FC6"),
+    { className: "iwiw_set_page" },
+    el("h2", { className: "iwiw_set_title" }, "iwiw \u8BB0\u5FC6"),
     el(
       "p",
-      { className: "meowmm_set_subtitle" },
-      "\u8DE8\u4F1A\u8BDD\u8BB0\u5FC6\u63D2\u4EF6\u7684\u5168\u90E8\u8BBE\u7F6E\u3002\u6539\u52A8\u4FDD\u5B58\u5728 DSH \u8BBE\u7F6E\u91CC\uFF08\u5B57\u6BB5\u7EA7\uFF0C\u53EF\u5355\u9879\u6062\u590D\u9ED8\u8BA4\uFF09\uFF1B\u751F\u6548\u9700\u8981\u70ED\u91CD\u8F7D/\u91CD\u542F meow-memory \u63D2\u4EF6\u3002"
+      { className: "iwiw_set_subtitle" },
+      "\u672C\u5730\u957F\u671F\u8BB0\u5FC6\u63D2\u4EF6\u7684\u8FD0\u884C\u53C2\u6570\u3002\u6539\u52A8\u4FDD\u5B58\u5728 DSH \u8BBE\u7F6E\u91CC\uFF08\u5B57\u6BB5\u7EA7\uFF0C\u53EF\u5355\u9879\u6062\u590D\u9ED8\u8BA4\uFF09\uFF1BhitTopK / reflectTurns / dreamIdleMinutes / standingLayers \u70ED\u751F\u6548\uFF0CcoreMaxChars \u5728\u4E0B\u6B21 core \u6BB5\u5237\u65B0\u65F6\u751F\u6548\u3002"
     ),
-    !snap.writable ? el("span", { className: "meowmm_set_muted" }, "\u5F53\u524D\u8FDE\u63A5\u4E3A\u53EA\u8BFB\uFF08\u8BBE\u7F6E\u5199\u5165\u4EC5\u9650\u672C\u673A\u56DE\u73AF\u8FDE\u63A5\uFF09\u3002") : null,
-    savedAt > 0 ? el("span", { className: "meowmm_set_saved" }, "\u5DF2\u4FDD\u5B58 \u2713 \u70ED\u91CD\u8F7D/\u91CD\u542F meow-memory \u63D2\u4EF6\u540E\u751F\u6548") : null,
-    error !== null ? el("div", { className: "meowmm_set_err" }, error) : null,
+    !snap.writable ? el("span", { className: "iwiw_set_muted" }, "\u5F53\u524D\u8FDE\u63A5\u4E3A\u53EA\u8BFB\uFF08\u8BBE\u7F6E\u5199\u5165\u4EC5\u9650\u672C\u673A\u56DE\u73AF\u8FDE\u63A5\uFF09\u3002") : null,
+    savedAt > 0 ? el("span", { className: "iwiw_set_saved" }, "\u5DF2\u4FDD\u5B58 \u2713") : null,
+    error !== null ? el("div", { className: "iwiw_set_err" }, error) : null,
     ...FIELDS.map(
       (group) => el(
         "div",
-        { key: group.title, className: "meowmm_set_card" },
-        el("div", { className: "meowmm_set_group" }, group.title),
+        { key: group.title, className: "iwiw_set_card" },
+        el("div", { className: "iwiw_set_group" }, group.title),
         ...group.fields.map(renderField)
       )
     )
@@ -1224,7 +1133,7 @@ function MemorySettingsSection(props) {
 function applySettingsPage(ctx) {
   if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${CSS_ID2}"]`) === null) {
     const tag = document.createElement("style");
-    tag.dataset.plugin = "meow-memory-settings";
+    tag.dataset.plugin = "iwiw-memory-settings";
     tag.dataset.pluginCss = CSS_ID2;
     tag.textContent = CSS2;
     document.head.appendChild(tag);
@@ -1237,7 +1146,7 @@ function applySettingsPage(ctx) {
         name: "settings.section",
         id: SETTINGS_NS,
         order: 35,
-        label: () => "\u55B5\u8BB0\u5FC6",
+        label: () => "iwiw \u8BB0\u5FC6",
         inject: () => ({ scope })
       },
       MemorySettingsSection
