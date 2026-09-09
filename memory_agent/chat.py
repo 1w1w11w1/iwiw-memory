@@ -21,7 +21,7 @@ chat.py — 记忆系统 CLI 工作台（独立 chat 功能）
   /pending approve <id>      审批通过
   /pending reject <id>       拒绝
   /maintain                  审查记忆维护候选（生成归档待确认动作）
-  /dream                     空闲整理：审查近期记忆（低风险修正自动留痕执行）
+  /consolidate               空闲巩固：审查近期记忆（低风险修正自动留痕执行）
   /stats                     记忆库统计
   /help                      帮助
   /quit                      退出
@@ -359,12 +359,12 @@ async def _handle_command(cmd: str, rest: str, state: dict[str, Any]) -> bool:
             print("  使用 /pending approve <id> 或 /pending reject <id> 处理")
         return True
 
-    if c == "dream":
-        print("（dream 整理中……）")
-        from .maintenance import run_dream
-        r = await run_dream()
+    if c == "consolidate":
+        print("（巩固中……）")
+        from .maintenance import run_consolidate
+        r = await run_consolidate()
         if r.get("error"):
-            print(f"✗ dream 失败: {r['error']}")
+            print(f"✗ 巩固失败: {r['error']}")
             return True
         print(f"✓ 审查了 {r['reviewed']} 条近期记忆")
         for f in r["auto_fixed"]:

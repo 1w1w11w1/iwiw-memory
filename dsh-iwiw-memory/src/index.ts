@@ -24,18 +24,16 @@ interface PluginConfig {
   standingLayers?: string[];
   /** reflect steering：连续 N 个模型步未写入记忆后注入一次性回顾提示；0 关闭（默认 7）。 */
   reflectTurns?: number;
-  /** dream 空闲整理：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
-  dreamIdleMinutes?: number;
+  /** 记忆巩固（consolidate）：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
+  consolidateIdleMinutes?: number;
   /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
   env?: Record<string, string>;
 }
 
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
-const DEFAULT_PYTHON = "E:/desktop/111/.venv/Scripts/python.exe";
-const DEFAULT_CWD = "E:/desktop/111";
 const DEFAULT_CORE_MAX_CHARS = 2500;
 
-/** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
+/** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
 export function isPeakTime(d: Date): boolean {
   const h = d.getHours() + d.getMinutes() / 60;
   return (h >= 8.75 && h < 12) || (h >= 13.75 && h < 18);
@@ -133,22 +131,30 @@ export const SETTINGS_SCHEMA = Schema.object({
   hitTopK: Schema.number().default(3).description("每条消息命中注入条数上限"),
   coreMaxChars: Schema.number().default(2500).description("常驻记忆段字符预算"),
   reflectTurns: Schema.number().default(7).description("回顾提示触发步数，0=关闭"),
-  dreamIdleMinutes: Schema.number().default(180).description("空闲整理阈值（分钟），0=关闭"),
+  consolidateIdleMinutes: Schema.number().default(180).description("空闲巩固阈值（分钟），0=关闭"),
   standingLayers: Schema.string().default("profile,rules").description("常驻记忆类型，逗号分隔"),
 });
 
 const SETTINGS_NS = "dsh-iwiw-memory";
 
 export const apply = async (ctx: Context, config: PluginConfig = {}) => {
-  const python = config.python ?? DEFAULT_PYTHON;
-  const cwd = config.cwd ?? DEFAULT_CWD;
+  // 部署级配置（不进设置页）：插件以 `python -m memory_agent.mcp_server` 拉起记忆内核，
+  // cwd 必须指向 iwiw-memory 仓库根（含 memory_agent/）；缺失即失败并给出修复指引。
+  const python = config.python ?? "python";
+  if (!config.cwd) {
+    throw new Error(
+      "[dsh-iwiw-memory] 缺少部署配置 cwd：请在本机 profile 的 cordis.patch.yml 中为插件设置 "
+      + "config.cwd（iwiw-memory 仓库根目录）与 config.python（Python 解释器路径，缺省取 PATH 上的 python）。",
+    );
+  }
+  const cwd = config.cwd;
   // settings.yaml user 层可调字段：patch config 为初始值，settings 注册后被覆盖；
-  // 消费点读 overrides（大部分字段热生效：下一步/下一轮 dream 间隔即生效）。
+  // 消费点读 overrides（大部分字段热生效：下一步/下一轮巩固间隔即生效）。
   const overrides: Record<string, any> = {
     coreMaxChars: config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS,
     standingLayers: config.standingLayers ?? ["profile", "rules"],
     reflectTurns: config.reflectTurns ?? 7,
-    dreamIdleMinutes: config.dreamIdleMinutes ?? 180,
+    consolidateIdleMinutes: config.consolidateIdleMinutes ?? 180,
     hitTopK: undefined as number | undefined,
   };
   overrides.hitTopK = config.hitTopK ?? 3;
@@ -268,7 +274,7 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
     order: -50,
     text: () => cachedCore || "（core 记忆加载中…）",
   }));
-  // rules 准则段：用户要求持续遵守的准则每轮生效（meow rules 层验证过的机制）
+  // rules 准则段：用户要求持续遵守的准则每轮生效
   disposers.push(ctx.systemPrompt.section({
     name: "iwiw-memory:rules",
     order: -45,
@@ -285,16 +291,16 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   }));
 
   // 5) 每消息命中注入（agent/pre-step）：最后一条 user 消息触发检索，
-  //    命中且未注入过的记忆以快照消息插入其前（meow 同款机制）。
+  //    命中且未注入过的记忆以快照消息插入其前。
   //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回）。
   //    检索带 session_id + context（内核 per-session SessionState，回指联想）
   //    并排除常驻层（已在 system 注入，命中注入防重复）。
   const injectedBySession = new Map<string, Set<string>>();
   // 压缩后补回：compaction 释放去重并快照本会话已注入 slugs，compaction/end 后 pre-step 补回
   const reinjectArmed = new Map<string, string[]>();
-  // dream 活动时间戳：任何 pre-step 活动都刷新
+  // 活动时间戳：任何 pre-step 活动都刷新（供巩固空闲判定）
   const lastActivityAt = { value: Date.now() };
-  let dreamRunning = false;
+  let consolidateRunning = false;
   disposers.push(
     ctx.on("session/event", (session: any, event: any) => {
       const t = event?.type;
@@ -347,13 +353,13 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         .trim();
       if (text.length < 4) return decision;
       const sid = typeof agent?.session?.header?.id === "string" ? agent.session.header.id : "default";
-      // ── dream 报告：空闲整理完成后下一次对话一次性告知（折叠横条显示）──
-      if (lastDreamReport.value) {
-        const report = lastDreamReport.value;
-        lastDreamReport.value = "";
+      // ── 巩固报告：空闲巩固完成后下一次对话一次性告知 ──
+      if (lastConsolidateReport.value) {
+        const report = lastConsolidateReport.value;
+        lastConsolidateReport.value = "";
         const rewritten = [...decision.messages];
-        rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(report, { kind: "dream-report", ids: [] }));
-        ctx.logger.info("[dsh-iwiw-memory] dream report injected");
+        rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(report, { kind: "consolidate-report", ids: [] }));
+        ctx.logger.info("[dsh-iwiw-memory] consolidate report injected");
         return { ...decision, messages: rewritten };
       }
       // ── reflect steering：连续 N 步未写入 → 注入一次性回顾提示（优先于命中注入）──
@@ -434,24 +440,24 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
     }),
   );
 
-  // 6) dream 空闲整理：空闲 dreamIdleMinutes 且非峰时 → 调内核 run_dream（低风险修正留痕自愈，归档进待审批）。
-  //    结果暂存 lastDreamReport，下一次对话 pre-step 一次性注入（渲染端折叠为「梦境整理报告」横条）。
-  //    常驻定时器（10min 检查一次），每次读 overrides.dreamIdleMinutes——settings 改空闲阈值热生效；设 0 即停。
-  const lastDreamReport = { value: "" };
-  const dreamIdleMinutes = (): number => overrides.dreamIdleMinutes as number;
-  const dreamTimer = dreamIdleMinutes() > 0
+  // 6) 记忆巩固（consolidate）：空闲 consolidateIdleMinutes 且非峰时 → 调内核 run_consolidate（低风险修正留痕自愈，归档进待审批）。
+  //    结果暂存 lastConsolidateReport，下一次对话 pre-step 一次性注入。
+  //    常驻定时器（10min 检查一次），每次读 overrides.consolidateIdleMinutes——settings 改空闲阈值热生效；设 0 即停。
+  const lastConsolidateReport = { value: "" };
+  const consolidateIdleMinutes = (): number => overrides.consolidateIdleMinutes as number;
+  const consolidateTimer = consolidateIdleMinutes() > 0
     ? setInterval(() => {
-        const idle = dreamIdleMinutes();
-        if (idle <= 0 || dreamRunning) return;
+        const idle = consolidateIdleMinutes();
+        if (idle <= 0 || consolidateRunning) return;
         if (Date.now() - lastActivityAt.value < idle * 60_000) return;
         if (isPeakTime(new Date())) return;
-        dreamRunning = true;
-        ctx.logger.info("[dsh-iwiw-memory] dream: idle threshold reached, running consolidation");
-        tools.dream()
+        consolidateRunning = true;
+        ctx.logger.info("[dsh-iwiw-memory] consolidate: idle threshold reached");
+        tools.consolidate()
           .then((r: any) => {
             const d = (r && typeof r === "object") ? r as Record<string, any> : {};
             ctx.logger.info(
-              `[dsh-iwiw-memory] dream done: reviewed=${d.reviewed ?? 0} auto_fixed=${d.auto_fixed?.length ?? 0}`
+              `[dsh-iwiw-memory] consolidate done: reviewed=${d.reviewed ?? 0} auto_fixed=${d.auto_fixed?.length ?? 0}`
               + ` pending=${d.pending?.length ?? 0} suggestions=${d.suggestions?.length ?? 0}`
               + (d.error ? ` error=${d.error}` : ""),
             );
@@ -463,22 +469,22 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
             const sugg: string[] = d.suggestions ?? [];
             if (sugg.length) parts.push(`合并建议 ${sugg.length} 条`);
             if (d.error) parts.push(`错误：${d.error}`);
-            if (!fixed.length && !pend.length && !sugg.length && !d.error) parts.push("无需整理");
-            lastDreamReport.value = ["## 梦境整理报告", "", "空闲期整理完成：" + parts.join("；") + "。"].join("\n");
+            if (!fixed.length && !pend.length && !sugg.length && !d.error) parts.push("无需巩固");
+            lastConsolidateReport.value = ["## 记忆巩固报告", "", "空闲期巩固完成：" + parts.join("；") + "。"].join("\n");
           })
-          .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] dream failed", e))
+          .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] consolidate failed", e))
           .finally(() => {
-            dreamRunning = false;
-            // 重置活动时间戳：下一轮 dream 需重新积累完整空闲期
+            consolidateRunning = false;
+            // 重置活动时间戳：下一轮巩固需重新积累完整空闲期
             lastActivityAt.value = Date.now();
           });
       }, 10 * 60_000)
     : null;
 
-  ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + dream scheduler");
+  ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + consolidation scheduler");
 
   return async () => {
-    if (dreamTimer) clearInterval(dreamTimer);
+    if (consolidateTimer) clearInterval(consolidateTimer);
     for (const d of disposers) { try { d(); } catch {} }
     await backend.close();
     ctx.logger.info("[dsh-iwiw-memory] disposed");

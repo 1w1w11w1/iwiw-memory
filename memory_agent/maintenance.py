@@ -100,9 +100,9 @@ async def review_maintenance(limit: int = 20, timeout: float = 20.0) -> dict[str
     return {"reviewed": len(candidates), "pending": pending, "error": None}
 
 
-# ── dream：空闲整理（对标 meow-memory dream 的内核侧）──
+# ── consolidate：空闲巩固（空闲期审查近期记忆，低风险自愈 + 高风险待审批）──
 
-DREAM_SYSTEM_PROMPT = """你是记忆整理器（dream）。审查一批最近创建/更新的长期记忆，提出整理建议。
+CONSOLIDATE_SYSTEM_PROMPT = """你是记忆巩固器（consolidate）。审查一批最近创建/更新的长期记忆，提出巩固建议。
 
 规则：
 - 保守为主：拿不准就 keep。
@@ -121,8 +121,8 @@ DREAM_SYSTEM_PROMPT = """你是记忆整理器（dream）。审查一批最近�
 没有需要整理的返回 []。"""
 
 
-async def run_dream(since_hours: float = 24.0, limit: int = 20, timeout: float = 40.0) -> dict[str, Any]:
-    """dream 整理：审查窗口内创建/更新的记忆。
+async def run_consolidate(since_hours: float = 24.0, limit: int = 20, timeout: float = 40.0) -> dict[str, Any]:
+    """consolidate 巩固：审查窗口内创建/更新的记忆。
 
     低风险修正（retype/update_desc）走 mutation 自动执行（version+audit 可回溯，
     呼应"白箱可审计、事后回溯优于事前确认"）；archive 生成 pending 待审批；
@@ -150,14 +150,14 @@ async def run_dream(since_hours: float = 24.0, limit: int = 20, timeout: float =
     )
     try:
         text = await complete_text(
-            system_prompt=DREAM_SYSTEM_PROMPT,
+            system_prompt=CONSOLIDATE_SYSTEM_PROMPT,
             user_prompt=f"## 本批候选\n{catalog}\n\n返回JSON列表。",
             max_tokens=1200,
             temperature=0.1,
             timeout=timeout,
         )
     except Exception as exc:
-        logger.warning("dream failed: %s", exc)
+        logger.warning("consolidate failed: %s", exc)
         result["error"] = str(exc)
         return result
 
@@ -181,7 +181,7 @@ async def run_dream(since_hours: float = 24.0, limit: int = 20, timeout: float =
             continue
         mem = by_slug[slug]
         action = str(act.get("action") or "keep").strip().lower()
-        reason = str(act.get("reason") or "dream")[:200]
+        reason = str(act.get("reason") or "consolidate")[:200]
 
         if action == "retype":
             new_type = str(act.get("mem_type") or "").strip()
@@ -189,7 +189,7 @@ async def run_dream(since_hours: float = 24.0, limit: int = 20, timeout: float =
                 r = replace_memory_result(
                     slug=slug, description=mem.get("description", ""), body=mem.get("content", ""),
                     mem_type=new_type, priority=mem.get("priority", "active"),
-                    reason=f"dream retype: {reason}", audit_action="dream_retype",
+                    reason=f"consolidate retype: {reason}", audit_action="consolidate_retype",
                 )
                 if r.ok:
                     result["auto_fixed"].append({"slug": slug, "action": "retype", "mem_type": new_type, "reason": reason})
@@ -199,14 +199,14 @@ async def run_dream(since_hours: float = 24.0, limit: int = 20, timeout: float =
                 r = replace_memory_result(
                     slug=slug, description=desc, body=mem.get("content", ""),
                     mem_type=mem.get("mem_type", "fact"), priority=mem.get("priority", "active"),
-                    reason=f"dream update_desc: {reason}", audit_action="dream_desc",
+                    reason=f"consolidate update_desc: {reason}", audit_action="consolidate_desc",
                 )
                 if r.ok:
                     result["auto_fixed"].append({"slug": slug, "action": "update_desc", "reason": reason})
         elif action == "archive":
             if mem.get("mem_type") in ("profile", "rules"):
                 continue
-            item = create_pending_action(action="archive", target_memory_slug=slug, reason=f"dream: {reason}")
+            item = create_pending_action(action="archive", target_memory_slug=slug, reason=f"consolidate: {reason}")
             if item:
                 result["pending"].append({"id": item["id"], "slug": slug, "action": "archive", "reason": item["reason"]})
         elif action == "merge":

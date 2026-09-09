@@ -86,7 +86,7 @@ TOOL_TEMPERATURE = _env_float("MEMORY_AGENT_TOOL_TEMPERATURE", 0.2)
 TOOL_TIMEOUT = _env_float("MEMORY_AGENT_TOOL_TIMEOUT", 30.0)
 TOOL_MAX_LOOPS = _env_int("MEMORY_AGENT_TOOL_MAX_LOOPS", 3)
 
-# ── reflect steering（写入密度兜底，对标 meow-memory reflectTurns）──
+# ── reflect steering（写入密度兜底）──
 # 连续 REFLECT_TURNS 轮未写入记忆时，向 system 注入一次性回顾提示
 # （提示后归零；轮内实际写入也会归零）。0 = 关闭。
 REFLECT_TURNS = _env_int("MEMORY_AGENT_REFLECT_TURNS", 7)

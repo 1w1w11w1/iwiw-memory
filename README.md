@@ -1,6 +1,6 @@
-# 记忆系统（memory-agent）
+# iwiw-memory（iwiw 记忆）
 
-一个独立的本地长期记忆系统。核心是 SQLite 分级事实记忆（core/normal/archive），自带 CLI 对话工作台（chat）用于日常使用与机制验证，并通过 MCP 对外提供完整工具面（为后续接入 DSH 预留）。
+一个带长期记忆系统的 chat：核心是 SQLite 分级事实记忆内核（core/normal/archive 三级 + 版本/审计/回滚），自带 CLI 对话工作台用于日常使用与机制验证，并通过 MCP 对外提供完整工具面；对话能力经多端接入（CLI / DSH 插件，QQ-bot 规划中）复用同一内核。
 
 > 项目早期为个人智能体原型（含自研 harness 与 Web 界面），现已转型为独立的记忆系统核心，移除 harness、会话层与界面层。
 
@@ -9,7 +9,7 @@
 - [架构总览](docs/architecture.md) — 分层、模块职责、不变量
 - [数据流](docs/data-flow.md) — 提取 / 检索 / 写入 / 维护 / 启动五条链路
 - [CLI 使用指南](docs/chat-guide.md) — 命令参考与典型流程
-- [DSH 接入规划](docs/dsh-integration.md) — 第二阶段方向
+- [多端接入演进](docs/dsh-plugin-evolution.md) — 路线图：DSH 插件已落地，QQ-bot 规划中
 
 ## 结构
 
@@ -20,7 +20,9 @@
   - `query_builder.py`：查询扩展
   - `chat.py`：CLI 对话工作台（`python -m memory_agent.chat`）
   - `mcp_server.py`：MCP 工具服务器（`python -m memory_agent.mcp_server`）
+- `dsh-iwiw-memory/`：DSH 接入端（插件）——让任意 DSH agent 获得跨会话记忆，见[插件 README](dsh-iwiw-memory/README.md)
 - `data/`：数据目录（`memory.db` 单一真源；`legacy/` 历史资料；`logs/`）
+- `scripts/`：开发与部署辅助脚本
 - `tests/`：核心机制评估
 
 ## 快速开始
@@ -37,6 +39,16 @@
    ```powershell
    python -m memory_agent.chat
    ```
+
+## 接入层（多端复用）
+
+记忆内核是共享能力，经不同接入端进入对话场景：
+
+| 接入端 | 状态 | 说明 |
+|---|---|---|
+| CLI 工作台（`memory_agent/chat.py`） | ✅ 可用 | 内置对话界面，日常使用与机制验证 |
+| DSH 插件（`dsh-iwiw-memory/`） | ✅ 可用 | 让任意 DSH agent 获得跨会话记忆，安装与配置见[插件 README](dsh-iwiw-memory/README.md) |
+| QQ-bot | 🚧 规划中 | 多端复用方案见[演进文档](docs/dsh-plugin-evolution.md) |
 
 ## 记忆分级
 

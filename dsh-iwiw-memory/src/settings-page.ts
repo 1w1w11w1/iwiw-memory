@@ -8,7 +8,7 @@
  * base=patch config，user 层字段级覆盖，大部分字段热生效（消费点读 overrides）。
  *
  * 字段与 host 侧消费一一对应：hitTopK / coreMaxChars / reflectTurns /
- * dreamIdleMinutes / standingLayers。python/cwd/env 属部署配置，仅在
+ * consolidateIdleMinutes / standingLayers。python/cwd/env 属部署配置，仅在
  * cordis.patch.yml 修改（不在页面暴露）。
  */
 
@@ -65,10 +65,10 @@ const FIELDS: GroupSpec[] = [
     ],
   },
   {
-    title: '回顾与整理',
+    title: '回顾与巩固',
     fields: [
       { key: 'reflectTurns', label: '回顾提示触发步数', type: 'num', hint: '连续 N 步未写入记忆时注入一次性回顾提示；0=关闭' },
-      { key: 'dreamIdleMinutes', label: '空闲整理阈值（分钟）', type: 'num', hint: '空闲满该分钟数且非峰时（9-12/14-18）触发 dream 整理；0=关闭' },
+      { key: 'consolidateIdleMinutes', label: '空闲巩固阈值（分钟）', type: 'num', hint: '空闲满该分钟数且非峰时（9-12/14-18）自动触发记忆巩固；0=关闭' },
     ],
   },
   {
@@ -281,7 +281,7 @@ function MemorySettingsSection(props: { scope: any }): any {
     el(
       'p',
       { className: 'iwiw_set_subtitle' },
-      '本地长期记忆插件的运行参数。改动保存在 DSH 设置里（字段级，可单项恢复默认）；hitTopK / reflectTurns / dreamIdleMinutes / standingLayers 热生效，coreMaxChars 在下次 core 段刷新时生效。',
+      '本地长期记忆插件的运行参数。改动保存在 DSH 设置里（字段级，可单项恢复默认）；hitTopK / reflectTurns / consolidateIdleMinutes / standingLayers 热生效，coreMaxChars 在下次 core 段刷新时生效。',
     ),
     !snap.writable ? el('span', { className: 'iwiw_set_muted' }, '当前连接为只读（设置写入仅限本机回环连接）。') : null,
     savedAt > 0 ? el('span', { className: 'iwiw_set_saved' }, '已保存 ✓') : null,

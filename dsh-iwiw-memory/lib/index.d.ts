@@ -18,12 +18,12 @@ interface PluginConfig {
     standingLayers?: string[];
     /** reflect steering：连续 N 个模型步未写入记忆后注入一次性回顾提示；0 关闭（默认 7）。 */
     reflectTurns?: number;
-    /** dream 空闲整理：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
-    dreamIdleMinutes?: number;
+    /** 记忆巩固（consolidate）：空闲 N 分钟后触发（峰时抑制见 isPeakTime）；0 关闭（默认 180）。 */
+    consolidateIdleMinutes?: number;
     /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
     env?: Record<string, string>;
 }
-/** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
+/** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
 export declare function isPeakTime(d: Date): boolean;
 /** settings schema（schemastery 对象）：设置通道要求 schema 可 JSON 序列化——
  *  host describe 时序列化信封，渲染端 rehydrate+validate（纯函数会静默产出空镜像）。 */
@@ -31,13 +31,13 @@ export declare const SETTINGS_SCHEMA: Schema<Schemastery.ObjectS<{
     hitTopK: Schema<number, number>;
     coreMaxChars: Schema<number, number>;
     reflectTurns: Schema<number, number>;
-    dreamIdleMinutes: Schema<number, number>;
+    consolidateIdleMinutes: Schema<number, number>;
     standingLayers: Schema<string, string>;
 }>, Schemastery.ObjectT<{
     hitTopK: Schema<number, number>;
     coreMaxChars: Schema<number, number>;
     reflectTurns: Schema<number, number>;
-    dreamIdleMinutes: Schema<number, number>;
+    consolidateIdleMinutes: Schema<number, number>;
     standingLayers: Schema<string, string>;
 }>>;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;

@@ -1,5 +1,7 @@
 # 记忆内核接入 DSH / QQ-bot 演进方案
 
+> **状态（2026-09）**：DSH 插件端已落地（`dsh-iwiw-memory/`，安装与配置见[插件 README](../dsh-iwiw-memory/README.md)）；QQ-bot 端规划中。本文的多端复用架构即为现行方向。
+>
 > 主开发方向：生动的 chat 方案。记忆内核（memory_agent）作为共享能力，经 DSH 插件、QQ-bot 等多端复用。
 > 本方案聚焦 DSH 插件（先做），并给出多端复用的整体演进。
 

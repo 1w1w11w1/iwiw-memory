@@ -1,5 +1,7 @@
 # 第二阶段：接入 DSH 规划
 
+> **（历史文档）** 本文写于插件化之前，推荐的 MCP 直挂路线已被 `dsh-iwiw-memory` 插件取代（插件经 MCP 子进程挂载内核，工具面/注入/设置页一并托管）。保留作设计背景；当前路线见 [dsh-plugin-evolution.md](dsh-plugin-evolution.md) 与[插件 README](../dsh-iwiw-memory/README.md)。
+
 > 本文是规划文档，第二阶段实施时才执行。当前阶段保持独立，不依赖 DSH。
 
 ## 目标

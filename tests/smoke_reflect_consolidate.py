@@ -1,4 +1,4 @@
-"""⑤ reflect + ⑥ dream 内核侧 tracer bullet（本地冒烟，不入库提交）。"""
+"""reflect + consolidate 内核侧 tracer bullet（本地冒烟，不入库提交）。"""
 import asyncio
 import sys
 import tempfile
@@ -18,11 +18,11 @@ from memory_agent.config import REFLECT_TURNS
 # ── ⑤ reflect：配置可加载、chat 模块导入无损（轮次逻辑由 E2E 覆盖）──
 assert REFLECT_TURNS >= 1, "REFLECT_TURNS 默认值异常"
 import memory_agent.chat  # noqa: F401  语法/导入完整性
-print(f"⑤ reflect: REFLECT_TURNS={REFLECT_TURNS}，chat 导入 OK")
+print(f"reflect: REFLECT_TURNS={REFLECT_TURNS}，chat 导入 OK")
 
-# ── ⑥ dream：canned LLM 输出做确定性验证 ──
+# ── consolidate：canned LLM 输出做确定性验证 ──
 # 空库短路（先于建数据验证）
-r_empty = asyncio.run(maintenance.run_dream(since_hours=24))
+r_empty = asyncio.run(maintenance.run_consolidate(since_hours=24))
 assert r_empty["reviewed"] == 0, "空库应短路返回"
 
 upsert_memory(slug="d-fact", description="某个项目决策", content="dsh 换装链的拍板过程", mem_type="fact")
@@ -45,7 +45,7 @@ async def fake_complete_text(**kwargs):
 
 
 maintenance.complete_text = fake_complete_text
-r = asyncio.run(maintenance.run_dream(since_hours=24))
+r = asyncio.run(maintenance.run_consolidate(since_hours=24))
 
 assert r["error"] is None, r["error"]
 assert r["reviewed"] == 4, f"reviewed={r['reviewed']}"
@@ -73,4 +73,4 @@ assert get_memory("d-old")["priority"] == "archived"
 hist = list_pending_actions("executed")
 assert len(hist) == 1
 
-print("⑥ dream: retype/update_desc 留痕自愈 + profile 保护 + archive 走审批 + merge 仅建议 — ALL PASS")
+print("consolidate: retype/update_desc 留痕自愈 + profile 保护 + archive 走审批 + merge 仅建议 — ALL PASS")

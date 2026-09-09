@@ -25,8 +25,8 @@ export declare class MemoryTools {
     }): Promise<JsonValue>;
     /** 命中自增（使用强化）：记忆被实际注入时调用，供维护排序。 */
     touch(slugs: string[]): Promise<JsonValue>;
-    /** 空闲整理（dream）：低风险修正自动留痕执行，归档走审批。 */
-    dream(sinceHours?: number, limit?: number): Promise<JsonValue>;
+    /** 记忆巩固（consolidate）：低风险修正自动留痕执行，归档走审批。 */
+    consolidate(sinceHours?: number, limit?: number): Promise<JsonValue>;
     read(params: {
         slug: string;
     }): Promise<JsonValue>;

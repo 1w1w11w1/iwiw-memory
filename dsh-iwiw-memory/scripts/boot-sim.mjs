@@ -16,7 +16,6 @@ const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8
 const bundles = manifest.dsh?.profile?.bundles ?? [];
 console.log("bundles:", bundles.join(", "));
 if (!bundles.includes("@iwiw/dsh-iwiw-memory")) throw new Error("bundle 未列入 profile");
-if (bundles.includes("meow-memory")) throw new Error("meow-memory 仍在 bundles");
 
 const installNodeModules = "D:/dsh/DSH Desktop/resources/app.asar.unpacked/node_modules";
 function resolvePackageDir(packageName) {

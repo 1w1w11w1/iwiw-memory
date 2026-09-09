@@ -12,7 +12,6 @@ import path from "node:path";
 import fs from "node:fs";
 import { apply, isPeakTime } from "../lib/index.js";
 import { MemoryBackend } from "../lib/backend.js";
-import { computeInjectionGroups } from "../lib/client-fold.js";
 
 // B 管道捕获：截获 pre-step 发往 MCP 的 search_memories 调用参数
 const searchCalls = [];
@@ -76,7 +75,7 @@ const settingsEntry = ctx.settingsService.registered["dsh-iwiw-memory"];
 const settingsOk = !!settingsEntry
   && settingsEntry.resolved.hitTopK === 3
   && settingsEntry.resolved.reflectTurns === 7
-  && settingsEntry.resolved.dreamIdleMinutes === 180
+  && settingsEntry.resolved.consolidateIdleMinutes === 180
   && settingsEntry.resolved.standingLayers === "profile,rules";
 console.log("settings 注册断言:", settingsOk ? "PASS" : "FAIL", JSON.stringify(settingsEntry?.resolved));
 
@@ -233,7 +232,7 @@ let reflectOk = false;
   ctx2.logger = { info: () => {}, warn: (...a) => console.log("[warn2]", ...a), error: (...a) => console.log("[error2]", ...a) };
   ctx2.tools = { register: (def) => { registered2.push(def); return () => {}; } };
   ctx2.systemPrompt = { section: () => () => {} };
-  const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, dreamIdleMinutes: 0 });
+  const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, consolidateIdleMinutes: 0 });
   const preStep2 = (handlers2["agent/pre-step"] ?? [])[0];
   const agent2 = { session: { header: { id: "reflect-sess", origin: "main" } } };
   const run2 = async (text) => {
@@ -251,7 +250,7 @@ let reflectOk = false;
   await dispose2();
 }
 
-console.log("\n=== 5.8 dream 峰时抑制（纯函数）===");
+console.log("\n=== 5.8 巩固峰时抑制（纯函数）===");
 const peakOk = isPeakTime(new Date(2026, 0, 1, 9, 0)) === true
   && isPeakTime(new Date(2026, 0, 1, 8, 50)) === true
   && isPeakTime(new Date(2026, 0, 1, 8, 40)) === false
@@ -260,47 +259,7 @@ const peakOk = isPeakTime(new Date(2026, 0, 1, 9, 0)) === true
   && isPeakTime(new Date(2026, 0, 1, 18, 5)) === false;
 console.log("isPeakTime 断言:", peakOk ? "PASS" : "FAIL");
 
-console.log("\n=== 6. client-fold 识别断言（纯计算）===");
-const snapOf = (kind, text) => ({
-  kind: "context",
-  data: {
-    source: { kind: "plugin", plugin: "dsh-iwiw-memory", form: "snapshot", memory: { kind } },
-    content: [{ type: "text", text }],
-  },
-  location: { kind: "turn", turn: { turn: 1 } },
-});
-const snapshot = {
-  chat: {
-    order: ["k1", "k2", "k3", "k4"],
-    nodes: new Map([
-      ["k1", { kind: "user", data: { content: [{ type: "text", text: "我的哮喘平时要注意什么" }] } }],
-      ["k2", snapOf("hit", "## 相关记忆（命中）\n- **user-asthma** (normal) — 用户有哮喘\n  用户有哮喘病史。")],
-      ["k3", { kind: "user", data: { content: [{ type: "text", text: "我们继续刚才的话题" }] } }],
-      ["k4", snapOf("reinjection", "## 相关记忆（压缩后补回）\n- **user-asthma**\n  用户有哮喘病史。")],
-    ]),
-    locations: { getTurn: () => [] },
-  },
-};
-const groups = computeInjectionGroups(snapshot);
-const foldOk = groups.length === 2 && groups[0].kind === "hit" && groups[1].kind === "first";
-console.log("识别组:", groups.map((g) => g.id + ":" + g.kind).join(", "), "| 断言:", foldOk ? "PASS" : "FAIL");
-
-// reflect / dream-report 识别（新 InjectionKind，横条标签区分于记忆命中）
-const snapNew = {
-  chat: {
-    order: ["r1", "r2"],
-    nodes: new Map([
-      ["r1", snapOf("reflect", "## 会话回顾（reflect）\n\n最近多轮对话没有写入记忆。")],
-      ["r2", snapOf("dream-report", "## 梦境整理报告\n\n空闲期整理完成：审查了 5 条近期记忆；待审批归档 1 条。")],
-    ]),
-    locations: { getTurn: () => [] },
-  },
-};
-const groupsNew = computeInjectionGroups(snapNew);
-const kindOk = groupsNew.length === 2 && groupsNew[0].kind === "reflect" && groupsNew[1].kind === "dream";
-console.log("reflect/dream 识别:", groupsNew.map((g) => g.kind).join(","), "| 断言:", kindOk ? "PASS" : "FAIL");
-
-console.log("\n=== 7. client bundle 冒烟（minimal DOM stub）===");
+console.log("\n=== 6. client bundle 冒烟（minimal DOM stub）===");
 let clientOk = false;
 try {
   // 万能 Proxy stub：任何属性访问/调用都返回自身（可无限链式）。
@@ -345,7 +304,7 @@ try {
     inject: (name, factory) => { factory(); return () => {}; },
     register: () => ({}),
   };
-  const clientCtx = { slots, sessions: {} };
+  const clientCtx = { slots };
   const clientDispose = client.apply(clientCtx);
   console.log("client.apply 执行 OK, dispose 可调:", typeof clientDispose === "function");
   await clientDispose();
@@ -358,6 +317,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && foldOk && kindOk && clientOk;
+const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && clientOk;
 console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
 process.exit(allOk ? 0 : 1);

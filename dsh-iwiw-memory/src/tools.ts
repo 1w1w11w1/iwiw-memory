@@ -33,12 +33,12 @@ export class MemoryTools {
     return this.parse(await this.backend.callTool("touch_memories", { slugs }));
   }
 
-  /** 空闲整理（dream）：低风险修正自动留痕执行，归档走审批。 */
-  async dream(sinceHours?: number, limit?: number): Promise<JsonValue> {
+  /** 记忆巩固（consolidate）：低风险修正自动留痕执行，归档走审批。 */
+  async consolidate(sinceHours?: number, limit?: number): Promise<JsonValue> {
     const args: Record<string, unknown> = {};
     if (sinceHours !== undefined) args.since_hours = sinceHours;
     if (limit !== undefined) args.limit = limit;
-    return this.parse(await this.backend.callTool("run_dream", args));
+    return this.parse(await this.backend.callTool("run_consolidate", args));
   }
 
   async read(params: { slug: string }): Promise<JsonValue> {

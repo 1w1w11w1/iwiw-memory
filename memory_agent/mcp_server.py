@@ -18,7 +18,7 @@ mcp_server.py — 记忆系统 MCP 服务器（DSH 接入桥）
 - pending_approve  : 审批通过
 - pending_reject   : 审批拒绝
 - maintenance_review : 维护候选审查（生成归档待确认动作）
-- run_dream        : 空闲整理（低风险修正自动留痕执行，归档走审批）
+- run_consolidate  : 空闲巩固（低风险修正自动留痕执行，归档走审批）
 
 
 启动：python -m memory_agent.mcp_server
@@ -221,8 +221,8 @@ async def list_tools() -> list[Tool]:
             {"limit": {"type": "integer", "description": "候选数量，默认 20"}},
         ),
         _tool(
-            "run_dream",
-            "空闲整理（dream）：审查窗口内创建/更新的记忆；retype/update_desc 低风险修正自动执行（版本+审计留痕），archive 生成待审批动作，merge 仅输出建议。",
+            "run_consolidate",
+            "空闲巩固（consolidate）：审查窗口内创建/更新的记忆；retype/update_desc 低风险修正自动执行（版本+审计留痕），archive 生成待审批动作，merge 仅输出建议。",
             {
                 "since_hours": {"type": "number", "description": "审查窗口（小时），默认 24"},
                 "limit": {"type": "integer", "description": "候选上限，默认 20"},
@@ -346,9 +346,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         from .maintenance import review_maintenance
         return ok(await review_maintenance(limit=int(arguments.get("limit", 20))))
 
-    if name == "run_dream":
-        from .maintenance import run_dream
-        return ok(await run_dream(
+    if name == "run_consolidate":
+        from .maintenance import run_consolidate
+        return ok(await run_consolidate(
             since_hours=float(arguments.get("since_hours", 24.0)),
             limit=int(arguments.get("limit", 20)),
         ))

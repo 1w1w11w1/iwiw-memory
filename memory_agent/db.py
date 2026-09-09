@@ -662,7 +662,7 @@ def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
 
 
 def get_recent_changed(since_iso: str, limit: int = 20) -> list[dict[str, Any]]:
-    """获取窗口内创建/更新的 active 记忆（dream 审查范围）。"""
+    """获取窗口内创建/更新的 active 记忆（巩固审查范围）。"""
     conn = connect()
     rows = conn.execute(
         """SELECT slug, description, mem_type, priority, access_count, last_access_at, updated_at, content
