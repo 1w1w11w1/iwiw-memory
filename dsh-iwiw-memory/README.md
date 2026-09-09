@@ -1,4 +1,4 @@
-# @iwiw/dsh-iwiw-memory
+# dsh-iwiw-memory
 
 IwIw 记忆插件：iwiw-memory 记忆内核的 DSH 接入端。让 DSH agent 拥有跨会话记忆、自动学习、自动反省能力——内核（Python）经 MCP 子进程挂载，本插件（TypeScript）负责工具注册、上下文注入与设置页。
 
@@ -36,14 +36,14 @@ New-Item -ItemType Junction -Path "<profile>\node_modules\@iwiw\dsh-iwiw-memory"
 **2. profile 的 `cordis.patch.yml` 部署配置**（`python` 缺省取 PATH 上的 python，`cwd` 必填且必须指向仓库根）：
 
 ```yaml
-- id: '@iwiw/dsh-iwiw-memory'
+- id: 'dsh-iwiw-memory'
   config:
     enabled: true
     python: '<仓库根>/.venv/Scripts/python.exe'
     cwd: '<仓库根>'
 ```
 
-> desktop bundle 契约（缺一即启动崩溃）：包内 `package.json` 声明 `dsh.bundle.patch` 指向 `cordis.patch.yml`；包内 patch 用 `- insert:` 行装载插件（name 必须是 npm 包名 `@iwiw/dsh-iwiw-memory`）；profile patch 的 id 与 insert 行 id 一致。写入 profile 配置文件须无 BOM（UTF-8 无 BOM，否则 DSH 解析失败）。
+> desktop bundle 契约（缺一即启动崩溃）：包内 `package.json` 声明 `dsh.bundle.patch` 指向 `cordis.patch.yml`；包内 patch 用 `- insert:` 行装载插件（name 必须是 npm 包名 `dsh-iwiw-memory`）；profile patch 的 id 与 insert 行 id 一致。写入 profile 配置文件须无 BOM（UTF-8 无 BOM，否则 DSH 解析失败）。
 
 重启 DSH 生效。启动日志出现 `applied: 4 tools + 2 prompt sections + pre-step hook + consolidation scheduler` 即挂载成功。
 

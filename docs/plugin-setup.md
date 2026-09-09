@@ -1,6 +1,6 @@
 # DSH 插件安装指南（快速开始）
 
-为 DSH agent 装上跨会话记忆的推荐方式：`@iwiw/dsh-iwiw-memory` 插件——记忆工具注册、常驻注入、空闲巩固、桌面通知全部由插件编排，记忆内核（Python）经 MCP 子进程挂载。
+为 DSH agent 装上跨会话记忆的推荐方式：`dsh-iwiw-memory` 插件——记忆工具注册、常驻注入、空闲巩固、桌面通知全部由插件编排，记忆内核（Python）经 MCP 子进程挂载。
 
 > 只要轻量的工具面（模型主动调用，无常驻注入/巩固/通知）？见 [DSH MCP 挂载指南](dsh-mcp-setup.md)。
 
@@ -19,7 +19,7 @@
 ## 第 1 步：安装插件包到 profile
 
 ```powershell
-npm install @iwiw/dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
+npm install dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
 ```
 
 - `<DSH_HOME>` 默认为 `~/.dsh`
@@ -32,7 +32,7 @@ npm install @iwiw/dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
 ## 第 2 步：部署配置（profile 的 cordis.patch.yml）
 
 ```yaml
-- id: '@iwiw/dsh-iwiw-memory'
+- id: 'dsh-iwiw-memory'
   config:
     enabled: true
     python: '<仓库根>/.venv/Scripts/python.exe'

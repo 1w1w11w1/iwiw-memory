@@ -64,7 +64,7 @@ git clone https://github.com/1w1w11w1/iwiw-memory.git
 cd iwiw-memory
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-npm install @iwiw/dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
+npm install dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
 ```
 
 再在 profile 的 cordis.patch.yml 部署配置并重启 DSH——完整步骤见[插件安装指南](docs/plugin-setup.md)。
