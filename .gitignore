@@ -24,3 +24,5 @@ node_modules/
 # 开发文档（本地查阅），不入库
 dev-docs/
 publish-out.txt
+.agents/
+skills-lock.json
