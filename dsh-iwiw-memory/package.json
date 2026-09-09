@@ -17,7 +17,8 @@
   ],
   "scripts": {
     "build": "tsc && node build.mjs",
-    "build:client": "node build.mjs"
+    "build:client": "node build.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dsh": {
     "bundle": {

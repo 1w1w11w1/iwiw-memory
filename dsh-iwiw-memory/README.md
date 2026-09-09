@@ -75,3 +75,12 @@ npm install
 npm run build        # tsc（host 端）+ esbuild（client 端）
 node scripts/host-smoke.mjs   # host 级冒烟（SMOKE_PYTHON / SMOKE_CWD 可覆盖部署路径）
 ```
+
+## 发布
+
+```powershell
+npm run release              # patch 版本（0.1.0 → 0.1.1）
+npm run release -- --minor   # minor / --major / --dry-run（只验证不发布）
+```
+
+一条命令完成：build → 冒烟（失败即中止）→ 提交工作区改动 → 版本号 bump（commit + tag）→ npm publish（官方源）→ push main + tags。需要 `~/.npmrc` 里有 Automation 令牌（bypass 2FA）。
