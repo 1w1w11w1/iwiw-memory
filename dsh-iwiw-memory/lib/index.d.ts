@@ -1,4 +1,5 @@
 import { Context } from "@deepseek-ai/cordis";
+import Schema from "@deepseek-ai/schemastery";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export declare const name = "dsh-iwiw-memory";
 /** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
@@ -24,16 +25,20 @@ interface PluginConfig {
 }
 /** 峰时抑制（meow 同款）：9-12 / 14-18 及各自前 15 分钟不触发 dream。 */
 export declare function isPeakTime(d: Date): boolean;
-/** settings.yaml 可调字段的默认值（settings.section 页编辑；patch config 为 base 覆盖在先）。 */
-export declare const SETTINGS_DEFAULTS: {
-    readonly coreMaxChars: 2500;
-    readonly hitTopK: 3;
-    readonly reflectTurns: 7;
-    readonly dreamIdleMinutes: 180;
-    readonly standingLayers: "profile,rules";
-};
-/** settings schema（纯函数归一化）：白名单字段 + 类型纠偏，未知字段丢弃。
- *  standingLayers 以字符串存储（UI 逗号分隔编辑），兼容 patch 传入的数组形式。 */
-export declare function settingsSchema(merged: unknown): Record<string, unknown>;
+/** settings schema（schemastery 对象）：设置通道要求 schema 可 JSON 序列化——
+ *  host describe 时序列化信封，渲染端 rehydrate+validate（纯函数会静默产出空镜像）。 */
+export declare const SETTINGS_SCHEMA: Schema<Schemastery.ObjectS<{
+    hitTopK: Schema<number, number>;
+    coreMaxChars: Schema<number, number>;
+    reflectTurns: Schema<number, number>;
+    dreamIdleMinutes: Schema<number, number>;
+    standingLayers: Schema<string, string>;
+}>, Schemastery.ObjectT<{
+    hitTopK: Schema<number, number>;
+    coreMaxChars: Schema<number, number>;
+    reflectTurns: Schema<number, number>;
+    dreamIdleMinutes: Schema<number, number>;
+    standingLayers: Schema<string, string>;
+}>>;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;
 export {};

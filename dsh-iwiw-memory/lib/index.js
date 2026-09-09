@@ -1,11 +1,12 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import Schema from "@deepseek-ai/schemastery";
 import { MemoryBackend } from "./backend.js";
 import { MemoryTools, toTextBlocks } from "./tools.js";
 import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export const name = "dsh-iwiw-memory";
 /** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
-export const inject = ["tools", "systemPrompt"];
+export const inject = ["tools", "systemPrompt", "settings"];
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_PYTHON = "E:/desktop/111/.venv/Scripts/python.exe";
 const DEFAULT_CWD = "E:/desktop/111";
@@ -100,34 +101,15 @@ function makeDefinition(tools, onRemember) {
         }),
     };
 }
-/** settings.yaml 可调字段的默认值（settings.section 页编辑；patch config 为 base 覆盖在先）。 */
-export const SETTINGS_DEFAULTS = {
-    coreMaxChars: 2500,
-    hitTopK: 3,
-    reflectTurns: 7,
-    dreamIdleMinutes: 180,
-    standingLayers: "profile,rules",
-};
-/** settings schema（纯函数归一化）：白名单字段 + 类型纠偏，未知字段丢弃。
- *  standingLayers 以字符串存储（UI 逗号分隔编辑），兼容 patch 传入的数组形式。 */
-export function settingsSchema(merged) {
-    const m = (merged && typeof merged === "object") ? merged : {};
-    const out = {};
-    for (const [key, def] of Object.entries(SETTINGS_DEFAULTS)) {
-        const v = m[key];
-        if (typeof def === "number") {
-            const n = Number(v ?? def);
-            out[key] = Number.isFinite(n) && n >= 0 ? n : def;
-        }
-        else if (key === "standingLayers") {
-            out[key] = typeof v === "string" ? v : (Array.isArray(v) ? v.join(",") : def);
-        }
-        else {
-            out[key] = typeof v === "string" ? v : def;
-        }
-    }
-    return out;
-}
+/** settings schema（schemastery 对象）：设置通道要求 schema 可 JSON 序列化——
+ *  host describe 时序列化信封，渲染端 rehydrate+validate（纯函数会静默产出空镜像）。 */
+export const SETTINGS_SCHEMA = Schema.object({
+    hitTopK: Schema.number().default(3).description("每条消息命中注入条数上限"),
+    coreMaxChars: Schema.number().default(2500).description("常驻记忆段字符预算"),
+    reflectTurns: Schema.number().default(7).description("回顾提示触发步数，0=关闭"),
+    dreamIdleMinutes: Schema.number().default(180).description("空闲整理阈值（分钟），0=关闭"),
+    standingLayers: Schema.string().default("profile,rules").description("常驻记忆类型，逗号分隔"),
+});
 const SETTINGS_NS = "dsh-iwiw-memory";
 export const apply = async (ctx, config = {}) => {
     const python = config.python ?? DEFAULT_PYTHON;
@@ -147,7 +129,7 @@ export const apply = async (ctx, config = {}) => {
     const hitTopK = () => overrides.hitTopK;
     ctx.inject(["settings"], (sctx) => {
         try {
-            const scope = sctx.settings.register(SETTINGS_NS, settingsSchema, { base: settingsSchema(config) });
+            const scope = sctx.settings.register(SETTINGS_NS, SETTINGS_SCHEMA, { base: config });
             const applySettings = (resolved) => {
                 for (const [k, v] of Object.entries(resolved)) {
                     // standingLayers 存储为逗号分隔字符串，运行时消费需要数组
@@ -156,9 +138,9 @@ export const apply = async (ctx, config = {}) => {
                         : v;
                 }
             };
-            applySettings(settingsSchema(scope.get()));
+            applySettings(scope.get());
             scope.watch(() => {
-                applySettings(settingsSchema(scope.get()));
+                applySettings(scope.get());
                 ctx.logger.info(`[dsh-iwiw-memory] settings updated: ${JSON.stringify(overrides)}`);
             });
             ctx.logger.info("[dsh-iwiw-memory] settings section installed");
