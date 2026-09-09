@@ -137,7 +137,8 @@ try {
   console.log(`published dsh-iwiw-memory@${newVer}`);
 
   step("6/6 push main + tags，创建 GitHub Release");
-  sh("git push origin main --follow-tags");
+  sh("git push origin main");
+  sh(`git push origin v${newVer}`); // npm version 产生的是轻量 tag，--follow-tags 不覆盖，必须显式推
   const notesFile = join(tmpdir(), `release-notes-${newVer}.md`);
   writeFileSync(notesFile, body, "utf8");
   sh(`gh release create v${newVer} --title "v${newVer}" --notes-file "${notesFile}" --latest`, { env: ghEnv, cwd: repoRoot });
