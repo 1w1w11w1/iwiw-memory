@@ -6,7 +6,7 @@ import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export const name = "dsh-iwiw-memory";
 /** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
-export const inject = ["tools", "systemPrompt", "settings", "desktopRuntime"];
+export const inject = ["tools", "systemPrompt", "settings"];
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_CORE_MAX_CHARS = 2500;
 /** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
@@ -44,9 +44,9 @@ function makeDefinition(tools, onRemember) {
             },
             async execute(args) {
                 const a = args;
-                const result = await tools.remember(a);
-                onRemember?.(result?.slug);
-                return { result };
+                const out = { result: await tools.remember(a) };
+                onRemember?.();
+                return out;
             },
         }),
         memory_search: defineTool({
@@ -107,9 +107,6 @@ export const SETTINGS_SCHEMA = Schema.object({
     reflectTurns: Schema.number().default(7).description("回顾提示触发步数，0=关闭"),
     consolidateIdleMinutes: Schema.number().default(180).description("空闲巩固阈值（分钟），0=关闭"),
     standingLayers: Schema.string().default("profile,rules").description("常驻记忆类型，逗号分隔"),
-    notifyRemember: Schema.boolean().default(false).description("记忆写入系统通知（60 秒窗口合并）"),
-    notifyConsolidate: Schema.boolean().default(true).description("巩固完成系统通知"),
-    notifyOnFailure: Schema.boolean().default(true).description("后台异常系统通知"),
 });
 const SETTINGS_NS = "dsh-iwiw-memory";
 export const apply = async (ctx, config = {}) => {
@@ -128,54 +125,12 @@ export const apply = async (ctx, config = {}) => {
         standingLayers: config.standingLayers ?? ["profile", "rules"],
         reflectTurns: config.reflectTurns ?? 7,
         consolidateIdleMinutes: config.consolidateIdleMinutes ?? 180,
-        notifyRemember: config.notifyRemember ?? false,
-        notifyConsolidate: config.notifyConsolidate ?? true,
-        notifyOnFailure: config.notifyOnFailure ?? true,
         hitTopK: undefined,
     };
     overrides.hitTopK = config.hitTopK ?? 3;
     const standingLayers = () => overrides.standingLayers.filter((t) => VALID_MEM_TYPES.has(t));
     const reflectTurns = () => overrides.reflectTurns;
     const hitTopK = () => overrides.hitTopK;
-    // ── 感知与通知：经 desktopRuntime.notifyAttention 发系统级桌面通知
-    //    （窗口聚焦时官方实现自动静默；服务缺失=非桌面环境，降级 logger）。──
-    const NOTIFY_COPY = {
-        consolidateDone: {
-            zh: { title: "记忆巩固完成", body: "低风险修正 {N} 条已自动留痕；{M} 条归档建议待审批" },
-            en: { title: "Memory consolidation done", body: "{N} fix(es) auto-applied; {M} archive suggestion(s) pending" },
-        },
-        consolidateFailed: {
-            zh: { title: "记忆巩固失败", body: "将在下次空闲重试；详情见 DSH 日志" },
-            en: { title: "Memory consolidation failed", body: "Will retry on next idle; see DSH logs" },
-        },
-        backendDown: {
-            zh: { title: "记忆内核连接异常", body: "记忆功能暂不可用，重启 DSH 后恢复" },
-            en: { title: "Memory backend unavailable", body: "Memory tools unavailable until DSH restart" },
-        },
-        remember: {
-            zh: { title: "已记住", body: "新增 {N} 条长期记忆：{SLUGS}" },
-            en: { title: "Memories saved", body: "{N} memories added: {SLUGS}" },
-        },
-    };
-    const fill = (tpl, vars) => Object.entries(vars).reduce((s, [k, v]) => s.split(`{${k}}`).join(String(v)), tpl);
-    const notify = (settingKey, kind, vars = {}) => {
-        if (!overrides[settingKey])
-            return;
-        try {
-            const rt = ctx.desktopRuntime;
-            if (!rt || typeof rt.notifyAttention !== "function") {
-                ctx.logger.info(`[dsh-iwiw-memory] notify ${kind} skipped: desktopRuntime unavailable`);
-                return;
-            }
-            const lang = String(rt.locale ?? "zh").startsWith("en") ? "en" : "zh";
-            const copy = NOTIFY_COPY[kind][lang];
-            rt.notifyAttention({ title: fill(copy.title, vars), body: fill(copy.body, vars) });
-            ctx.logger.info(`[dsh-iwiw-memory] notified: ${kind}`);
-        }
-        catch (e) {
-            ctx.logger.info("[dsh-iwiw-memory] notify failed", e);
-        }
-    };
     ctx.inject(["settings"], (sctx) => {
         try {
             const scope = sctx.settings.register(SETTINGS_NS, SETTINGS_SCHEMA, { base: config });
@@ -198,15 +153,7 @@ export const apply = async (ctx, config = {}) => {
             ctx.logger.warn("[dsh-iwiw-memory] settings registration failed (patch config in effect)", e);
         }
     });
-    let lastBackendDownAt = 0;
-    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env, (e) => {
-        ctx.logger.warn("[dsh-iwiw-memory] backend connection failed", e);
-        // 节流：5 分钟内不重复打扰（内核挂掉时每个工具调用都会触发）
-        if (Date.now() - lastBackendDownAt < 5 * 60_000)
-            return;
-        lastBackendDownAt = Date.now();
-        notify("notifyOnFailure", "backendDown");
-    });
+    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
     const tools = new MemoryTools(backend);
     // 1) 启动时预热后端（避免首次工具调用才连接）。
     try {
@@ -215,29 +162,9 @@ export const apply = async (ctx, config = {}) => {
     catch (e) {
         ctx.logger.warn("memory backend warmup failed", e);
     }
-    // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）+ reflect 计数归零 + 写入通知（节流）。
-    // 写入通知节流：60s 窗口内合并计数，窗口关闭时发一条（notifyRemember 开关控制）。
-    let rememberPending = [];
-    let rememberTimer;
-    const onRememberNotify = (slug) => {
-        if (!overrides.notifyRemember)
-            return;
-        if (slug)
-            rememberPending.push(slug);
-        if (rememberTimer)
-            return;
-        rememberTimer = setTimeout(() => {
-            rememberTimer = undefined;
-            const n = rememberPending.length;
-            if (n <= 0)
-                return;
-            const slugs = rememberPending.slice(0, 5).join("、") + (n > 5 ? " …" : "");
-            rememberPending = [];
-            notify("notifyRemember", "remember", { N: n, SLUGS: slugs });
-        }, 60_000);
-    };
+    // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）+ reflect 计数归零。
     let stepSinceWrite = 0;
-    const defs = makeDefinition(tools, (slug) => { stepSinceWrite = 0; refreshCore().catch(() => { }); onRememberNotify(slug); });
+    const defs = makeDefinition(tools, () => { stepSinceWrite = 0; refreshCore().catch(() => { }); });
     const disposers = [
         ctx.tools.register(defs.memory_remember),
         ctx.tools.register(defs.memory_search),
@@ -534,12 +461,8 @@ export const apply = async (ctx, config = {}) => {
                 if (!fixed.length && !pend.length && !sugg.length && !d.error)
                     parts.push("无需巩固");
                 lastConsolidateReport.value = ["## 记忆巩固报告", "", "空闲期巩固完成：" + parts.join("；") + "。"].join("\n");
-                notify("notifyConsolidate", "consolidateDone", { N: fixed.length, M: pend.length });
             })
-                .catch((e) => {
-                ctx.logger.warn("[dsh-iwiw-memory] consolidate failed", e);
-                notify("notifyOnFailure", "consolidateFailed");
-            })
+                .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] consolidate failed", e))
                 .finally(() => {
                 consolidateRunning = false;
                 // 重置活动时间戳：下一轮巩固需重新积累完整空闲期
@@ -551,8 +474,6 @@ export const apply = async (ctx, config = {}) => {
     return async () => {
         if (consolidateTimer)
             clearInterval(consolidateTimer);
-        if (rememberTimer)
-            clearTimeout(rememberTimer);
         for (const d of disposers) {
             try {
                 d();

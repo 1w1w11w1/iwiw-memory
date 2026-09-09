@@ -15,7 +15,7 @@ const profileDir = "C:/Users/YS/.dsh/profiles/desktop";
 const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
 const bundles = manifest.dsh?.profile?.bundles ?? [];
 console.log("bundles:", bundles.join(", "));
-if (!bundles.includes("@iwiw/dsh-iwiw-memory")) throw new Error("bundle 未列入 profile");
+if (!bundles.includes("dsh-iwiw-memory")) throw new Error("bundle 未列入 profile");
 
 const installNodeModules = "D:/dsh/DSH Desktop/resources/app.asar.unpacked/node_modules";
 function resolvePackageDir(packageName) {
@@ -37,7 +37,7 @@ for (const packageName of bundles) {
   const patchPath = join(packageDir, declared);
   const patches = loadOverlayPatches("smoke", patchPath);
   // 对 iwiw 自身：insert 行必须装载自己的包名（name 是 import() 说明符）
-  if (packageName === "@iwiw/dsh-iwiw-memory") {
+  if (packageName === "dsh-iwiw-memory") {
     const selfInsert = patches.flatMap((p) => p.insert ?? []).find((r) => r.name === packageName);
     if (!selfInsert) throw new Error(`iwiw insert 行缺失或 name 不是 ${packageName}`);
     console.log(`bundle ${packageName}: patch OK, insert id=${selfInsert.id} name=${selfInsert.name} config=${JSON.stringify(selfInsert.config)}`);
@@ -47,9 +47,9 @@ console.log("全部 12 个 bundle 的 dsh.bundle.patch 声明与解析均通过"
 
 // profile patch 层：id 覆盖目标必须存在
 const profilePatch = readFileSync(join(profileDir, "cordis.patch.yml"), "utf8");
-if (!profilePatch.includes("@iwiw/dsh-iwiw-memory")) throw new Error("profile patch 缺 iwiw id 覆盖");
+if (!profilePatch.includes("dsh-iwiw-memory")) throw new Error("profile patch 缺 iwiw id 覆盖");
 
 // 依赖清单一致性：dependencies 与 bundles 都指向 iwiw
-if (!manifest.dependencies?.["@iwiw/dsh-iwiw-memory"]) throw new Error("dependencies 缺 iwiw");
+if (!manifest.dependencies?.["dsh-iwiw-memory"]) throw new Error("dependencies 缺 iwiw");
 
 console.log("BOOT SIMULATION: ALL PASS");

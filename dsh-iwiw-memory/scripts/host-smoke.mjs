@@ -295,7 +295,7 @@ try {
     get: (t, prop) => (prop in t ? t[prop] : universal),
   });
   await import("../lib/client.js");
-  if (registeredId !== "@iwiw/dsh-iwiw-memory") {
+  if (registeredId !== "dsh-iwiw-memory") {
     throw new Error("client bundle 未通过 __ModuleLoader__ 自注册，id=" + registeredId);
   }
   const client = clientExports;

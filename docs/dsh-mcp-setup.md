@@ -1,6 +1,6 @@
 # DSH MCP 挂载指南
 
-> 让 DSH agent 通过 MCP 直挂获得记忆工具面（适合轻量接入；完整体验——常驻注入/空闲巩固/桌面通知——使用 `dsh-iwiw-memory` 插件，见插件 README）。
+> 让 DSH agent 通过 MCP 直挂获得记忆工具面（适合轻量接入；完整体验——常驻注入/空闲巩固——使用 `dsh-iwiw-memory` 插件，见插件 README）。
 > 前提：memory_agent 已包化（`pip install -e .`，入口 `memory-agent-mcp`）。
 
 ## 1. 验证后端可启动
@@ -45,4 +45,4 @@ python -m memory_agent.mcp_server        # 或 memory-agent-mcp
 ## 4. 局限与完整体验
 
 MCP 直挂是"模型主动调用"，不做常驻注入与空闲巩固。
-需要跨会话记忆完整体验（常驻注入 / 命中注入 / 空闲巩固 / 桌面通知），使用 `dsh-iwiw-memory` 插件（见插件 README）。
+需要跨会话记忆完整体验（常驻注入 / 命中注入 / 空闲巩固），使用 `dsh-iwiw-memory` 插件（见插件 README）。

@@ -1,6 +1,6 @@
 # DSH 插件安装指南（快速开始）
 
-为 DSH agent 装上跨会话记忆的推荐方式：`dsh-iwiw-memory` 插件——记忆工具注册、常驻注入、空闲巩固、桌面通知全部由插件编排，记忆内核（Python）经 MCP 子进程挂载。
+为 DSH agent 装上跨会话记忆的推荐方式：`dsh-iwiw-memory` 插件——记忆工具注册、常驻注入、空闲巩固全部由插件编排，记忆内核（Python）经 MCP 子进程挂载。
 
 > 只要轻量的工具面（模型主动调用，无常驻注入/巩固/通知）？见 [DSH MCP 挂载指南](dsh-mcp-setup.md)。
 
@@ -64,8 +64,5 @@ npm install dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
 | 命中注入条数上限 | 3 | 每条消息最多联想注入的记忆条数 |
 | 常驻记忆段字符预算 | 2500 | profile/rules 注入的总字符上限 |
 | 空闲巩固阈值（分钟） | 180 | 空闲多久后自动巩固记忆，0=关闭 |
-| 记忆写入系统通知 | 关 | 写入确认桌面通知（60 秒合并） |
-| 巩固完成系统通知 | 开 | 空闲巩固结束的桌面通知 |
-| 后台异常系统通知 | 开 | 巩固失败 / 内核异常的桌面通知 |
 
 完整参数与行为细节见[插件 README](https://github.com/1w1w11w1/iwiw-memory/tree/main/dsh-iwiw-memory)。

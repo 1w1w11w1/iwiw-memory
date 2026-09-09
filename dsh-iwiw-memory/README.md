@@ -66,9 +66,6 @@ New-Item -ItemType Junction -Path "<profile>\node_modules\@iwiw\dsh-iwiw-memory"
 | `reflectTurns` | 7 | 回顾提示触发步数，0=关闭 |
 | `consolidateIdleMinutes` | 180 | 空闲巩固阈值（分钟），0=关闭 |
 | `standingLayers` | profile,rules | 常驻记忆类型，逗号分隔 |
-| `notifyRemember` | false | 记忆写入系统通知（60 秒窗口合并） |
-| `notifyConsolidate` | true | 空闲巩固完成系统通知（聚焦时自动静默） |
-| `notifyOnFailure` | true | 巩固失败 / 记忆内核连接异常系统通知 |
 
 ## 开发
 

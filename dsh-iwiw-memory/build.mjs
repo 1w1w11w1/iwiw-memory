@@ -16,7 +16,7 @@ import { cpSync, mkdirSync } from "node:fs";
 
 mkdirSync("lib", { recursive: true });
 
-const CLIENT_ID = "@iwiw/dsh-iwiw-memory";
+const CLIENT_ID = "dsh-iwiw-memory";
 
 // client bundle（渲染进程，__ModuleLoader__ cjs factory）
 await esbuild.build({

@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: "@iwiw/dsh-iwiw-memory",
+  id: "dsh-iwiw-memory",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -81,14 +81,6 @@ var FIELDS = [
     fields: [
       { key: "reflectTurns", label: "\u56DE\u987E\u63D0\u793A\u89E6\u53D1\u6B65\u6570", type: "num", hint: "\u8FDE\u7EED N \u6B65\u672A\u5199\u5165\u8BB0\u5FC6\u65F6\u6CE8\u5165\u4E00\u6B21\u6027\u56DE\u987E\u63D0\u793A\uFF1B0=\u5173\u95ED" },
       { key: "consolidateIdleMinutes", label: "\u7A7A\u95F2\u5DE9\u56FA\u9608\u503C\uFF08\u5206\u949F\uFF09", type: "num", hint: "\u7A7A\u95F2\u6EE1\u8BE5\u5206\u949F\u6570\u4E14\u975E\u5CF0\u65F6\uFF089-12/14-18\uFF09\u81EA\u52A8\u89E6\u53D1\u8BB0\u5FC6\u5DE9\u56FA\uFF1B0=\u5173\u95ED" }
-    ]
-  },
-  {
-    title: "\u611F\u77E5\u4E0E\u901A\u77E5",
-    fields: [
-      { key: "notifyRemember", label: "\u8BB0\u5FC6\u5199\u5165\u7CFB\u7EDF\u901A\u77E5", type: "bool", hint: "\u5199\u5165\u6210\u529F\u65F6\u53D1\u684C\u9762\u901A\u77E5\uFF1B\u9AD8\u9891\u4E8B\u4EF6\u6309 60 \u79D2\u7A97\u53E3\u5408\u5E76\u4E3A\u4E00\u6761" },
-      { key: "notifyConsolidate", label: "\u5DE9\u56FA\u5B8C\u6210\u7CFB\u7EDF\u901A\u77E5", type: "bool", hint: "\u7A7A\u95F2\u5DE9\u56FA\u7ED3\u675F\u65F6\u53D1\u684C\u9762\u901A\u77E5\uFF08\u542B\u81EA\u6108\u4E0E\u5F85\u5BA1\u6279\u660E\u7EC6\uFF09\uFF1B\u7A97\u53E3\u805A\u7126\u65F6\u81EA\u52A8\u9759\u9ED8" },
-      { key: "notifyOnFailure", label: "\u540E\u53F0\u5F02\u5E38\u7CFB\u7EDF\u901A\u77E5", type: "bool", hint: "\u5DE9\u56FA\u5931\u8D25\u6216\u8BB0\u5FC6\u5185\u6838\u8FDE\u63A5\u5F02\u5E38\u65F6\u53D1\u684C\u9762\u901A\u77E5" }
     ]
   },
   {

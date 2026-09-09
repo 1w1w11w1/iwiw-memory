@@ -72,14 +72,6 @@ const FIELDS: GroupSpec[] = [
     ],
   },
   {
-    title: '感知与通知',
-    fields: [
-      { key: 'notifyRemember', label: '记忆写入系统通知', type: 'bool', hint: '写入成功时发桌面通知；高频事件按 60 秒窗口合并为一条' },
-      { key: 'notifyConsolidate', label: '巩固完成系统通知', type: 'bool', hint: '空闲巩固结束时发桌面通知（含自愈与待审批明细）；窗口聚焦时自动静默' },
-      { key: 'notifyOnFailure', label: '后台异常系统通知', type: 'bool', hint: '巩固失败或记忆内核连接异常时发桌面通知' },
-    ],
-  },
-  {
     title: '常驻层（模式配置）',
     fields: [
       { key: 'standingLayers', label: '常驻记忆类型', type: 'str', hint: '逗号分隔：profile/fact/lesson/rules/project。chat 模式=profile,rules；dev 模式建议 rules。这些类型全量注入每轮，其余按话题检索召回', placeholder: 'profile,rules' },
