@@ -1,0 +1,23 @@
+.venv/
+.env
+data/
+.claude/
+.codex/
+*.log
+__pycache__/
+*.py[cod]
+*.mp3
+*.wav
+*.pdf
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+Thumbs.db
+.dsh-meow/
+.mimosa/
+*.egg-info/
+node_modules/
+
+# 内部讨论稿，不入库
+记忆系统-推进讨论-提示词.md
