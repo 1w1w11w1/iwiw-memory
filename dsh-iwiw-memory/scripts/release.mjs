@@ -127,6 +127,10 @@ try {
   if (sh("git status --porcelain")) sh('git commit -m "chore: release prep"');
   sh(`npm version ${bump} -f`);
   const newVer = ver();
+  // 幂等补齐：npm version 在部分环境会静默跳过 git commit/tag
+  sh("git add -A");
+  if (sh("git status --porcelain")) sh(`git commit -m "chore: bump v${newVer}"`);
+  if (!sh("git tag --list").split("\n").includes(`v${newVer}`)) sh(`git tag v${newVer} -f`);
 
   step("5/6 npm publish（官方源）");
   sh("npm publish --registry=https://registry.npmjs.org/");

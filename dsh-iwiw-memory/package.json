@@ -1,6 +1,6 @@
 {
   "name": "dsh-iwiw-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "IwIw 记忆插件：跨会话记忆，模型自主调用记忆工具（桥接 memory_agent MCP 内核）",
   "type": "module",
   "main": "lib/index.js",
