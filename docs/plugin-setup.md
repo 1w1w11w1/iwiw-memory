@@ -18,15 +18,24 @@
 
 ## 第 1 步：安装插件包到 profile
 
+**方式 A：DSH 官方插件管理器（推荐，自动写入 dependencies 与 bundles）**
+
+```powershell
+dsh plugin --profile desktop add dsh-iwiw-memory@latest
+```
+
+**方式 B：npm 直接装入 profile（等价）**
+
 ```powershell
 npm install dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
 ```
 
 - `<DSH_HOME>` 默认为 `~/.dsh`
-- 开发模式（跟随本仓库改动）可用 junction 替代：
+- 方式 A 与 B 二选一；已用 junction 开发部署的机器不要再跑这两种安装（同名路径冲突）
+- 开发模式（跟随本仓库改动）用 junction 替代：
 
   ```powershell
-  New-Item -ItemType Junction -Path "<DSH_HOME>\profiles\desktop\node_modules\@iwiw\dsh-iwiw-memory" -Target "<仓库根>\dsh-iwiw-memory"
+  New-Item -ItemType Junction -Path "<DSH_HOME>\profiles\desktop\node_modules\dsh-iwiw-memory" -Target "<仓库根>\dsh-iwiw-memory"
   ```
 
 ## 第 2 步：部署配置（profile 的 cordis.patch.yml）
