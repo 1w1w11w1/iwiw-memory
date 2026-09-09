@@ -1,0 +1,22 @@
+
+> dsh-iwiw-memory@0.1.1 release
+> node scripts/release.mjs --minor
+
+dsh-iwiw-memory v0.1.1 → minor release
+
+==> 1/6 build（tsc + esbuild）
+build OK
+
+==> 2/6 host 冒烟
+smoke OK
+
+==> 3/6 聚合 changelog
+## [0.1.1] - 2026-09-09
+
+### 文档
+- 安装命令对齐官方插件管理器（dsh plugin add），roadmap 收录自包含安装包方案 (4d1725ce)
+
+### 工程优化
+- bump v0.1.1 (e17c4b14)
+
+==> 4/6 提交并 bump 版本（npm version）
