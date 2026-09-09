@@ -23,6 +23,8 @@ node_modules/
 记忆系统-推进讨论-提示词.md
 # 开发文档（本地查阅），不入库
 dev-docs/
+# 插件包构建产物：内嵌内核副本
+dsh-iwiw-memory/python/
 publish-out.txt
 .agents/
 skills-lock.json

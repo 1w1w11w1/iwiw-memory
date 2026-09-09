@@ -13,6 +13,7 @@
   },
   "files": [
     "lib",
+    "python",
     "cordis.patch.yml"
   ],
   "scripts": {
@@ -21,6 +22,9 @@
     "release": "node scripts/release.mjs"
   },
   "dsh": {
+    "engines": {
+      "dsh": ">=0.1.2-rc.1"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

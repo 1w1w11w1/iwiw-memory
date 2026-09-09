@@ -1,6 +1,6 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { MemoryBackend } from "./backend.js";
+import { MemoryBackend, ensureRuntime } from "./backend.js";
 import { MemoryTools, toTextBlocks } from "./tools.js";
 import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
@@ -9,6 +9,13 @@ export const name = "dsh-iwiw-memory";
 export const inject = ["tools", "systemPrompt", "settings"];
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_CORE_MAX_CHARS = 2500;
+/** 部署面 config schema（官方 Config 范式）：insert 行不带 config 时 loader 按默认值填充。
+ *  python/cwd 缺省 → 包内自带内核 + 依赖自动自举（ensureRuntime）。 */
+export const Config = Schema.object({
+    enabled: Schema.boolean().default(true).description("启用插件"),
+    python: Schema.string().default("python").description("内核解释器（缺依赖时自动建 venv 自举）"),
+    cwd: Schema.string().default("").description("内核目录（空 = 使用包内自带内核）"),
+});
 /** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
 export function isPeakTime(d) {
     const h = d.getHours() + d.getMinutes() / 60;
@@ -110,14 +117,10 @@ export const SETTINGS_SCHEMA = Schema.object({
 });
 const SETTINGS_NS = "dsh-iwiw-memory";
 export const apply = async (ctx, config = {}) => {
-    // 部署级配置（不进设置页）：插件以 `python -m memory_agent.mcp_server` 拉起记忆内核，
-    // cwd 必须指向 iwiw-memory 仓库根（含 memory_agent/）；缺失即失败并给出修复指引。
-    const python = config.python ?? "python";
-    if (!config.cwd) {
-        throw new Error("[dsh-iwiw-memory] 缺少部署配置 cwd：请在本机 profile 的 cordis.patch.yml 中为插件设置 "
-            + "config.cwd（iwiw-memory 仓库根目录）与 config.python（Python 解释器路径，缺省取 PATH 上的 python）。");
-    }
-    const cwd = config.cwd;
+    // 部署级配置（不进设置页）：插件以 `python -m memory_agent.mcp_server` 拉起记忆内核。
+    // python/cwd 缺省时使用包内自带内核并自动自举依赖（ensureRuntime，见 backend.ts），
+    // 官方 Config 范式：insert 行无需携带 config，loader 按 schema 默认值填充。
+    const { python, cwd } = ensureRuntime({ python: config.python, cwd: config.cwd });
     // settings.yaml user 层可调字段：patch config 为初始值，settings 注册后被覆盖；
     // 消费点读 overrides（大部分字段热生效：下一步/下一轮巩固间隔即生效）。
     const overrides = {

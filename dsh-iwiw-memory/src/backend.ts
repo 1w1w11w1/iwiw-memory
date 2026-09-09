@@ -1,5 +1,61 @@
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+export interface Runtime {
+  python: string;
+  cwd: string;
+}
+
+/** 包内内核目录（build 时从仓库根 memory_agent/ 复制到 python/）。 */
+const bundledCwd = join(dirname(fileURLToPath(import.meta.url)), "..", "python");
+
+/** 依赖探测：目标解释器能否 import mcp 与 jieba。 */
+function depsOk(python: string, cwd: string): boolean {
+  const r = spawnSync(python, ["-c", "import mcp, jieba"], { cwd, encoding: "utf8", timeout: 60_000 });
+  return r.status === 0;
+}
+
+/**
+ * 解析内核运行时（发布自举，官方 Config 范式）：
+ * 1. cwd 缺省 → 包内自带内核（python/，build 时复制）；
+ * 2. 目标解释器缺依赖（mcp/jieba）→ 在 <DSH_HOME>/iwiw-memory-venv 建专用 venv
+ *    并安装包内 requirements（一次性，之后复用）。
+ */
+export function ensureRuntime(opts: { python?: string; cwd?: string }): Runtime {
+  const cwd = opts.cwd?.trim() || bundledCwd;
+  let python = opts.python?.trim() || "python";
+  if (!existsSync(cwd)) throw new Error(`[dsh-iwiw-memory] 内核目录不存在: ${cwd}`);
+  if (depsOk(python, cwd)) return { python, cwd };
+
+  const dshHome = process.env.DSH_HOME || join(homedir(), ".dsh");
+  const venvDir = join(dshHome, "iwiw-memory-venv");
+  const venvPython = process.platform === "win32" ? join(venvDir, "Scripts", "python.exe") : join(venvDir, "bin", "python");
+  if (!existsSync(venvPython)) {
+    console.info("[dsh-iwiw-memory] 首次运行：正在创建内核专用虚拟环境（一次性，约 10 秒）...");
+    const v = spawnSync(python, ["-m", "venv", venvDir], { encoding: "utf8", timeout: 120_000 });
+    if (v.status !== 0) throw new Error(`[dsh-iwiw-memory] venv 创建失败: ${v.stderr?.slice(0, 300)}`);
+  }
+  if (!depsOk(venvPython, cwd)) {
+    console.info("[dsh-iwiw-memory] 正在安装内核依赖（mcp/jieba，一次性，可能需要几分钟）...");
+    // --no-cache-dir：自举不依赖用户 pip 缓存的健康状态（缓存文件权限损坏会 Errno 13）
+    const p = spawnSync(
+      venvPython,
+      ["-m", "pip", "install", "--no-cache-dir", "-r", join(cwd, "requirements.txt")],
+      { encoding: "utf8", timeout: 600_000 },
+    );
+    if (p.status !== 0) {
+      const detail = ((p.stderr ?? "") + "\n" + (p.stdout ?? "")).trim().slice(-400);
+      throw new Error(`[dsh-iwiw-memory] 内核依赖安装失败:\n${detail}`);
+    }
+  }
+  if (!depsOk(venvPython, cwd)) throw new Error("[dsh-iwiw-memory] 内核依赖自举失败（venv 内仍缺 mcp/jieba）");
+  return { python: venvPython, cwd };
+}
 
 /**
  * 记忆内核后端连接：惰性 spawn Python memory_agent.mcp_server，

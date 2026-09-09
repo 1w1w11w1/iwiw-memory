@@ -3,8 +3,10 @@
 # `name` is the npm package specifier — Node resolution finds the installed code
 # (junction node_modules/dsh-iwiw-memory); `id` is the entry identity that
 # profile-level patches use for config overrides.
+# python/cwd 声明在 host 半区 export const Config（带默认值）：行不带 config 时
+# loader 按 schema 默认值填充（包内内核 + 依赖自举），无需用户配置。
 - insert:
-    - id: 'dsh-iwiw-memory'
-      name: 'dsh-iwiw-memory'
+    - id: iwiw-memory
+      name: dsh-iwiw-memory
       config:
         enabled: true

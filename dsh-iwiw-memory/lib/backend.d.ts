@@ -1,3 +1,17 @@
+export interface Runtime {
+    python: string;
+    cwd: string;
+}
+/**
+ * 解析内核运行时（发布自举，官方 Config 范式）：
+ * 1. cwd 缺省 → 包内自带内核（python/，build 时复制）；
+ * 2. 目标解释器缺依赖（mcp/jieba）→ 在 <DSH_HOME>/iwiw-memory-venv 建专用 venv
+ *    并安装包内 requirements（一次性，之后复用）。
+ */
+export declare function ensureRuntime(opts: {
+    python?: string;
+    cwd?: string;
+}): Runtime;
 /**
  * 记忆内核后端连接：惰性 spawn Python memory_agent.mcp_server，
  * 通过 MCP stdio 调用（检索/提取/维护等）。单例复用。

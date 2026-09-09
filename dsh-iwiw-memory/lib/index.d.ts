@@ -5,9 +5,9 @@ export declare const name = "dsh-iwiw-memory";
 /** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
 export declare const inject: string[];
 interface PluginConfig {
-    /** Python 解释器路径（含 mcp/jieba 依赖的 venv 或系统 Python）。 */
+    /** Python 解释器（缺省自动自举：检测依赖，缺则在 ~/.dsh 建专用 venv 安装）。 */
     python?: string;
-    /** memory_agent 工作目录。 */
+    /** 内核目录（缺省使用包内自带内核 python/）。 */
     cwd?: string;
     /** 常驻层注入段总字符预算（与内核 MEMORY_RECALL_MAX_CHARS 对齐）。 */
     coreMaxChars?: number;
@@ -23,6 +23,17 @@ interface PluginConfig {
     /** 覆盖 MCP 子进程环境变量（如 MEMORY_AGENT_DB_PATH 指向隔离库）。 */
     env?: Record<string, string>;
 }
+/** 部署面 config schema（官方 Config 范式）：insert 行不带 config 时 loader 按默认值填充。
+ *  python/cwd 缺省 → 包内自带内核 + 依赖自动自举（ensureRuntime）。 */
+export declare const Config: Schema<Schemastery.ObjectS<{
+    enabled: Schema<boolean, boolean>;
+    python: Schema<string, string>;
+    cwd: Schema<string, string>;
+}>, Schemastery.ObjectT<{
+    enabled: Schema<boolean, boolean>;
+    python: Schema<string, string>;
+    cwd: Schema<string, string>;
+}>>;
 /** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
 export declare function isPeakTime(d: Date): boolean;
 /** settings schema（schemastery 对象）：设置通道要求 schema 可 JSON 序列化——

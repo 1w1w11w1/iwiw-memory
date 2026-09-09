@@ -12,11 +12,19 @@
  * 运行：npm run build
  */
 import * as esbuild from "esbuild";
-import { cpSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync } from "node:fs";
 
 mkdirSync("lib", { recursive: true });
 
-const CLIENT_ID = "dsh-iwiw-memory";
+const CLIENT_ID = "dsh-iwiw-memory"; // 渲染端自注册 id = npm 包名（真机验证值；与 patch 行短 id 分属两套体系）
+
+// 内核进包（官方 Config 范式：cwd 缺省指向包内 python/，依赖由 ensureRuntime 自举）
+rmSync("python", { recursive: true, force: true });
+cpSync("../memory_agent", "python/memory_agent", {
+  recursive: true,
+  filter: (src) => !src.includes("__pycache__"),
+});
+cpSync("../requirements.txt", "python/requirements.txt");
 
 // client bundle（渲染进程，__ModuleLoader__ cjs factory）
 await esbuild.build({

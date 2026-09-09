@@ -1,7 +1,7 @@
 import { Context } from "@deepseek-ai/cordis";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { MemoryBackend } from "./backend.js";
+import { MemoryBackend, ensureRuntime } from "./backend.js";
 import { MemoryTools, toTextBlocks } from "./tools.js";
 import { coreSectionText, toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
 
@@ -11,9 +11,9 @@ export const name = "dsh-iwiw-memory";
 export const inject: string[] = ["tools", "systemPrompt", "settings"];
 
 interface PluginConfig {
-  /** Python 解释器路径（含 mcp/jieba 依赖的 venv 或系统 Python）。 */
+  /** Python 解释器（缺省自动自举：检测依赖，缺则在 ~/.dsh 建专用 venv 安装）。 */
   python?: string;
-  /** memory_agent 工作目录。 */
+  /** 内核目录（缺省使用包内自带内核 python/）。 */
   cwd?: string;
   /** 常驻层注入段总字符预算（与内核 MEMORY_RECALL_MAX_CHARS 对齐）。 */
   coreMaxChars?: number;
@@ -32,6 +32,14 @@ interface PluginConfig {
 
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_CORE_MAX_CHARS = 2500;
+
+/** 部署面 config schema（官方 Config 范式）：insert 行不带 config 时 loader 按默认值填充。
+ *  python/cwd 缺省 → 包内自带内核 + 依赖自动自举（ensureRuntime）。 */
+export const Config = Schema.object({
+  enabled: Schema.boolean().default(true).description("启用插件"),
+  python: Schema.string().default("python").description("内核解释器（缺依赖时自动建 venv 自举）"),
+  cwd: Schema.string().default("").description("内核目录（空 = 使用包内自带内核）"),
+});
 
 /** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
 export function isPeakTime(d: Date): boolean {
@@ -138,16 +146,10 @@ export const SETTINGS_SCHEMA = Schema.object({
 const SETTINGS_NS = "dsh-iwiw-memory";
 
 export const apply = async (ctx: Context, config: PluginConfig = {}) => {
-  // 部署级配置（不进设置页）：插件以 `python -m memory_agent.mcp_server` 拉起记忆内核，
-  // cwd 必须指向 iwiw-memory 仓库根（含 memory_agent/）；缺失即失败并给出修复指引。
-  const python = config.python ?? "python";
-  if (!config.cwd) {
-    throw new Error(
-      "[dsh-iwiw-memory] 缺少部署配置 cwd：请在本机 profile 的 cordis.patch.yml 中为插件设置 "
-      + "config.cwd（iwiw-memory 仓库根目录）与 config.python（Python 解释器路径，缺省取 PATH 上的 python）。",
-    );
-  }
-  const cwd = config.cwd;
+  // 部署级配置（不进设置页）：插件以 `python -m memory_agent.mcp_server` 拉起记忆内核。
+  // python/cwd 缺省时使用包内自带内核并自动自举依赖（ensureRuntime，见 backend.ts），
+  // 官方 Config 范式：insert 行无需携带 config，loader 按 schema 默认值填充。
+  const { python, cwd } = ensureRuntime({ python: config.python, cwd: config.cwd });
   // settings.yaml user 层可调字段：patch config 为初始值，settings 注册后被覆盖；
   // 消费点读 overrides（大部分字段热生效：下一步/下一轮巩固间隔即生效）。
   const overrides: Record<string, any> = {
