@@ -1,5 +1,47 @@
+window.__ModuleLoader__.load({
+  id: "@iwiw/dsh-iwiw-memory",
+  factory: (require) => {
+    var module = { exports: {} };
+    var exports = module.exports;
+
+"use strict";
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
 // src/client.ts
-import { createElement as createElement2, useCallback as useCallback2, useEffect, useLayoutEffect, useMemo, useRef, useState as useState2 } from "react";
+var client_exports = {};
+__export(client_exports, {
+  MemoryFoldDock: () => MemoryFoldDock,
+  apply: () => apply,
+  inject: () => inject
+});
+module.exports = __toCommonJS(client_exports);
+var import_react = require("react");
 
 // src/client-fold.ts
 var REFLECT_MARKER = "[iwiw-memory-reflect]";
@@ -840,7 +882,7 @@ function startDreamSkipManager() {
 }
 
 // src/settings-page.ts
-import * as React from "react";
+var React = __toESM(require("react"), 1);
 var SETTINGS_NS = "dsh-iwiw-memory";
 var CSS_ID2 = "meow-memory-settings-css";
 var CSS2 = `
@@ -1668,12 +1710,12 @@ function applyFoldState(groups, expanded, onToggle, session) {
   }
 }
 function MemoryFoldDock({ session }) {
-  const [expanded, setExpanded] = useState2(() => /* @__PURE__ */ new Set());
-  const [injExpanded, setInjExpanded] = useState2(() => /* @__PURE__ */ new Set());
-  const groups = useMemo(() => computeFoldGroups(session), [session]);
-  const injGroups = useMemo(() => computeInjectionGroups(session), [session]);
-  const dgNotices = useMemo(() => computeDelegateNotices(session), [session]);
-  const toggle = useCallback2((id) => {
+  const [expanded, setExpanded] = (0, import_react.useState)(() => /* @__PURE__ */ new Set());
+  const [injExpanded, setInjExpanded] = (0, import_react.useState)(() => /* @__PURE__ */ new Set());
+  const groups = (0, import_react.useMemo)(() => computeFoldGroups(session), [session]);
+  const injGroups = (0, import_react.useMemo)(() => computeInjectionGroups(session), [session]);
+  const dgNotices = (0, import_react.useMemo)(() => computeDelegateNotices(session), [session]);
+  const toggle = (0, import_react.useCallback)((id) => {
     setExpanded((prev) => {
       const next = new Set(prev);
       const willExpand = !next.has(id);
@@ -1684,7 +1726,7 @@ function MemoryFoldDock({ session }) {
       return next;
     });
   }, [groups, session]);
-  const toggleInj = useCallback2((id) => {
+  const toggleInj = (0, import_react.useCallback)((id) => {
     setInjExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -1692,14 +1734,14 @@ function MemoryFoldDock({ session }) {
       return next;
     });
   }, []);
-  useLayoutEffect(() => {
+  (0, import_react.useLayoutEffect)(() => {
     applyFoldState(groups, expanded, toggle, session);
     applyInjectionFold(injGroups, injExpanded, toggleInj);
     applyDelegateNotices(dgNotices);
   }, [groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices]);
-  const latest = useRef({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices });
+  const latest = (0, import_react.useRef)({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices });
   latest.current = { groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices };
-  useEffect(() => {
+  (0, import_react.useEffect)(() => {
     let timer = 0;
     const observer = new MutationObserver(() => {
       window.clearTimeout(timer);
@@ -1722,17 +1764,17 @@ function makeDelegateVanishDock(refreshSubagents) {
     const current = useSessions?.((state) => state?.current);
     const byId = useSessions?.((state) => state?.byId);
     const catalogs = useSessions?.((state) => state?.subagentsByParent);
-    const sentinelRef = useRef(null);
-    const decision = useMemo(
+    const sentinelRef = (0, import_react.useRef)(null);
+    const decision = (0, import_react.useMemo)(
       () => computeVanishDecision({ current, byId, subagentsByParent: catalogs }),
       [current, byId, catalogs]
     );
-    const latest = useRef({ decision });
+    const latest = (0, import_react.useRef)({ decision });
     latest.current = { decision };
-    useLayoutEffect(() => {
+    (0, import_react.useLayoutEffect)(() => {
       applyVanishDom(decision, sentinelRef.current);
     }, [decision]);
-    useEffect(() => {
+    (0, import_react.useEffect)(() => {
       if (current !== void 0 && typeof refreshSubagents === "function") {
         try {
           refreshSubagents(current);
@@ -1741,7 +1783,7 @@ function makeDelegateVanishDock(refreshSubagents) {
       }
       return startVanishObserver(() => ({ decision: latest.current.decision, sentinel: sentinelRef.current }));
     }, [current]);
-    return createElement2("span", {
+    return (0, import_react.createElement)("span", {
       [SENTINEL_ATTR]: "1",
       style: { display: "none" },
       ref: sentinelRef
@@ -1798,9 +1840,7 @@ function apply(ctx) {
     }
   };
 }
-export {
-  MemoryFoldDock,
-  apply,
-  inject
-};
+    return module.exports;
+  }
+});
 //# sourceMappingURL=client.js.map

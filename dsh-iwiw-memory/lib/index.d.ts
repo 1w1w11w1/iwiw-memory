@@ -1,6 +1,8 @@
 import { Context } from "@deepseek-ai/cordis";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export declare const name = "dsh-iwiw-memory";
+/** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
+export declare const inject: string[];
 interface PluginConfig {
     /** Python 解释器路径（含 mcp/jieba 依赖的 venv 或系统 Python）。 */
     python?: string;

@@ -258,7 +258,6 @@ console.log("识别组:", groups.map((g) => g.id + ":" + g.kind).join(", "), "| 
 console.log("\n=== 7. client bundle 冒烟（minimal DOM stub）===");
 let clientOk = false;
 try {
-  const client = await import("../lib/client.js");
   // 万能 Proxy stub：任何属性访问/调用都返回自身（可无限链式）。
   // 只用于验证 bundle 加载与 apply 主路径不抛错——DOM 行为真验证在换装阶段。
   const universal = new Proxy(function () {}, {
@@ -273,8 +272,30 @@ try {
     set: () => true,
   });
   globalThis.document = universal;
-  globalThis.window = universal;
   globalThis.MutationObserver = universal;
+  // 模拟 DSH 渲染端 __ModuleLoader__：求值时注册，factory 立即执行并捕获 cjs 导出；
+  // factory 内 require("react") 由宿主提供，这里用 universal stub 顶替。
+  let clientExports = null;
+  let registeredId = null;
+  const loader = {
+    load: (entry) => {
+      registeredId = entry.id;
+      clientExports = entry.factory((spec) => {
+        if (spec === "react") return universal;
+        throw new Error("unexpected client require: " + spec);
+      });
+    },
+  };
+  // 真实 window 只保证 __ModuleLoader__，其余浏览器 API 用 universal 兜底
+  globalThis.window = new Proxy({ __ModuleLoader__: loader }, {
+    get: (t, prop) => (prop in t ? t[prop] : universal),
+  });
+  await import("../lib/client.js");
+  if (registeredId !== "@iwiw/dsh-iwiw-memory") {
+    throw new Error("client bundle 未通过 __ModuleLoader__ 自注册，id=" + registeredId);
+  }
+  const client = clientExports;
+  if (typeof client?.apply !== "function") throw new Error("client factory 导出缺少 apply");
   const slots = {
     inject: (name, factory) => { factory(); return () => {}; },
     register: () => ({}),

@@ -4,6 +4,8 @@ import { MemoryTools, toTextBlocks } from "./tools.js";
 import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export const name = "dsh-iwiw-memory";
+/** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
+export const inject = ["tools", "systemPrompt"];
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_PYTHON = "E:/desktop/111/.venv/Scripts/python.exe";
 const DEFAULT_CWD = "E:/desktop/111";
