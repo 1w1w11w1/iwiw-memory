@@ -362,7 +362,7 @@ export const EN_PROMPT_SEPARATOR = "This turn's user prompt:"
 
 
 
-export type InjectionKind = 'first' | 'hit'
+export type InjectionKind = 'first' | 'hit' | 'reflect' | 'dream'
 
 
 
@@ -424,13 +424,33 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
 
         form?: string
 
-        memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' }
+        memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' | 'reflect' | 'dream-report' }
 
       } | undefined
 
       if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
 
       const memKind = source.memory?.kind
+
+      if (memKind === 'reflect') {
+
+        // 回顾提示（reflect steering）：折叠为独立横条，标签区分于记忆命中。
+
+        groups.push({ id: key, kind: 'reflect', injectedText: contextText(node) })
+
+        continue
+
+      }
+
+      if (memKind === 'dream-report') {
+
+        // 梦境整理报告：空闲整理结果的一次性注入，折叠为横条。
+
+        groups.push({ id: key, kind: 'dream', injectedText: contextText(node) })
+
+        continue
+
+      }
 
       if (memKind === 'initial' || memKind === 'reinjection') {
 

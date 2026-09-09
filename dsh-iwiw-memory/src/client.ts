@@ -762,7 +762,10 @@ function applyInjectionFold(
 
       }
 
-      const kindLabel = group.kind === 'first' ? '（长期记忆）' : '（关键词命中）'
+      const kindLabel = group.kind === 'first' ? '（长期记忆）'
+        : group.kind === 'reflect' ? '（回顾提示）'
+        : group.kind === 'dream' ? '（梦境整理报告）'
+        : '（关键词命中）'
 
       const label = `${expanded.has(group.id) ? '▾' : '▸'} 已注入记忆${kindLabel}`
 

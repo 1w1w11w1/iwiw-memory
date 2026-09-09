@@ -144,6 +144,14 @@ function computeInjectionGroups(snapshot) {
       const source = node.data.source;
       if (source?.kind !== "plugin" || source.plugin !== PLUGIN_NAME) continue;
       const memKind = source.memory?.kind;
+      if (memKind === "reflect") {
+        groups.push({ id: key, kind: "reflect", injectedText: contextText(node) });
+        continue;
+      }
+      if (memKind === "dream-report") {
+        groups.push({ id: key, kind: "dream", injectedText: contextText(node) });
+        continue;
+      }
       if (memKind === "initial" || memKind === "reinjection") {
         groups.push({ id: key, kind: "first", injectedText: contextText(node) });
         continue;
@@ -1628,7 +1636,7 @@ function applyInjectionFold(groups, expanded, onToggle) {
         bar.addEventListener("click", () => onToggle(group.id));
         anchor.appendChild(bar);
       }
-      const kindLabel = group.kind === "first" ? "\uFF08\u957F\u671F\u8BB0\u5FC6\uFF09" : "\uFF08\u5173\u952E\u8BCD\u547D\u4E2D\uFF09";
+      const kindLabel = group.kind === "first" ? "\uFF08\u957F\u671F\u8BB0\u5FC6\uFF09" : group.kind === "reflect" ? "\uFF08\u56DE\u987E\u63D0\u793A\uFF09" : group.kind === "dream" ? "\uFF08\u68A6\u5883\u6574\u7406\u62A5\u544A\uFF09" : "\uFF08\u5173\u952E\u8BCD\u547D\u4E2D\uFF09";
       const label = `${expanded.has(group.id) ? "\u25BE" : "\u25B8"} \u5DF2\u6CE8\u5165\u8BB0\u5FC6${kindLabel}`;
       if (bar.textContent !== label) bar.textContent = label;
       let body = anchor.querySelector(`:scope > [${INJ_BODY_ATTR}]`);

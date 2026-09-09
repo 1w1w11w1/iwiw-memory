@@ -54,7 +54,19 @@ function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
       },
       output: {
         schema: { type: "object", additionalProperties: false, properties: { result: { type: "json" } } },
-        render: (_args, value) => toTextBlocks(value),
+        // 写入反馈人性化：✓ 已记住（类型）slug — 描述；带近似条目时提醒查重合并。
+        render: (args, value) => {
+          const r = (value as any)?.result ?? value;
+          const a = args as any;
+          if (r?.ok) {
+            const lines = [`✓ 已记住（${r.level ?? a?.level ?? "fact"}）${r.slug}` + (a?.description ? ` — ${a.description}` : "")];
+            if (Array.isArray(r.related) && r.related.length > 0) {
+              lines.push(`⚠ 近似条目（如重复请带其 slug 更新合并）：` + r.related.map((x: any) => x?.slug ?? x).join("、"));
+            }
+            return toTextBlocks(lines.join("\n"));
+          }
+          return toTextBlocks(value);
+        },
       },
       async execute(args) {
         const a = args as { description: string; body: string; level?: string; slug?: string; priority?: string };
@@ -289,6 +301,15 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         .trim();
       if (text.length < 4) return decision;
       const sid = typeof agent?.session?.header?.id === "string" ? agent.session.header.id : "default";
+      // ── dream 报告：空闲整理完成后下一次对话一次性告知（折叠横条显示）──
+      if (lastDreamReport.value) {
+        const report = lastDreamReport.value;
+        lastDreamReport.value = "";
+        const rewritten = [...decision.messages];
+        rewritten.splice(rewritten.indexOf(lastUser), 0, snapshotMessage(report, { kind: "dream-report", ids: [] }));
+        ctx.logger.info("[dsh-iwiw-memory] dream report injected");
+        return { ...decision, messages: rewritten };
+      }
       // ── reflect steering：连续 N 步未写入 → 注入一次性回顾提示（优先于命中注入）──
       if (reflectTurns > 0 && stepSinceWrite >= reflectTurns) {
         stepSinceWrite = 0;
@@ -368,6 +389,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
   );
 
   // 6) dream 空闲整理：空闲 dreamIdleMinutes 且非峰时 → 调内核 run_dream（低风险修正留痕自愈，归档进待审批）。
+  //    结果暂存 lastDreamReport，下一次对话 pre-step 一次性注入（渲染端折叠为「梦境整理报告」横条）。
+  const lastDreamReport = { value: "" };
   const dreamTimer = dreamIdleMinutes > 0
     ? setInterval(() => {
         if (dreamRunning) return;
@@ -383,6 +406,16 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
               + ` pending=${d.pending?.length ?? 0} suggestions=${d.suggestions?.length ?? 0}`
               + (d.error ? ` error=${d.error}` : ""),
             );
+            const parts: string[] = [`审查了 ${d.reviewed ?? 0} 条近期记忆`];
+            const fixed: string[] = d.auto_fixed ?? [];
+            if (fixed.length) parts.push(`自动修正 ${fixed.length} 条（${fixed.map((f: any) => f?.slug).join("、")}）`);
+            const pend: string[] = d.pending ?? [];
+            if (pend.length) parts.push(`待审批归档 ${pend.length} 条`);
+            const sugg: string[] = d.suggestions ?? [];
+            if (sugg.length) parts.push(`合并建议 ${sugg.length} 条`);
+            if (d.error) parts.push(`错误：${d.error}`);
+            if (!fixed.length && !pend.length && !sugg.length && !d.error) parts.push("无需整理");
+            lastDreamReport.value = ["## 梦境整理报告", "", "空闲期整理完成：" + parts.join("；") + "。"].join("\n");
           })
           .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] dream failed", e))
           .finally(() => {

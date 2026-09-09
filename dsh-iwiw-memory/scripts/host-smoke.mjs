@@ -255,6 +255,21 @@ const groups = computeInjectionGroups(snapshot);
 const foldOk = groups.length === 2 && groups[0].kind === "hit" && groups[1].kind === "first";
 console.log("识别组:", groups.map((g) => g.id + ":" + g.kind).join(", "), "| 断言:", foldOk ? "PASS" : "FAIL");
 
+// reflect / dream-report 识别（新 InjectionKind，横条标签区分于记忆命中）
+const snapNew = {
+  chat: {
+    order: ["r1", "r2"],
+    nodes: new Map([
+      ["r1", snapOf("reflect", "## 会话回顾（reflect）\n\n最近多轮对话没有写入记忆。")],
+      ["r2", snapOf("dream-report", "## 梦境整理报告\n\n空闲期整理完成：审查了 5 条近期记忆；待审批归档 1 条。")],
+    ]),
+    locations: { getTurn: () => [] },
+  },
+};
+const groupsNew = computeInjectionGroups(snapNew);
+const kindOk = groupsNew.length === 2 && groupsNew[0].kind === "reflect" && groupsNew[1].kind === "dream";
+console.log("reflect/dream 识别:", groupsNew.map((g) => g.kind).join(","), "| 断言:", kindOk ? "PASS" : "FAIL");
+
 console.log("\n=== 7. client bundle 冒烟（minimal DOM stub）===");
 let clientOk = false;
 try {
@@ -313,6 +328,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-const allOk = a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && clientOk;
+const allOk = a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && foldOk && kindOk && clientOk;
 console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
 process.exit(allOk ? 0 : 1);
