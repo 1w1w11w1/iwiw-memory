@@ -55,18 +55,27 @@
 
 ## 快速开始
 
-1. 复制 `.env.example` 为 `.env`，填写 `MEMORY_AGENT_LLM_API_KEY`。
-2. 安装依赖：
+### 方式 A：DSH 插件（推荐）
 
-   ```powershell
-   pip install -r requirements.txt
-   ```
+让 DSH agent 获得跨会话记忆（常驻注入 / 空闲巩固 / 桌面通知）：
 
-3. 启动 CLI 工作台：
+```powershell
+git clone https://github.com/1w1w11w1/iwiw-memory.git
+cd iwiw-memory
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+npm install @iwiw/dsh-iwiw-memory --prefix "<DSH_HOME>\profiles\desktop"
+```
 
-   ```powershell
-   python -m memory_agent.chat
-   ```
+再在 profile 的 cordis.patch.yml 部署配置并重启 DSH——完整步骤见[插件安装指南](docs/plugin-setup.md)。
+
+### 方式 B：CLI 工作台
+
+```powershell
+pip install -r requirements.txt        # 首次
+# 编辑 .env 填入 MEMORY_AGENT_LLM_API_KEY
+python -m memory_agent.chat
+```
 
 ## 接入层（多端复用）
 
