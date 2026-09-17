@@ -5,7 +5,7 @@ IwIw 记忆插件：iwiw-memory 记忆内核的 DSH 接入端。让 DSH agent �
 ## 能力
 
 - **4 个记忆工具**：memory_remember / memory_search / memory_read / memory_list，模型自主调用写入与检索（与内核 CLI 同源）
-- **常驻注入**：core 层画像 + rules 准则段每轮注入 system prompt，写入后自动刷新
+- **常驻注入**：常驻层记忆（`standingLayers`，默认 `profile,rules`）每轮全量注入 system prompt，写入后自动刷新；注入视图剥离只对检索有意义的 `关键词:` 行（正文不动）
 - **命中注入**：每条用户消息触发检索，命中记忆以快照消息插入上下文（会话内去重、压缩后自动补回）
 - **reflect steering**：连续多步未写入记忆时注入一次性回顾提示
 - **启动补账**：每次插件启动后台跑一次巩固——检查上次水位之后新完成的对话，整理已有记忆；结果下次对话一次性告知。与聊天活跃度无关，没有峰时抑制
@@ -47,7 +47,7 @@ New-Item -ItemType Junction -Path "<profile>\node_modules\@iwiw\dsh-iwiw-memory"
 
 > profile bundle 契约（缺一即启动崩溃）：包内 `package.json` 声明 `dsh.bundle.patch` 指向 `cordis.patch.yml`；包内 patch 用 `- insert:` 行装载插件（name 必须是 npm 包名 `@iwiw/dsh-iwiw-memory`）；profile patch 的 id 与 insert 行 id 一致。写入 profile 配置文件须无 BOM（UTF-8 无 BOM，否则 DSH 解析失败）。
 
-重启 DSH 生效。启动日志出现 `applied: 4 tools + 2 prompt sections + pre-step hook + consolidation scheduler` 即挂载成功。
+重启 DSH 生效。启动日志出现 `[dsh-iwiw-memory] applied: 4 tools + 3 prompt sections + pre-step hook (reflect/hit) + startup reconcile` 即挂载成功（随后一行 `capture commands registered (/memo, /recall, /iwiw-prompt)`）。
 
 ## 配置
 
