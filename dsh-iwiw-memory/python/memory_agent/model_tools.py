@@ -11,7 +11,6 @@ import hashlib
 from typing import Any
 
 from .db import get_memory, list_memories, upsert_memory, touch_memories
-from .redaction import describe, scan
 from .retrieval import search_memories
 
 REMEMBER_GUIDE = (
@@ -24,10 +23,6 @@ REMEMBER_GUIDE = (
     "（新建前先用 memory_search 查重，已存在近似条目则带其 slug 更新）。"
     "只记稳定信息与用户明确要求记住的内容；一次性、临时话题不要写。"
     "用户最新表述优先。"
-    "不要写入凭据类信息：API key、token、密码、私钥、连接串里的口令——"
-    "需要记录“配置在哪”就写占位符（如 ARK_API_KEY=<见 .env>），不要抄真值；"
-    "公网 IP/域名如需记录只写用途与归属，本机与内网地址（127.0.0.1、192.168.x.x）可保留。"
-    "写入前会做一次确定性脱敏，命中的凭据会被替换并在返回里告知。"
 )
 
 TOOL_GUIDES: dict[str, str] = {
@@ -128,18 +123,12 @@ def execute_memory_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             if not args.get("slug"):
                 hits = search_memories(description, top_k=3)
                 related = [{"slug": h["slug"], "description": h.get("description", "")} for h in hits]
-            # 先检测原文（给模型的提示基于用户原始输入），落库仍由 db 层统一脱敏兜底
-            redacted_kinds = describe(scan(description) + scan(body))
             row = upsert_memory(
                 slug=slug, description=description, content=body,
                 mem_type=level, priority=priority,
             )
             result = {"ok": True, "slug": row["slug"], "level": row.get("mem_type", level), "related": related}
-            if redacted_kinds:
-                result["redacted"] = redacted_kinds
             echo = f"remember → {row['slug']} [{row.get('mem_type', '')}/{row.get('priority', '')}]" + (f"（近似: {', '.join(r['slug'] for r in related)}）" if related else "")
-            if redacted_kinds:
-                echo += f"（已脱敏：{redacted_kinds}）"
         elif name == "memory_search":
             query = (args.get("query") or "").strip()
             hits = search_memories(query, top_k=max(1, min(int(args.get("top_k", 5)), 10)))

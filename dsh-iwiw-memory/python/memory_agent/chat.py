@@ -109,18 +109,6 @@ async def _execute_memory_tool(tc: dict[str, Any]) -> tuple[dict[str, str], str]
     return msg, out["echo"]
 
 
-def _recorded_suffix(mem: dict[str, Any]) -> str:
-    """注入 header 的记录时间后缀：由系统从落库字段直接读取，不经模型。
-
-    权威源是 recorded_date（写入时落库），回退 created_at；两者都缺则不加后缀。
-    只呈现"何时记下"这一确定事实，不推断正文中日期表述的语义。
-    """
-    stamp = (mem.get("recorded_date") or mem.get("created_at") or "").strip()
-    if not stamp:
-        return ""
-    return f" · 记录于 {stamp[:16].replace('T', ' ')}"
-
-
 def _always_load_text() -> str:
     """组装常驻记忆全文（STANDING_LAYERS 各层，启动时注入系统提示）。
 
@@ -136,7 +124,7 @@ def _always_load_text() -> str:
     def _collect(target: list[str], mems: list[dict]) -> None:
         nonlocal budget
         for mem in mems:
-            header = f"- **{mem['slug']}** ({mem['mem_type']}) — {mem.get('description', '')}{_recorded_suffix(mem)}"
+            header = f"- **{mem['slug']}** ({mem['mem_type']}) — {mem.get('description', '')}"
             body = mem.get("content", "")
             if len(body) > budget:
                 body = body[:budget] + "..."
@@ -204,7 +192,7 @@ def _related_text(
     injected: set[str] = set()
     budget = MEMORY_RECALL_MAX_CHARS
     for mem in results:
-        header = f"- **{mem['slug']}** ({mem['priority']}) — {mem.get('description', '')}{_recorded_suffix(mem)}"
+        header = f"- **{mem['slug']}** ({mem['priority']}) — {mem.get('description', '')}"
         body = (mem.get("content") or "")
         if len(body) > budget:
             body = body[:budget] + "..."
