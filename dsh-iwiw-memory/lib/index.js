@@ -1,24 +1,33 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
 import { MemoryBackend } from "./backend.js";
 import { MemoryTools, toTextBlocks } from "./tools.js";
 import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
+import { registerCaptureCommands } from "./capture.js";
+import { runStartup } from "./startup.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
 export const name = "dsh-iwiw-memory";
 /** 必须显式声明 host 端用到的 cordis 服务，否则 ctx 访问器会抛 "cannot get property ... without inject"。 */
-export const inject = ["tools", "systemPrompt", "settings"];
+export const inject = ["tools", "systemPrompt", "settings", "commands"];
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
 const DEFAULT_CORE_MAX_CHARS = 2500;
-/** 峰时抑制：9-12 / 14-18 及各自前 15 分钟不触发巩固（避免打扰活跃时段）。 */
-export function isPeakTime(d) {
-    const h = d.getHours() + d.getMinutes() / 60;
-    return (h >= 8.75 && h < 12) || (h >= 13.75 && h < 18);
+/** 注入 header 的记录时间后缀：直接来自后端落库字段（recorded_date），模型不生成、不复述。
+ *  只呈现"何时记下"这一确定事实，缺席时不加后缀。 */
+function recordedSuffix(recordedDate) {
+    const stamp = typeof recordedDate === "string" ? recordedDate.trim() : "";
+    if (!stamp)
+        return "";
+    return ` · 记录于 ${stamp.slice(0, 16).replace("T", " ")}`;
 }
 function makeDefinition(tools, onRemember) {
     return {
         memory_remember: defineTool({
             name: "memory_remember",
-            description: "把值得长期保存的稳定信息写入记忆，按内容类型选 level。写入即全文替换；新建前先 memory_search 查重。",
+            description: "把值得长期保存的稳定信息写入记忆，按内容类型选 level。写入即全文替换；新建前先 memory_search 查重。" +
+                "不要写入凭据类内容（API key/token/密码/私钥/连接串口令），需要记录配置位置时写占位符而非真值；" +
+                "公网 IP 只记用途，本机与内网地址可保留。写入前内核会确定性脱敏，命中项在返回里告知。",
             parameters: {
                 description: { type: "string", required: true, description: "一句话描述" },
                 body: { type: "string", required: true, description: "完整正文（整体替换旧内容，不是追加）" },
@@ -36,6 +45,9 @@ function makeDefinition(tools, onRemember) {
                         const lines = [`✓ 已记住（${r.level ?? a?.level ?? "fact"}）${r.slug}` + (a?.description ? ` — ${a.description}` : "")];
                         if (Array.isArray(r.related) && r.related.length > 0) {
                             lines.push(`⚠ 近似条目（如重复请带其 slug 更新合并）：` + r.related.map((x) => x?.slug ?? x).join("、"));
+                        }
+                        if (r.redacted) {
+                            lines.push(`🔒 已脱敏（未落库）：${r.redacted}；如需保留配置线索请改记占位符`);
                         }
                         return toTextBlocks(lines.join("\n"));
                     }
@@ -105,8 +117,11 @@ export const SETTINGS_SCHEMA = Schema.object({
     hitTopK: Schema.number().default(3).description("每条消息命中注入条数上限"),
     coreMaxChars: Schema.number().default(2500).description("常驻记忆段字符预算"),
     reflectTurns: Schema.number().default(7).description("回顾提示触发步数，0=关闭"),
-    consolidateIdleMinutes: Schema.number().default(180).description("空闲巩固阈值（分钟），0=关闭"),
+    // 启动补账：替代旧的空闲轮询（与聊天活跃度无关）
+    startupConsolidate: Schema.boolean().default(true).description("启动时自动补账"),
     standingLayers: Schema.string().default("profile,rules").description("常驻记忆类型，逗号分隔"),
+    // 已弃用：保留数值 schema 只为接收旧配置，不给默认值、不在设置页展示
+    consolidateIdleMinutes: Schema.number().description("已弃用，仅兼容旧关闭设置"),
 });
 const SETTINGS_NS = "dsh-iwiw-memory";
 export const apply = async (ctx, config = {}) => {
@@ -124,35 +139,58 @@ export const apply = async (ctx, config = {}) => {
         coreMaxChars: config.coreMaxChars ?? DEFAULT_CORE_MAX_CHARS,
         standingLayers: config.standingLayers ?? ["profile", "rules"],
         reflectTurns: config.reflectTurns ?? 7,
-        consolidateIdleMinutes: config.consolidateIdleMinutes ?? 180,
+        startupConsolidate: config.startupConsolidate ?? config.consolidateIdleMinutes !== 0,
         hitTopK: undefined,
     };
     overrides.hitTopK = config.hitTopK ?? 3;
+    // 旧配置迁移：consolidateIdleMinutes=0 曾表示「明确关闭巩固」。
+    // 必须看 user/base 层是否**显式**设置过——schema 默认值填好的数字会掩盖旧 0。
+    let legacyConsolidateDisabled = config.consolidateIdleMinutes === 0;
+    let legacyNotice = legacyConsolidateDisabled
+        ? "旧的 consolidateIdleMinutes=0 已映射为 startupConsolidate=false（启动补账关闭）。"
+        : "";
     const standingLayers = () => overrides.standingLayers.filter((t) => VALID_MEM_TYPES.has(t));
     const reflectTurns = () => overrides.reflectTurns;
     const hitTopK = () => overrides.hitTopK;
-    ctx.inject(["settings"], (sctx) => {
-        try {
-            const scope = sctx.settings.register(SETTINGS_NS, SETTINGS_SCHEMA, { base: config });
-            const applySettings = (resolved) => {
-                for (const [k, v] of Object.entries(resolved)) {
-                    // standingLayers 存储为逗号分隔字符串，运行时消费需要数组
-                    overrides[k] = k === "standingLayers"
-                        ? String(v).split(",").map((s) => s.trim()).filter((t) => VALID_MEM_TYPES.has(t))
-                        : v;
-                }
-            };
+    try {
+        const scope = ctx.settings.register(SETTINGS_NS, SETTINGS_SCHEMA, { base: config });
+        const applySettings = (resolved) => {
+            for (const [k, v] of Object.entries(resolved)) {
+                // standingLayers 存储为逗号分隔字符串，运行时消费需要数组
+                overrides[k] = k === "standingLayers"
+                    ? String(v).split(",").map((s) => s.trim()).filter((t) => VALID_MEM_TYPES.has(t))
+                    : v;
+            }
+        };
+        applySettings(scope.get());
+        // 显式新字段优先于旧字段；user 层优先于 base/config 层。
+        const descriptor = ctx.settings.describe()
+            .find((entry) => entry?.ns === SETTINGS_NS);
+        const user = descriptor?.user ?? {};
+        const base = descriptor?.base ?? config;
+        const hasNewSetting = Object.prototype.hasOwnProperty.call(user, "startupConsolidate")
+            || Object.prototype.hasOwnProperty.call(base, "startupConsolidate");
+        const legacy = Object.prototype.hasOwnProperty.call(user, "consolidateIdleMinutes")
+            ? user.consolidateIdleMinutes
+            : base.consolidateIdleMinutes;
+        if (!hasNewSetting && typeof legacy === "number") {
+            legacyConsolidateDisabled = legacy === 0;
+            legacyNotice = legacyConsolidateDisabled
+                ? "旧的 consolidateIdleMinutes=0 已映射为 startupConsolidate=false（启动补账关闭）。"
+                : "旧的 consolidateIdleMinutes 阈值已停用：巩固改为每次启动补账一次。";
+            overrides.startupConsolidate = !legacyConsolidateDisabled;
+        }
+        if (legacyNotice)
+            ctx.logger.info(`[dsh-iwiw-memory] ${legacyNotice}`);
+        scope.watch(() => {
             applySettings(scope.get());
-            scope.watch(() => {
-                applySettings(scope.get());
-                ctx.logger.info(`[dsh-iwiw-memory] settings updated: ${JSON.stringify(overrides)}`);
-            });
-            ctx.logger.info("[dsh-iwiw-memory] settings section installed");
-        }
-        catch (e) {
-            ctx.logger.warn("[dsh-iwiw-memory] settings registration failed (patch config in effect)", e);
-        }
-    });
+            ctx.logger.info(`[dsh-iwiw-memory] settings updated: ${JSON.stringify(overrides)}`);
+        });
+        ctx.logger.info("[dsh-iwiw-memory] settings section installed");
+    }
+    catch (e) {
+        ctx.logger.warn("[dsh-iwiw-memory] settings registration failed (patch config in effect)", e);
+    }
     const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
     const tools = new MemoryTools(backend);
     // 1) 启动时预热后端（避免首次工具调用才连接）。
@@ -205,8 +243,9 @@ export const apply = async (ctx, config = {}) => {
     // A2 一致性：core/rules 段缓存 + 写入后异步刷新（pending 重跑，刷新期间的请求不丢失）。
     let cachedCore = "";
     let cachedRules = "";
-    let refreshing = false;
+    let refreshInFlight = null;
     let pending = false;
+    let disposing = false;
     const fetchRulesText = async () => {
         // rules 类准则全量注入（archived 退役不注入）；未配置 rules 层则无准则段
         if (!standingLayers().includes("rules"))
@@ -229,22 +268,28 @@ export const apply = async (ctx, config = {}) => {
             return "";
         }
     };
-    const refreshCore = async () => {
-        if (refreshing) {
+    // 返回可等待的在途 Promise：调用方 await 它才是「刷新已生效」，
+    // 只把请求排进队列就说刷新完成会让系统段读到旧值。
+    const refreshCore = () => {
+        if (disposing)
+            return refreshInFlight ?? Promise.resolve();
+        if (refreshInFlight) {
             pending = true;
-            return;
+            return refreshInFlight;
         }
-        refreshing = true;
-        try {
-            do {
-                pending = false;
-                cachedCore = await fetchCoreText();
-                cachedRules = await fetchRulesText();
-            } while (pending);
-        }
-        finally {
-            refreshing = false;
-        }
+        refreshInFlight = (async () => {
+            try {
+                do {
+                    pending = false;
+                    cachedCore = await fetchCoreText();
+                    cachedRules = await fetchRulesText();
+                } while (pending);
+            }
+            finally {
+                refreshInFlight = null;
+            }
+        })();
+        return refreshInFlight;
     };
     refreshCore().catch(() => { });
     disposers.push(ctx.systemPrompt.section({
@@ -268,6 +313,20 @@ export const apply = async (ctx, config = {}) => {
             ].join("\n");
         },
     }));
+    // 4.5) 跨项目「想法带回」管道（/memo + /recall）——纯开发者工具，可整块剥离：
+    //     删除本段两行 + src/capture.ts + package.json 的 peerDependency 即可，
+    //     不影响上面的记忆工具与注入链路。
+    try {
+        // 与内核 @deepseek-ai/dsh-home-paths resolveDshHome 同语义：非空 $DSH_HOME 优先，
+        // 否则回退 ~/.dsh。桌面端插件进程里 DSH_HOME 常缺省，直接读 env 会得到 profiles\web（盘符相对路径）。
+        const dshHome = (process.env.DSH_HOME ?? "").trim() || join(homedir(), ".dsh");
+        const profileDir = config.profileDir ?? join(dshHome, "profiles", "web");
+        disposers.push(...registerCaptureCommands(ctx, { python, profileDir }));
+        ctx.logger.info("[dsh-iwiw-memory] capture commands registered (/memo, /recall)");
+    }
+    catch (e) {
+        ctx.logger.warn("[dsh-iwiw-memory] capture commands registration failed", e);
+    }
     // 5) 每消息命中注入（agent/pre-step）：最后一条 user 消息触发检索，
     //    命中且未注入过的记忆以快照消息插入其前。
     //    会话内去重：注入过的 slug 不再重复注入（compress 后由 reinject 补回）。
@@ -276,9 +335,6 @@ export const apply = async (ctx, config = {}) => {
     const injectedBySession = new Map();
     // 压缩后补回：compaction 释放去重并快照本会话已注入 slugs，compaction/end 后 pre-step 补回
     const reinjectArmed = new Map();
-    // 活动时间戳：任何 pre-step 活动都刷新（供巩固空闲判定）
-    const lastActivityAt = { value: Date.now() };
-    let consolidateRunning = false;
     disposers.push(ctx.on("session/event", (session, event) => {
         const t = event?.type;
         const sid = typeof session?.id === "string" ? session.id : null;
@@ -323,7 +379,6 @@ export const apply = async (ctx, config = {}) => {
             return decision;
         if (agent?.session?.header?.origin === "subagent")
             return decision;
-        lastActivityAt.value = Date.now();
         const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === "user");
         if (!lastUser)
             return decision;
@@ -409,7 +464,7 @@ export const apply = async (ctx, config = {}) => {
             injectedBySession.set(sid, seen);
             const lines = ["## 相关记忆（命中）", ""];
             for (const h of fresh) {
-                lines.push(`- **${h.slug}** (${h.priority}) — ${h.description}`);
+                lines.push(`- **${h.slug}** (${h.priority}) — ${h.description}${recordedSuffix(h.recorded_date)}`);
                 lines.push(`  ${h.content}`);
             }
             const rewritten = [...decision.messages];
@@ -424,62 +479,68 @@ export const apply = async (ctx, config = {}) => {
             return decision;
         }
     }));
-    // 6) 记忆巩固（consolidate）：空闲 consolidateIdleMinutes 且非峰时 → 调内核 run_consolidate（低风险修正留痕自愈，归档进待审批）。
-    //    结果暂存 lastConsolidateReport，下一次对话 pre-step 一次性注入。
-    //    常驻定时器（10min 检查一次），每次读 overrides.consolidateIdleMinutes——settings 改空闲阈值热生效；设 0 即停。
+    // 6) 启动补账（A）：每次插件启动跑一次后台补账，替代旧的空闲轮询。
+    //    与聊天活跃度无关，也没有峰时抑制。结果暂存 lastConsolidateReport，
+    //    下一次对话 pre-step 一次性注入。
+    //    常驻、永不重启的进程不会自动周期巩固；需要时手动调 MCP 的 run_consolidate。
+    // 巩固/补账报告：完成后暂存，下一次对话 pre-step 一次性注入（与旧定时器同款消费点）。
     const lastConsolidateReport = { value: "" };
-    const consolidateIdleMinutes = () => overrides.consolidateIdleMinutes;
-    const consolidateTimer = consolidateIdleMinutes() > 0
-        ? setInterval(() => {
-            const idle = consolidateIdleMinutes();
-            if (idle <= 0 || consolidateRunning)
+    const startupState = { running: false, finished: false };
+    const startupTasks = new Set();
+    let activeStartupController = null;
+    if (overrides.startupConsolidate === false) {
+        ctx.logger.info("[dsh-iwiw-memory] startup reconcile disabled by settings");
+    }
+    else {
+        ctx.inject(["storageDomain", "sessionQuery", "sessionPersistence"], (sctx) => {
+            // 回调可能因服务重绑再次执行：同次 apply 内防重复；失败/服务暂失回到可重试态。
+            if (startupState.running || startupState.finished)
                 return;
-            if (Date.now() - lastActivityAt.value < idle * 60_000)
-                return;
-            if (isPeakTime(new Date()))
-                return;
-            consolidateRunning = true;
-            ctx.logger.info("[dsh-iwiw-memory] consolidate: idle threshold reached");
-            tools.consolidate()
-                .then((r) => {
-                const d = (r && typeof r === "object") ? r : {};
-                ctx.logger.info(`[dsh-iwiw-memory] consolidate done: reviewed=${d.reviewed ?? 0} auto_fixed=${d.auto_fixed?.length ?? 0}`
-                    + ` pending=${d.pending?.length ?? 0} suggestions=${d.suggestions?.length ?? 0}`
-                    + (d.error ? ` error=${d.error}` : ""));
-                const parts = [`审查了 ${d.reviewed ?? 0} 条近期记忆`];
-                const fixed = d.auto_fixed ?? [];
-                if (fixed.length)
-                    parts.push(`自动修正 ${fixed.length} 条（${fixed.map((f) => f?.slug).join("、")}）`);
-                const pend = d.pending ?? [];
-                if (pend.length)
-                    parts.push(`待审批归档 ${pend.length} 条`);
-                const sugg = d.suggestions ?? [];
-                if (sugg.length)
-                    parts.push(`合并建议 ${sugg.length} 条`);
-                if (d.error)
-                    parts.push(`错误：${d.error}`);
-                if (!fixed.length && !pend.length && !sugg.length && !d.error)
-                    parts.push("无需巩固");
-                lastConsolidateReport.value = ["## 记忆巩固报告", "", "空闲期巩固完成：" + parts.join("；") + "。"].join("\n");
+            startupState.running = true;
+            const controller = new AbortController();
+            activeStartupController = controller;
+            const task = runStartup(sctx, {
+                getDatabaseId: () => tools.databaseId(),
+                consolidate: (sinceMs, untilMs) => tools.consolidateWindow(sinceMs, untilMs, controller.signal),
+                report: (text) => { lastConsolidateReport.value = text; },
+                log: {
+                    info: (msg) => ctx.logger.info(msg),
+                    warn: (msg, err) => ctx.logger.warn(msg, err),
+                },
+                signal: controller.signal,
             })
-                .catch((e) => ctx.logger.warn("[dsh-iwiw-memory] consolidate failed", e))
+                .then((outcome) => {
+                startupState.finished = outcome.status !== "failed";
+                ctx.logger.info(`[dsh-iwiw-memory] startup reconcile: ${outcome.status}`);
+            })
+                .catch((error) => ctx.logger.warn("[dsh-iwiw-memory] startup reconcile crashed", error))
                 .finally(() => {
-                consolidateRunning = false;
-                // 重置活动时间戳：下一轮巩固需重新积累完整空闲期
-                lastActivityAt.value = Date.now();
+                startupState.running = false;
+                startupTasks.delete(task);
+                if (activeStartupController === controller)
+                    activeStartupController = null;
             });
-        }, 10 * 60_000)
-        : null;
-    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + consolidation scheduler");
+            startupTasks.add(task);
+            return async () => {
+                controller.abort();
+                await task;
+            };
+        });
+    }
+    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + startup reconcile");
     return async () => {
-        if (consolidateTimer)
-            clearInterval(consolidateTimer);
+        disposing = true;
+        activeStartupController?.abort();
         for (const d of disposers) {
             try {
                 d();
             }
             catch { }
         }
+        const tasks = [...startupTasks];
+        if (refreshInFlight)
+            tasks.push(refreshInFlight);
+        await Promise.allSettled(tasks);
         await backend.close();
         ctx.logger.info("[dsh-iwiw-memory] disposed");
     };

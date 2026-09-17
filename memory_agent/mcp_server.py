@@ -222,10 +222,14 @@ async def list_tools() -> list[Tool]:
         ),
         _tool(
             "run_consolidate",
-            "空闲巩固（consolidate）：审查窗口内创建/更新的记忆；retype/update_desc 低风险修正自动执行（版本+审计留痕），archive 生成待审批动作，merge 仅输出建议。",
+            "巩固（consolidate）：审查窗口内创建/更新的记忆；retype/update_desc 低风险修正自动执行（版本+审计留痕），archive 生成待审批动作，merge 仅输出建议。"
+            "窗口模式（since_ms/until_ms）下 limit 是每批大小、窗口内候选完整分批；"
+            "旧模式（since_hours）下 limit 是候选上限。返回 complete 标明整个窗口是否处理成功。",
             {
-                "since_hours": {"type": "number", "description": "审查窗口（小时），默认 24"},
-                "limit": {"type": "integer", "description": "候选上限，默认 20"},
+                "since_hours": {"type": "number", "description": "审查窗口（小时），默认 24（旧模式）"},
+                "limit": {"type": "integer", "description": "旧模式=候选上限；窗口模式=每批大小，默认 20"},
+                "since_ms": {"type": "integer", "description": "窗口下界（epoch 毫秒，含）"},
+                "until_ms": {"type": "integer", "description": "窗口上界（epoch 毫秒，含）"},
             },
         ),
     ]
@@ -272,6 +276,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "slug": r["slug"], "description": r.get("description", ""),
                 "priority": r.get("priority", "active"), "mem_type": r.get("mem_type", "profile"),
                 "score": r.get("score", 0), "content": r.get("content", "")[:300],
+                "recorded_date": r.get("recorded_date") or "",
             }
             for r in results
         ])
@@ -291,10 +296,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         ])
 
     if name == "read_memory":
-        content = read_memory(arguments.get("slug", ""))
-        if content is None:
-            return ok({"error": f"memory '{arguments.get('slug')}' not found"})
-        return ok({"slug": arguments.get("slug"), "content": content})
+        slug = str(arguments.get("slug") or "")
+        mem = get_memory(slug)
+        if mem is None:
+            return ok({"error": f"memory '{slug}' not found"})
+        return ok({"slug": slug, "content": mem.get("content", "")})
 
     if name == "memory_stats":
         return ok(get_stats())
@@ -348,9 +354,53 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "run_consolidate":
         from .maintenance import run_consolidate
+
+        # 参数校验在信任边界上：非有限时间值/超范围数值会让窗口计算出无意义的 SQL 边界。
+        def _opt_int(key: str) -> int | None:
+            raw = arguments.get(key)
+            if raw is None or raw == "":
+                return None
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} must be an integer")
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative")
+            return value
+
+        try:
+            since_ms = _opt_int("since_ms")
+            until_ms = _opt_int("until_ms")
+            limit = _opt_int("limit") or 20
+            limit = max(1, min(limit, 200))
+            since_hours = float(arguments.get("since_hours", 24.0))
+            if not (since_hours == since_hours and abs(since_hours) != float("inf")):
+                raise ValueError("since_hours must be a finite number")
+            since_hours = max(0.0, min(since_hours, 24.0 * 3650))
+        except ValueError as exc:
+            return ok({"complete": False, "errors": [str(exc)], "error": str(exc),
+                       "reviewed": 0, "auto_fixed": [], "pending": [], "suggestions": []})
+
+        # 进度通知：从 request context 取 token；无 token 的 CLI 调用直接忽略。
+        on_progress = None
+        try:
+            request_context = server.request_context
+            meta = getattr(request_context, "meta", None)
+            token = getattr(meta, "progressToken", None)
+            if token is not None:
+                async def on_progress(done: int, total: int) -> None:  # type: ignore[misc]
+                    await request_context.session.send_progress_notification(
+                        progress_token=token, progress=done, total=total,
+                    )
+        except (LookupError, AttributeError):
+            on_progress = None
+
         return ok(await run_consolidate(
-            since_hours=float(arguments.get("since_hours", 24.0)),
-            limit=int(arguments.get("limit", 20)),
+            since_hours=since_hours,
+            limit=limit,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            on_progress=on_progress,
         ))
 
     return ok({"error": f"unknown tool: {name}"})

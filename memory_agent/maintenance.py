@@ -121,96 +121,202 @@ CONSOLIDATE_SYSTEM_PROMPT = """你是记忆巩固器（consolidate）。审查�
 没有需要整理的返回 []。"""
 
 
-async def run_consolidate(since_hours: float = 24.0, limit: int = 20, timeout: float = 40.0) -> dict[str, Any]:
+def _window_bounds(
+    since_hours: float,
+    since_ms: int | None,
+    until_ms: int | None,
+) -> tuple[str, str | None]:
+    """把窗口参数归一成 DB 的本地时间 ISO 字符串（秒精度）。
+
+    毫秒入参：下界向下取整（含边界，容忍同秒重复，靠幂等消除），
+    上界取所在秒（覆盖整秒）。不假装拥有毫秒精度——DB 存的就是本地秒。
+    """
+    if until_ms is not None:
+        until_dt = datetime.fromtimestamp(until_ms / 1000.0)
+    else:
+        until_dt = datetime.now()
+    if since_ms is not None:
+        since_dt = datetime.fromtimestamp(since_ms / 1000.0)
+    else:
+        from datetime import timedelta
+        since_dt = until_dt - timedelta(hours=since_hours)
+    return (
+        since_dt.isoformat(timespec="seconds"),
+        until_dt.isoformat(timespec="seconds"),
+    )
+
+
+async def run_consolidate(
+    since_hours: float = 24.0,
+    limit: int = 20,
+    timeout: float = 40.0,
+    *,
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+    on_progress: Any = None,
+) -> dict[str, Any]:
     """consolidate 巩固：审查窗口内创建/更新的记忆。
 
     低风险修正（retype/update_desc）走 mutation 自动执行（version+audit 可回溯，
-    呼应"白箱可审计、事后回溯优于事前确认"）；archive 生成 pending 待审批；
+    呼应"白箱审计、事后回溯优于事前确认"）；archive 生成 pending 待审批；
     merge 仅输出建议（pending merge 无执行语义，不落单）。
+
+    窗口模式（给了 since_ms/until_ms）与旧 since_hours 模式的区别：
+    旧模式把 limit 当"候选上限"，超出直接丢；窗口模式把 limit 当"每批大小"，
+    窗口内候选先完整取快照再分批，不静默丢候选。
+    on_progress(done, total)：仅后台 MCP 调用传入，不属 MCP JSON 参数。
+    返回 complete：任何一批 LLM/JSON/mutation/pending 失败即 False；
+    合法空数组与零候选是成功。
     """
-    from datetime import timedelta
+    from .db import (
+        create_pending_action,
+        get_recent_changed,
+        replace_memory_result,
+        snapshot_of,
+    )
 
-    from .db import get_recent_changed, create_pending_action, replace_memory_result
+    windowed = since_ms is not None or until_ms is not None
+    since_iso, until_iso = _window_bounds(since_hours, since_ms, until_ms)
 
-    since = (datetime.now() - timedelta(hours=since_hours)).isoformat(timespec="seconds")
-    candidates = get_recent_changed(since, limit=limit)
     result: dict[str, Any] = {
-        "reviewed": len(candidates), "auto_fixed": [], "pending": [],
-        "suggestions": [], "error": None,
+        "reviewed": 0, "auto_fixed": [], "pending": [],
+        "suggestions": [], "error": None, "errors": [], "complete": True,
+        "batches": 0,
     }
+
+    def fail(msg: str) -> None:
+        result["complete"] = False
+        result["errors"].append(msg)
+        if result["error"] is None:
+            result["error"] = msg
+
+    # 候选快照：窗口模式不限条数（避免默认参数静默丢候选），旧模式保留候选上限语义。
+    candidates = get_recent_changed(
+        since_iso,
+        limit=None if windowed else limit,
+        until_iso=until_iso if windowed else None,
+    )
+    result["reviewed"] = len(candidates)
     if not candidates:
         return result
 
-    catalog = "\n".join(
-        "- {} ({}) -- {}\n  正文: {}".format(
-            m["slug"], m.get("mem_type", "fact"), m.get("description", ""),
-            (m.get("content") or "")[:160],
-        )
-        for m in candidates
-    )
-    try:
-        text = await complete_text(
-            system_prompt=CONSOLIDATE_SYSTEM_PROMPT,
-            user_prompt=f"## 本批候选\n{catalog}\n\n返回JSON列表。",
-            max_tokens=1200,
-            temperature=0.1,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.warning("consolidate failed: %s", exc)
-        result["error"] = str(exc)
-        return result
-
-    match = re.search(r"\[[\s\S]*?\]", text)
-    if not match:
-        result["error"] = "unparseable LLM output"
-        return result
-    try:
-        actions = json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        result["error"] = f"bad JSON: {exc}"
-        return result
-
+    batch_size = max(1, limit)
     by_slug = {m["slug"]: m for m in candidates}
+    snapshots = {m["slug"]: snapshot_of(m) for m in candidates}
     movable = {"fact", "lesson", "project"}
-    for act in actions or []:
-        if not isinstance(act, dict):
-            continue
-        slug = str(act.get("slug") or "").strip()
-        if slug not in by_slug:
-            continue
-        mem = by_slug[slug]
-        action = str(act.get("action") or "keep").strip().lower()
-        reason = str(act.get("reason") or "consolidate")[:200]
+    total_batches = (len(candidates) + batch_size - 1) // batch_size
 
-        if action == "retype":
-            new_type = str(act.get("mem_type") or "").strip()
-            if new_type in movable and mem.get("mem_type") in movable and new_type != mem.get("mem_type"):
-                r = replace_memory_result(
-                    slug=slug, description=mem.get("description", ""), body=mem.get("content", ""),
-                    mem_type=new_type, priority=mem.get("priority", "active"),
-                    reason=f"consolidate retype: {reason}", audit_action="consolidate_retype",
-                )
-                if r.ok:
-                    result["auto_fixed"].append({"slug": slug, "action": "retype", "mem_type": new_type, "reason": reason})
-        elif action == "update_desc":
-            desc = str(act.get("description") or "").strip()
-            if desc and desc != mem.get("description", ""):
-                r = replace_memory_result(
-                    slug=slug, description=desc, body=mem.get("content", ""),
-                    mem_type=mem.get("mem_type", "fact"), priority=mem.get("priority", "active"),
-                    reason=f"consolidate update_desc: {reason}", audit_action="consolidate_desc",
-                )
-                if r.ok:
-                    result["auto_fixed"].append({"slug": slug, "action": "update_desc", "reason": reason})
-        elif action == "archive":
-            if mem.get("mem_type") in ("profile", "rules"):
+    for batch_no in range(total_batches):
+        batch = candidates[batch_no * batch_size : (batch_no + 1) * batch_size]
+        result["batches"] = batch_no + 1
+        if on_progress is not None:
+            try:
+                await on_progress(batch_no, total_batches)
+            except Exception:
+                pass  # 进度上报失败不影响业务
+
+        catalog = "\n".join(
+            "- {} ({}) -- {}\n  正文: {}".format(
+                m["slug"], m.get("mem_type", "fact"), m.get("description", ""),
+                (m.get("content") or "")[:160],
+            )
+            for m in batch
+        )
+        try:
+            text = await complete_text(
+                system_prompt=CONSOLIDATE_SYSTEM_PROMPT,
+                user_prompt=f"## 本批候选\n{catalog}\n\n返回JSON列表。",
+                max_tokens=1200,
+                temperature=0.1,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.warning("consolidate batch %s failed: %s", batch_no, exc)
+            fail(f"batch {batch_no}: llm failed: {exc}")
+            return result
+
+        match = re.search(r"\[[\s\S]*?\]", text)
+        if not match:
+            fail(f"batch {batch_no}: unparseable LLM output")
+            return result
+        try:
+            actions = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            fail(f"batch {batch_no}: bad JSON: {exc}")
+            return result
+
+        # 同 slug 多动作先合成一次修改：旧版按动作顺序各写一次，
+        # "先 retype 后 update_desc" 会让后一次用旧 mem_type 把类型改回去。
+        for act in actions or []:
+            if not isinstance(act, dict):
                 continue
-            item = create_pending_action(action="archive", target_memory_slug=slug, reason=f"consolidate: {reason}")
-            if item:
-                result["pending"].append({"id": item["id"], "slug": slug, "action": "archive", "reason": item["reason"]})
-        elif action == "merge":
-            target_slug = str(act.get("target_slug") or "").strip()
-            if target_slug and target_slug != slug and target_slug in by_slug:
-                result["suggestions"].append({"slug": slug, "target_slug": target_slug, "reason": reason})
+            slug = str(act.get("slug") or "").strip()
+            if slug not in by_slug:
+                continue
+            mem = by_slug[slug]
+            action = str(act.get("action") or "keep").strip().lower()
+            reason = str(act.get("reason") or "consolidate")[:200]
+
+            if action == "keep":
+                continue
+            if action == "retype":
+                new_type = str(act.get("mem_type") or "").strip()
+                if not (new_type in movable and mem.get("mem_type") in movable and new_type != mem.get("mem_type")):
+                    continue
+                mem["mem_type"] = new_type
+                mem.setdefault("_pending_auto", []).append(("retype", new_type, reason))
+            elif action == "update_desc":
+                desc = str(act.get("description") or "").strip()
+                if not desc or desc == mem.get("description", ""):
+                    continue
+                mem["description"] = desc
+                mem.setdefault("_pending_auto", []).append(("update_desc", desc, reason))
+            elif action == "archive":
+                if mem.get("mem_type") in ("profile", "rules"):
+                    continue
+                item = create_pending_action(action="archive", target_memory_slug=slug, reason=f"consolidate: {reason}")
+                if item:
+                    result["pending"].append({"id": item["id"], "slug": slug, "action": "archive", "reason": item["reason"]})
+                else:
+                    fail(f"batch {batch_no}: pending write failed for {slug}")
+            elif action == "merge":
+                target_slug = str(act.get("target_slug") or "").strip()
+                if target_slug and target_slug != slug and target_slug in by_slug:
+                    result["suggestions"].append({"slug": slug, "target_slug": target_slug, "reason": reason})
+
+    # 合成后的自动修正：每个 slug 只写一次，带上最终的类型与描述
+    for mem in candidates:
+        pending_auto = mem.get("_pending_auto")
+        if not pending_auto:
+            continue
+        slug = mem["slug"]
+        kinds = [a[0] for a in pending_auto]
+        reason_txt = "; ".join(f"{k}: {r}" for k, _v, r in pending_auto)
+        audit_action = "consolidate_retype" if "retype" in kinds else "consolidate_desc"
+        r = replace_memory_result(
+            slug=slug,
+            description=mem.get("description", ""),
+            body=mem.get("content", ""),
+            mem_type=mem.get("mem_type", "fact"),
+            priority=mem.get("priority", "active"),
+            reason=f"consolidate {reason_txt}",
+            audit_action=audit_action,
+            expected_snapshot=snapshots[slug],
+        )
+        if r.ok:
+            for kind, value, reason in pending_auto:
+                entry = {
+                    "slug": slug,
+                    "action": kind,
+                    "reason": reason,
+                    "version_id": r.version_id,
+                    "audit_id": r.audit_id,
+                    "changed_rows": r.changed_rows,
+                }
+                if kind == "retype":
+                    entry["mem_type"] = value
+                result["auto_fixed"].append(entry)
+        else:
+            fail(f"mutation failed for {slug}: {r.error}")
+
     return result

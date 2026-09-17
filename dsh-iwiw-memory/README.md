@@ -8,12 +8,14 @@ IwIw 记忆插件：iwiw-memory 记忆内核的 DSH 接入端。让 DSH agent �
 - **常驻注入**：core 层画像 + rules 准则段每轮注入 system prompt，写入后自动刷新
 - **命中注入**：每条用户消息触发检索，命中记忆以快照消息插入上下文（会话内去重、压缩后自动补回）
 - **reflect steering**：连续多步未写入记忆时注入一次性回顾提示
-- **记忆巩固**：空闲期自动调内核巩固记忆（峰时抑制），结果下次对话一次性告知
-- **设置页**：行为参数在 DSH 设置页可调，大部分热生效
+- **启动补账**：每次插件启动后台跑一次巩固——检查上次水位之后新完成的对话，整理已有记忆；结果下次对话一次性告知。与聊天活跃度无关，没有峰时抑制
+- **设置页**：行为参数在 DSH 设置页可调，大部分热生效（启动补账下次启动生效）
 
 ## 前置要求
 
-1. DSH 桌面版（desktop profile）——插件走 desktop bundle 契约加载
+1. DSH（任意 profile）——插件走 profile bundle 契约加载。本机实际挂载在 `web` profile
+   （`~/.dsh/profiles/web`）；`scripts/boot-sim.mjs` 会自动发现挂载了本插件的 profile，
+   不写死名称或安装路径
 2. Python 3.10+ 与本仓库（记忆内核 `memory_agent/` 就在本仓库根目录）：
 
    ```powershell
@@ -23,7 +25,7 @@ IwIw 记忆插件：iwiw-memory 记忆内核的 DSH 接入端。让 DSH agent �
    .venv\Scripts\pip install -r requirements.txt
    ```
 
-## 安装（desktop profile）
+## 安装（profile）
 
 插件包位于本仓库 `dsh-iwiw-memory/` 子目录，`lib/` 为预构建产物，无需本地编译。
 
@@ -43,7 +45,7 @@ New-Item -ItemType Junction -Path "<profile>\node_modules\@iwiw\dsh-iwiw-memory"
     cwd: '<仓库根>'
 ```
 
-> desktop bundle 契约（缺一即启动崩溃）：包内 `package.json` 声明 `dsh.bundle.patch` 指向 `cordis.patch.yml`；包内 patch 用 `- insert:` 行装载插件（name 必须是 npm 包名 `@iwiw/dsh-iwiw-memory`）；profile patch 的 id 与 insert 行 id 一致。写入 profile 配置文件须无 BOM（UTF-8 无 BOM，否则 DSH 解析失败）。
+> profile bundle 契约（缺一即启动崩溃）：包内 `package.json` 声明 `dsh.bundle.patch` 指向 `cordis.patch.yml`；包内 patch 用 `- insert:` 行装载插件（name 必须是 npm 包名 `@iwiw/dsh-iwiw-memory`）；profile patch 的 id 与 insert 行 id 一致。写入 profile 配置文件须无 BOM（UTF-8 无 BOM，否则 DSH 解析失败）。
 
 重启 DSH 生效。启动日志出现 `applied: 4 tools + 2 prompt sections + pre-step hook + consolidation scheduler` 即挂载成功。
 
@@ -64,8 +66,25 @@ New-Item -ItemType Junction -Path "<profile>\node_modules\@iwiw\dsh-iwiw-memory"
 | `hitTopK` | 3 | 每条消息命中注入条数上限 |
 | `coreMaxChars` | 2500 | 常驻记忆段字符预算 |
 | `reflectTurns` | 7 | 回顾提示触发步数，0=关闭 |
-| `consolidateIdleMinutes` | 180 | 空闲巩固阈值（分钟），0=关闭 |
+| `startupConsolidate` | true | 启动时自动补账（替代旧的空闲轮询），下次启动生效 |
 | `standingLayers` | profile,rules | 常驻记忆类型，逗号分隔 |
+
+```
+consolidateIdleMinutes（已弃用）
+```
+
+旧字段只做兼容读取：显式设为 0 会映射为 `startupConsolidate=false`，正数或缺省映射为
+启用（阈值本身不再生效，巩固改为每次启动一次）。不再在设置页展示。
+
+### 已知边界
+
+- 水位是两个独立边界：`lastRun`（已检查的会话事件）与 `lastConsolidatedAt`（已整理的记忆）。
+  失败、取消或无法确认读取完整性时不推进；下次启动按旧水位重试，因此后端写入必须可安全重放。
+- 增量判定依赖日志时间与本机时间可比。检测到时钟回拨时返回 `clock-regressed` 并**不降低水位**，
+  也不假装恢复完成；校时后需要显式重扫（本版不承诺仅凭时间自动无损恢复）。
+- 列目录、stat、读取水位这些元数据操作不可能为零；"第二次启动零成本"指的是无新增完成事件时
+  零 LLM 调用、零记忆 mutation、且未变化的 cold 会话零完整日志读取。
+- 长驻、永不重启的进程不会自动周期巩固；需要时手动调用 MCP 的 `run_consolidate`。
 
 ## 开发
 

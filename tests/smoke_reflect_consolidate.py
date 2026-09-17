@@ -11,7 +11,12 @@ tmp = Path(tempfile.mkdtemp()) / "smoke.db"
 memory_db.MEMORY_DB_PATH = tmp
 memory_db._connection = None
 
-from memory_agent.db import upsert_memory, get_memory, list_pending_actions
+from memory_agent.db import (
+    get_memory,
+    list_pending_actions,
+    replace_memory_result,
+    upsert_memory,
+)
 from memory_agent import maintenance
 from memory_agent.config import REFLECT_TURNS
 
@@ -53,6 +58,8 @@ assert r["reviewed"] == 4, f"reviewed={r['reviewed']}"
 assert {"slug": "d-fact", "action": "retype", "mem_type": "project"} == {
     k: r["auto_fixed"][0][k] for k in ("slug", "action", "mem_type")
 }, r["auto_fixed"]
+for item in r["auto_fixed"]:
+    assert item["version_id"] and item["audit_id"] and item["changed_rows"] == 1, item
 assert get_memory("d-fact")["mem_type"] == "project"
 # update_desc 自动执行
 assert any(a["slug"] == "d-desc" and a["action"] == "update_desc" for a in r["auto_fixed"])
@@ -73,4 +80,29 @@ assert get_memory("d-old")["priority"] == "archived"
 hist = list_pending_actions("executed")
 assert len(hist) == 1
 
-print("consolidate: retype/update_desc 留痕自愈 + profile 保护 + archive 走审批 + merge 仅建议 — ALL PASS")
+# LLM 审查期间用户更新同一条记忆：旧建议必须冲突失败，不能覆盖新更正。
+upsert_memory(slug="d-race", description="旧描述", content="并发保护正文", mem_type="fact")
+
+
+async def fake_race_complete_text(**kwargs):
+    changed = replace_memory_result(
+        slug="d-race",
+        description="用户刚刚更正的新描述",
+        body="并发保护正文",
+        mem_type="fact",
+        priority="active",
+        reason="concurrency smoke",
+    )
+    assert changed.ok, changed.error
+    return '''[
+      {"action": "update_desc", "slug": "d-race", "description": "LLM 基于旧快照的描述", "reason": "旧建议"}
+    ]'''
+
+
+maintenance.complete_text = fake_race_complete_text
+race = asyncio.run(maintenance.run_consolidate(since_hours=24))
+assert race["complete"] is False, race
+assert "conflict" in (race["error"] or ""), race
+assert get_memory("d-race")["description"] == "用户刚刚更正的新描述"
+
+print("consolidate: 自愈/审批/合并建议 + 并发更正保护 — ALL PASS")

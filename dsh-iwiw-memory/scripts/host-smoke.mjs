@@ -10,17 +10,19 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { apply, isPeakTime } from "../lib/index.js";
+import { apply } from "../lib/index.js";
 import { MemoryBackend } from "../lib/backend.js";
 
 // B 管道捕获：截获 pre-step 发往 MCP 的 search_memories 调用参数
 const searchCalls = [];
+let memoryStatsCalls = 0;
 const origCallTool = MemoryBackend.prototype.callTool;
-MemoryBackend.prototype.callTool = async function (name, args) {
+MemoryBackend.prototype.callTool = async function (name, args, options) {
   if (name === "search_memories" && args?.session_id !== undefined) {
     searchCalls.push({ args: JSON.parse(JSON.stringify(args)) });
   }
-  return origCallTool.call(this, name, args);
+  if (name === "memory_stats") memoryStatsCalls += 1;
+  return origCallTool.call(this, name, args, options);
 };
 
 // 隔离库：显式经 config.env 传给 MCP 子进程（MCP SDK 不继承完整父进程 env）
@@ -34,23 +36,31 @@ const registered = [];
 const sections = [];
 const handlers = {};
 // settings 服务 mock：与 dsh-settings 的 register 契约同形（schema 归一化 + get/watch）
-const makeSettingsService = () => ({
+const makeSettingsService = (userByNs = {}) => ({
   registered: {},
   register(ns, schema, options) {
     if (this.registered[ns]) throw new Error(`settings namespace "${ns}" is already registered`);
-    const resolved = schema(options?.base);
-    const entry = { ns, schema, resolved, watchers: new Set() };
+    const base = options?.base ?? {};
+    const user = userByNs[ns] ?? {};
+    const resolved = schema({ ...base, ...user });
+    const entry = { ns, schema, base, user, resolved, watchers: new Set() };
     this.registered[ns] = entry;
     return {
       get: () => entry.resolved,
       watch: (cb) => { entry.watchers.add(cb); return () => entry.watchers.delete(cb); },
     };
   },
+  describe() {
+    return Object.values(this.registered).map((entry) => ({
+      ns: entry.ns, value: entry.resolved, base: entry.base, user: entry.user,
+    }));
+  },
 });
-const makeCtx = (handlersMap = handlers) => {
-  const settingsService = makeSettingsService();
+const makeCtx = (handlersMap = handlers, userByNs = {}) => {
+  const settingsService = makeSettingsService(userByNs);
   return {
     settingsService,
+    settings: settingsService,
     logger: {
       info: (...a) => console.log("[info]", ...a),
       warn: (...a) => console.log("[warn]", ...a),
@@ -75,7 +85,7 @@ const settingsEntry = ctx.settingsService.registered["dsh-iwiw-memory"];
 const settingsOk = !!settingsEntry
   && settingsEntry.resolved.hitTopK === 3
   && settingsEntry.resolved.reflectTurns === 7
-  && settingsEntry.resolved.consolidateIdleMinutes === 180
+  && settingsEntry.resolved.startupConsolidate === true
   && settingsEntry.resolved.standingLayers === "profile,rules";
 console.log("settings 注册断言:", settingsOk ? "PASS" : "FAIL", JSON.stringify(settingsEntry?.resolved));
 
@@ -232,7 +242,7 @@ let reflectOk = false;
   ctx2.logger = { info: () => {}, warn: (...a) => console.log("[warn2]", ...a), error: (...a) => console.log("[error2]", ...a) };
   ctx2.tools = { register: (def) => { registered2.push(def); return () => {}; } };
   ctx2.systemPrompt = { section: () => () => {} };
-  const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, consolidateIdleMinutes: 0 });
+  const dispose2 = await apply(ctx2, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, reflectTurns: 2, startupConsolidate: false });
   const preStep2 = (handlers2["agent/pre-step"] ?? [])[0];
   const agent2 = { session: { header: { id: "reflect-sess", origin: "main" } } };
   const run2 = async (text) => {
@@ -250,14 +260,383 @@ let reflectOk = false;
   await dispose2();
 }
 
-console.log("\n=== 5.8 巩固峰时抑制（纯函数）===");
-const peakOk = isPeakTime(new Date(2026, 0, 1, 9, 0)) === true
-  && isPeakTime(new Date(2026, 0, 1, 8, 50)) === true
-  && isPeakTime(new Date(2026, 0, 1, 8, 40)) === false
-  && isPeakTime(new Date(2026, 0, 1, 13, 50)) === true
-  && isPeakTime(new Date(2026, 0, 1, 12, 30)) === false
-  && isPeakTime(new Date(2026, 0, 1, 18, 5)) === false;
-console.log("isPeakTime 断言:", peakOk ? "PASS" : "FAIL");
+console.log("\n=== 5.8 启动补账（真实 domain + 会话读取 stub）===");
+let startupOk = false;
+{
+  const { runStartup, StateSchema, INITIAL_STATE, scopeKeyOf, completedInWindow } = await import("../lib/startup.js");
+
+  // 纯函数：只有 turn/end + completed 且落在 (from, to] 才算完成轮次
+  const ev = (type, kind, time) => ({ type, data: kind ? { reason: { kind } } : {}, time });
+  const pureOk = completedInWindow(ev("turn/end", "completed", 200), 100, 300) === true
+    && completedInWindow(ev("turn/end", "aborted", 200), 100, 300) === false
+    && completedInWindow(ev("turn/end", "interrupted", 200), 100, 300) === false
+    && completedInWindow(ev("turn/end", "completed", 100), 100, 300) === false   // 左开
+    && completedInWindow(ev("turn/end", "completed", 300), 100, 300) === true    // 右闭
+    && completedInWindow(ev("step/end", null, 200), 100, 300) === false;
+  const startupChecks = [pureOk];
+  console.log("completedInWindow 边界断言:", pureOk ? "PASS" : "FAIL");
+
+  // 真实 storage-domain 风格的 mock：状态持久在闭包里，验证水位真的被推进
+  const makeDomain = () => {
+    let value = structuredClone(INITIAL_STATE);
+    const writes = [];
+    return {
+      writes,
+      get value() { return value; },
+      domain: {
+        global: {
+          get: () => value,
+          set: async (next) => { value = StateSchema.parse(next); writes.push(structuredClone(next)); },
+        },
+        close: async () => {},
+      },
+    };
+  };
+  const storageDomain = { open: async () => null };
+  const sessionQuery = { listSessions: async () => [], readSession: async () => ({ events: [], inheritedEventCount: 0 }) };
+  const sessionPersistence = { resolveCurrentLog: async () => undefined };
+
+  const logs = [];
+  const log = { info: (m) => logs.push(m), warn: (m) => logs.push("WARN " + m) };
+  const signal = new AbortController().signal;
+
+  // 场景 1：首次启动 → 只写基线水位，不列会话、不调 LLM
+  {
+    const store = makeDomain();
+    storageDomain.open = async () => store.domain;
+    let listed = 0;
+    const query = { listSessions: async () => { listed += 1; return []; }, readSession: async () => ({ events: [], inheritedEventCount: 0 }) };
+    let consolidateCalls = 0;
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => { consolidateCalls += 1; return { ok: true, reviewed: 0 }; },
+        report: () => {}, log, signal, now: () => 1000,
+      },
+    );
+    const firstOk = out.status === "first-run" && listed === 0 && consolidateCalls === 0
+      && store.value.lastRun === 1000 && store.value.lastConsolidatedAt === 1000;
+    startupChecks.push(firstOk);
+    console.log("场景1 首次启动（零会话/零LLM）:", firstOk ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 2：无新完成轮次 → 只推进 lastRun，lastConsolidatedAt 不动
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 1000, lastConsolidatedAt: 1000 });
+    storageDomain.open = async () => store.domain;
+    const query = {
+      listSessions: async () => [{ header: { id: "s1", origin: "main" }, live: false }],
+      readSession: async () => ({ events: [], inheritedEventCount: 0 }),
+    };
+    let consolidateCalls = 0;
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => { consolidateCalls += 1; return { ok: true }; },
+        report: () => {}, log, signal, now: () => 2000,
+      },
+    );
+    // resolveCurrentLog 返回 undefined → 不做 mtime 粗筛，仍由 readSession 完整读取。
+    const noopOk = out.status === "noop" && store.value.lastRun === 2000
+      && store.value.lastConsolidatedAt === 1000 && consolidateCalls === 0;
+    startupChecks.push(noopOk);
+    console.log("场景2 无完成轮次（仅推 lastRun）:", noopOk ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 3：live 会话有 completed → 触发一次窗口整理并推进两个水位
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 1000, lastConsolidatedAt: 1000 });
+    storageDomain.open = async () => store.domain;
+    const query = {
+      listSessions: async () => [{ header: { id: "s2", origin: "main" }, live: true }],
+      readSession: async () => ({
+        inheritedEventCount: 0,
+        events: [
+          { type: "turn/start", time: 1500, data: {} },
+          { type: "turn/end", time: 1600, data: { reason: { kind: "completed" } } },
+          { type: "turn/end", time: 1700, data: { reason: { kind: "aborted" } } }, // 不算
+        ],
+      }),
+    };
+    const windows = [];
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async (since, until) => { windows.push([since, until]); return { ok: true, reviewed: 3 }; },
+        report: (t) => logs.push(t), log, signal, now: () => 2000,
+      },
+    );
+    const ok3 = out.status === "consolidated" && out.completedTurns === 1
+      && windows.length === 1 && windows[0][0] === 1000 && windows[0][1] === 2000
+      && store.value.lastRun === 2000 && store.value.lastConsolidatedAt === 2000
+      && out.reviewed === 3;
+    startupChecks.push(ok3);
+    console.log("场景3 有完成轮次（固定窗口+双水位）:", ok3 ? "PASS" : "FAIL", JSON.stringify(out), JSON.stringify(windows));
+  }
+
+  // 场景 4：整理失败 → 不推进水位（下次按旧水位重试）
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 1000, lastConsolidatedAt: 1000 });
+    storageDomain.open = async () => store.domain;
+    const query = {
+      listSessions: async () => [{ header: { id: "s3", origin: "main" }, live: true }],
+      readSession: async () => ({
+        inheritedEventCount: 0,
+        events: [{ type: "turn/end", time: 1600, data: { reason: { kind: "completed" } } }],
+      }),
+    };
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => ({ ok: false, error: "llm exploded" }),
+        report: () => {}, log, signal, now: () => 2000,
+      },
+    );
+    const ok4 = out.status === "failed" && store.value.lastRun === 1000 && store.value.lastConsolidatedAt === 1000;
+    startupChecks.push(ok4);
+    console.log("场景4 整理失败不推水位:", ok4 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 5：时钟回拨 → clock-regressed，不降水位
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 5000, lastConsolidatedAt: 5000 });
+    storageDomain.open = async () => store.domain;
+    let consolidateCalls = 0;
+    const out = await runStartup(
+      { storageDomain, sessionQuery, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => { consolidateCalls += 1; return { ok: true }; },
+        report: () => {}, log, signal, now: () => 1000,
+      },
+    );
+    const ok5 = out.status === "clock-regressed" && store.value.lastRun === 5000 && consolidateCalls === 0;
+    startupChecks.push(ok5);
+    console.log("场景5 时钟回拨不降水位:", ok5 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 6：服务缺失 → disabled，不写假水位
+  {
+    const out = await runStartup(
+      { sessionQuery: null, sessionPersistence: null, storageDomain: null },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => ({ ok: true }),
+        report: () => {}, log, signal, now: () => 1000,
+      },
+    );
+    const ok6 = out.status === "disabled" && !!out.error;
+    startupChecks.push(ok6);
+    console.log("场景6 服务缺失降级:", ok6 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 7：后端没有 database_id → 停用（不冒险用错误锁 key）
+  {
+    const out = await runStartup(
+      { storageDomain, sessionQuery, sessionPersistence },
+      {
+        getDatabaseId: async () => null,
+        consolidate: async () => ({ ok: true }),
+        report: () => {}, log, signal, now: () => 1000,
+      },
+    );
+    const ok7 = out.status === "disabled" && out.error === "no database_id";
+    startupChecks.push(ok7);
+    console.log("场景7 无 database_id 停用:", ok7 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 8：跨进程占位锁真实互斥
+  {
+    const { acquireStartupLock, releaseStartupLock } = await import("../lib/startup.js");
+    const key = scopeKeyOf("lock-probe-" + Date.now());
+    const a = await acquireStartupLock(key);
+    const b = await acquireStartupLock(key);
+    await releaseStartupLock(a);
+    const c = await acquireStartupLock(key);
+    await releaseStartupLock(c);
+    const ok8 = a !== null && b === null && c !== null;
+    startupChecks.push(ok8);
+    console.log("场景8 占位锁互斥:", ok8 ? "PASS" : "FAIL", JSON.stringify({ a: !!a, b: !!b, c: !!c }));
+  }
+
+  // 场景 9：任一候选会话读取失败 → 整次失败，双水位保持原值
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 1000, lastConsolidatedAt: 1000 });
+    storageDomain.open = async () => store.domain;
+    const query = {
+      listSessions: async () => [{ header: { id: "broken", origin: "main" }, live: false }],
+      readSession: async () => { throw new Error("read failed"); },
+    };
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => ({ ok: true }),
+        report: () => {}, log, signal, now: () => 2000,
+      },
+    );
+    const ok9 = out.status === "failed"
+      && store.value.lastRun === 1000
+      && store.value.lastConsolidatedAt === 1000;
+    startupChecks.push(ok9);
+    console.log("场景9 会话读取失败不推水位:", ok9 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 10：真实 apply 关闭启动补账 → 不打开 storage domain
+  {
+    let opened = 0;
+    let childDispose;
+    const statsBefore = memoryStatsCalls;
+    const ctxDisabled = makeCtx({}, {
+      "dsh-iwiw-memory": { startupConsolidate: false },
+    });
+    ctxDisabled.tools = { register: () => () => {} };
+    ctxDisabled.systemPrompt = { section: () => () => {} };
+    ctxDisabled.inject = (services, cb) => {
+      if (services.includes("storageDomain")) {
+        childDispose = cb({
+          storageDomain: { open: async () => { opened += 1; throw new Error("must not open"); } },
+          sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [], inheritedEventCount: 0 }) },
+          sessionPersistence: { resolveCurrentLog: async () => undefined },
+        });
+      }
+      return () => {};
+    };
+    const disposeDisabled = await apply(ctxDisabled, {
+      python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, consolidateIdleMinutes: 180,
+    });
+    await disposeDisabled();
+    const ok10 = opened === 0 && memoryStatsCalls === statsBefore && childDispose === undefined;
+    startupChecks.push(ok10);
+    console.log("场景10 新关闭设置优先于旧正数:", ok10 ? "PASS" : "FAIL", JSON.stringify({ opened, statsCalls: memoryStatsCalls - statsBefore }));
+  }
+
+  // 场景 11：旧 user 配置 0 仍映射为关闭
+  {
+    let opened = 0;
+    const statsBefore = memoryStatsCalls;
+    const ctxLegacyDisabled = makeCtx({}, {
+      "dsh-iwiw-memory": { consolidateIdleMinutes: 0 },
+    });
+    ctxLegacyDisabled.tools = { register: () => () => {} };
+    ctxLegacyDisabled.systemPrompt = { section: () => () => {} };
+    ctxLegacyDisabled.inject = (services, cb) => {
+      if (services.includes("storageDomain")) {
+        cb({
+          storageDomain: { open: async () => { opened += 1; throw new Error("must not open"); } },
+          sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [], inheritedEventCount: 0 }) },
+          sessionPersistence: { resolveCurrentLog: async () => undefined },
+        });
+      }
+      return () => {};
+    };
+    const disposeLegacyDisabled = await apply(ctxLegacyDisabled, {
+      python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath },
+    });
+    await disposeLegacyDisabled();
+    const ok11 = opened === 0 && memoryStatsCalls === statsBefore;
+    startupChecks.push(ok11);
+    console.log("场景11 旧关闭设置仍生效:", ok11 ? "PASS" : "FAIL", JSON.stringify({ opened, statsCalls: memoryStatsCalls - statsBefore }));
+  }
+
+  // 场景 12：首次启动已取消 → 不打开 domain、不写基线
+  {
+    let opened = 0;
+    const controller = new AbortController();
+    controller.abort();
+    const out = await runStartup(
+      {
+        storageDomain: { open: async () => { opened += 1; return makeDomain().domain; } },
+        sessionQuery,
+        sessionPersistence,
+      },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => ({ ok: true }),
+        report: () => {}, log, signal: controller.signal, now: () => 1000,
+      },
+    );
+    const ok12 = out.status === "failed" && opened === 0;
+    startupChecks.push(ok12);
+    console.log("场景12 预取消不写基线:", ok12 ? "PASS" : "FAIL", JSON.stringify({ out, opened }));
+  }
+
+  // 场景 13：最后一次读取后取消 → noop 也不得推进水位
+  {
+    const store = makeDomain();
+    await store.domain.global.set({ lastRun: 1000, lastConsolidatedAt: 1000 });
+    storageDomain.open = async () => store.domain;
+    const controller = new AbortController();
+    const query = {
+      listSessions: async () => [{ header: { id: "cancel-after-read", origin: "main" }, live: true }],
+      readSession: async () => {
+        setImmediate(() => controller.abort());
+        return { events: [], inheritedEventCount: 0 };
+      },
+    };
+    const out = await runStartup(
+      { storageDomain, sessionQuery: query, sessionPersistence },
+      {
+        getDatabaseId: async () => "db-abc",
+        consolidate: async () => ({ ok: true }),
+        report: () => {}, log, signal: controller.signal, now: () => 2000,
+      },
+    );
+    const ok13 = out.status === "failed"
+      && store.value.lastRun === 1000
+      && store.value.lastConsolidatedAt === 1000;
+    startupChecks.push(ok13);
+    console.log("场景13 读取后取消不推水位:", ok13 ? "PASS" : "FAIL", JSON.stringify(out));
+  }
+
+  // 场景 14：显式新开启优先于旧 0，且可选服务绑定返回可等待 disposer
+  {
+    let opened = 0;
+    let childDispose;
+    const statsBefore = memoryStatsCalls;
+    const ctxEnabled = makeCtx({}, {
+      "dsh-iwiw-memory": { startupConsolidate: true },
+    });
+    ctxEnabled.tools = { register: () => () => {} };
+    ctxEnabled.systemPrompt = { section: () => () => {} };
+    ctxEnabled.inject = (services, cb) => {
+      if (services.includes("storageDomain")) {
+        const store = makeDomain();
+        childDispose = cb({
+          storageDomain: { open: async () => { opened += 1; return store.domain; } },
+          sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [], inheritedEventCount: 0 }) },
+          sessionPersistence: { resolveCurrentLog: async () => undefined },
+        });
+      }
+      return () => {};
+    };
+    const disposeEnabled = await apply(ctxEnabled, {
+      python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath }, consolidateIdleMinutes: 0,
+    });
+    for (let i = 0; i < 50 && opened === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (typeof childDispose === "function") await childDispose();
+    await disposeEnabled();
+    const ok14 = opened === 1
+      && memoryStatsCalls === statsBefore + 1
+      && typeof childDispose === "function";
+    startupChecks.push(ok14);
+    console.log("场景14 新开启设置优先且绑定可取消:", ok14 ? "PASS" : "FAIL", JSON.stringify({ opened, statsCalls: memoryStatsCalls - statsBefore, disposer: typeof childDispose }));
+  }
+
+  startupOk = startupChecks.every(Boolean);
+}
+console.log("启动补账断言:", startupOk ? "PASS" : "FAIL");
 
 console.log("\n=== 6. client bundle 冒烟（minimal DOM stub）===");
 let clientOk = false;
@@ -317,6 +696,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && peakOk && clientOk;
+const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && startupOk && clientOk;
 console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
 process.exit(allOk ? 0 : 1);

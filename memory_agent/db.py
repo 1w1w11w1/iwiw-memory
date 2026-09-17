@@ -1,9 +1,10 @@
 """
 SQLite storage for long-term memory.
 
-The source of truth is selfecho_data/sessions.db. Markdown files under
-memory/ are legacy/export caches only; runtime writes must go through this
-module so versions, audit events, FTS, and vector chunks stay in sync.
+The single source of truth is data/memory.db（见 config.MEMORY_DB_PATH）.
+All mutations (create/replace/archive/delete/merge/rollback) must go through
+the *_result entries in this module so version snapshots, audit events, and
+the FTS index stay in sync.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import MEMORY_DB_PATH
+from .redaction import findings_to_json, sanitize
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Schema
@@ -286,6 +288,144 @@ def _valid_type(t: str) -> str:
     return t if t in {"profile", "fact", "lesson", "rules", "project"} else "fact"
 
 
+# expected_snapshot 需要比较的字段：正文/描述/类型/状态/identity。
+# 刻意不只比 updated_at（秒级精度，同秒内两次修改无法区分）或 content_hash
+# （只覆盖正文，改描述或改类型不会被发现）。
+_SNAPSHOT_FIELDS = ("id", "slug", "content", "description", "mem_type", "priority")
+
+
+def snapshot_of(mem: dict[str, Any] | None) -> dict[str, Any] | None:
+    """从记忆行提取可比较快照（backfill 提交端也用同一形状）。"""
+    if not mem:
+        return None
+    return {k: mem.get(k) for k in _SNAPSHOT_FIELDS}
+
+
+def _snapshot_conflict(current: dict[str, Any], expected: dict[str, Any]) -> str | None:
+    """返回第一个不匹配的字段名；全部匹配返回 None。"""
+    for field in _SNAPSHOT_FIELDS:
+        if field in expected and current.get(field) != expected.get(field):
+            return field
+    return None
+
+
+def upsert_memory_result(
+    *,
+    slug: str,
+    description: str,
+    content: str,
+    mem_type: str = "fact",
+    priority: str = "active",
+    event_date: str | None = None,
+    content_hash: str = "",
+    metadata: dict[str, Any] | None = None,
+    recorded_date: str | None = None,
+    expected_snapshot: dict[str, Any] | None = None,
+    require_absent: bool = False,
+    reason: str = "create extracted memory",
+    audit_action: str = "create",
+    details: dict[str, Any] | None = None,
+) -> MemoryMutationResult:
+    """统一写入入口（创建 / 全文替换），返回审计凭据。
+
+    与 upsert_memory 的差别：本入口返回 MemoryMutationResult（version/audit/changed_rows），
+    upsert_memory 返回记忆行（兼容旧调用，行为不变）。
+
+    require_absent：要求目标不存在，否则 conflict。用于冷启动回填的首次创建——
+    不能用 None 同时表示"不检查"和"必须不存在"。与 expected_snapshot 互斥。
+    新建无前版本，version_id 为 None，但必须有 audit_id 与 changed_rows。
+    """
+    if require_absent and expected_snapshot is not None:
+        return MemoryMutationResult(
+            False, audit_action, slug,
+            error="require_absent and expected_snapshot are mutually exclusive",
+        )
+
+    slug = slug.strip().lower().replace(" ", "-")[:50] or "memory"
+    description, description_findings = sanitize(description)
+    content, content_findings = sanitize(content)
+    redaction_findings = description_findings + content_findings
+    existing = get_memory(slug)
+
+    if existing:
+        if require_absent:
+            return MemoryMutationResult(
+                False, audit_action, slug, error="conflict: memory already exists",
+                details={"expected_absent": True},
+            )
+        result = replace_memory_result(
+            slug=slug,
+            description=description,
+            body=content,
+            mem_type=mem_type,
+            priority=priority,
+            event_date=event_date,
+            reason=reason,
+            audit_action="upsert_replace" if audit_action == "create" else audit_action,
+            sanitized_findings=redaction_findings,
+            details={"mem_type": mem_type, "priority": priority, **(details or {})},
+            expected_snapshot=expected_snapshot,
+        )
+        return result
+
+    if expected_snapshot is not None:
+        return MemoryMutationResult(
+            False, audit_action, slug, error="conflict: memory not found but a snapshot was required",
+        )
+
+    conn = connect()
+    now = _now()
+    priority = _valid_priority(priority)
+    mem_type = _valid_type(mem_type)
+    mem_id = str(uuid.uuid4())
+    new_hash = content_hash or _simple_hash(content)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO memories
+                (id, slug, description, content, mem_type, priority,
+                 event_date, recorded_date, content_hash,
+                 created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (mem_id, slug, description.strip()[:200], content, mem_type, priority,
+             event_date, recorded_date or now, new_hash,
+             now, now, json.dumps(metadata or {}, ensure_ascii=False)),
+        )
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, error="no rows changed")
+        audit_details = {
+            "changed_rows": changed_rows,
+            "mem_type": mem_type,
+            "priority": priority,
+            "redactions": findings_to_json(redaction_findings),
+            **(details or {}),
+        }
+        audit_id = _record_audit(
+            action=audit_action,
+            target_slug=slug,
+            reason=reason,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, error="audit write failed")
+        conn.commit()
+        return MemoryMutationResult(
+            True, audit_action, slug,
+            changed_rows=changed_rows,
+            version_id=None,  # 新建无前版本
+            audit_id=audit_id,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
+
+
 def upsert_memory(
     *,
     slug: str,
@@ -306,62 +446,25 @@ def upsert_memory(
       变更事件写入 memory_audit，并同步 FTS 索引。
 
     任何失败都会 raise（不允许静默成功）；调用方如需可恢复结果，
-    请使用 replace_memory_result / delete_memory_result 等 *result 入口。
+    请使用 upsert_memory_result / replace_memory_result 等 *result 入口。
+
+    本函数只是 upsert_memory_result 的兼容包装（返回记忆行而非审计凭据）：
+    创建与替换逻辑单源在 *result 入口，避免两条路径各自 sanitize / 写审计而漂移。
     """
-    slug = slug.strip().lower().replace(" ", "-")[:50] or "memory"
-    existing = get_memory(slug)
-
-    if existing:
-        result = replace_memory_result(
-            slug=slug,
-            description=description,
-            body=content,
-            mem_type=mem_type,
-            priority=priority,
-            event_date=event_date,
-            reason="upsert replace",
-            audit_action="upsert_replace",
-            details={"mem_type": mem_type, "priority": priority},
-        )
-        if not result.ok:
-            raise RuntimeError(f"memory update failed: {result.error}")
-        return dict(get_memory(slug))
-
-    conn = connect()
-    now = _now()
-    priority = _valid_priority(priority)
-    mem_type = _valid_type(mem_type)
-    mem_id = str(uuid.uuid4())
-    new_hash = content_hash or _simple_hash(content)
-
-    cur = conn.execute(
-        """
-        INSERT INTO memories
-            (id, slug, description, content, mem_type, priority,
-             event_date, recorded_date, content_hash,
-             created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (mem_id, slug, description.strip()[:200], content, mem_type, priority,
-         event_date, recorded_date or now, new_hash,
-         now, now, json.dumps(metadata or {}, ensure_ascii=False)),
+    result = upsert_memory_result(
+        slug=slug,
+        description=description,
+        content=content,
+        mem_type=mem_type,
+        priority=priority,
+        event_date=event_date,
+        content_hash=content_hash,
+        metadata=metadata,
+        recorded_date=recorded_date,
     )
-    audit_id = _record_audit(
-        action="create",
-        target_slug=slug,
-        reason="create extracted memory",
-        details={"changed_rows": cur.rowcount, "mem_type": mem_type, "priority": priority},
-        commit=False,
-    )
-    if not audit_id or cur.rowcount <= 0:
-        conn.rollback()
-        raise RuntimeError("memory create audit failed")
-    conn.commit()
-
-    created = conn.execute(
-        "SELECT * FROM memories WHERE id = ?", (mem_id,)
-    ).fetchone()
-    return dict(created)
+    if not result.ok:
+        raise RuntimeError(f"memory write failed: {result.error}")
+    return dict(get_memory(result.target_slug))
 
 
 def get_memory(slug: str) -> dict[str, Any] | None:
@@ -462,13 +565,31 @@ def create_pending_action(
     reason: str = "",
     source_memory_ids: list[str] | None = None,
 ) -> dict[str, Any] | None:
-    """写入一条待确认的淘汰/合并动作。"""
+    """写入一条待确认的淘汰/合并动作。
+
+    已存在相同 action + target 的 pending 时直接复用（实测旧版会每次失败重放
+    都堆一条新的，审批列表被重复项淹没）。
+    """
     import uuid
     conn = connect()
     now = _now()
     mem = None
     if target_memory_slug:
         mem = get_memory(target_memory_slug)
+    # 去重：同一目标的同种动作只保留一条待审批
+    if mem:
+        existing = conn.execute(
+            """SELECT id, action, reason, status FROM memory_pending_actions
+               WHERE status = 'pending' AND action = ? AND target_memory_id = ?
+               ORDER BY ts DESC LIMIT 1""",
+            (action, mem["id"]),
+        ).fetchone()
+        if existing:
+            return {
+                "id": existing["id"], "action": existing["action"],
+                "target_slug": target_memory_slug, "reason": existing["reason"],
+                "status": "pending", "deduplicated": True,
+            }
     pending_id = str(uuid.uuid4())
     conn.execute(
         """INSERT INTO memory_pending_actions
@@ -661,17 +782,30 @@ def get_maintenance_candidates(limit: int = 30) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_recent_changed(since_iso: str, limit: int = 20) -> list[dict[str, Any]]:
-    """获取窗口内创建/更新的 active 记忆（巩固审查范围）。"""
+def get_recent_changed(
+    since_iso: str,
+    limit: int | None = 20,
+    *,
+    until_iso: str | None = None,
+) -> list[dict[str, Any]]:
+    """获取窗口内创建/更新的 active 记忆（巩固审查范围）。
+
+    limit=None 表示不限条数（固定窗口分批取候选时用，避免静默丢候选）。
+    until_iso 为窗口上界（含），与服务端"接受最多一秒重复、用幂等消除"的约定一致。
+    """
     conn = connect()
-    rows = conn.execute(
-        """SELECT slug, description, mem_type, priority, access_count, last_access_at, updated_at, content
-            FROM memories
-            WHERE priority = 'active' AND updated_at >= ?
-            ORDER BY updated_at DESC
-            LIMIT ?""",
-        (since_iso, limit),
-    ).fetchall()
+    sql = """SELECT id, slug, description, mem_type, priority, access_count, last_access_at, updated_at, content
+             FROM memories
+             WHERE priority = 'active' AND updated_at >= ?"""
+    params: list[Any] = [since_iso]
+    if until_iso is not None:
+        sql += " AND updated_at <= ?"
+        params.append(until_iso)
+    sql += " ORDER BY updated_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -694,6 +828,23 @@ def touch_memories(slugs: list[str]) -> int:
     return cur.rowcount
 
 
+def database_id() -> str:
+    """目标 DB 规范路径的稳定标识（SHA-256 前 16 位）。
+
+    宿主（DSH 插件）用它做 storage domain 名称与跨进程占位锁 key。
+    只返回摘要，不暴露绝对路径。Windows 下先 normcase 消除大小写/分隔符差异，
+    否则同一文件的不同写法会算出两个 key，锁形同虚设。
+    """
+    import hashlib
+    import os
+
+    try:
+        canonical = os.path.normcase(str(MEMORY_DB_PATH.resolve()))
+    except OSError:
+        canonical = os.path.normcase(str(MEMORY_DB_PATH))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def get_stats() -> dict[str, Any]:
     """记忆库统计。"""
     conn = connect()
@@ -708,6 +859,7 @@ def get_stats() -> dict[str, Any]:
         "total_memories": total,
         "by_priority": by_priority,
         "by_type": by_type,
+        "database_id": database_id(),
     }
 
 
@@ -890,12 +1042,25 @@ def replace_memory_result(
     reason: str = "",
     audit_action: str = "manual_edit",
     details: dict[str, Any] | None = None,
+    sanitized_findings: list[Any] | None = None,
+    expected_snapshot: dict[str, Any] | None = None,
 ) -> MemoryMutationResult:
-    """覆盖写入记忆，并返回审计结果。"""
-    old = get_memory(slug)
-    if not old:
-        return MemoryMutationResult(False, audit_action, slug, error="memory not found")
+    """覆盖写入记忆，并返回审计结果。
 
+    sanitized_findings：调用方（如 upsert_memory）已 sanitize 过并传入脱敏后文本时，
+        透传其 findings，本函数不再重复 sanitize（重复计算会丢掉 description 命中）。
+        传 None 表示本函数自行 sanitize。
+    expected_snapshot：乐观并发前置条件。非 None 时必须与库中当前状态匹配，
+        否则返回 conflict，不用旧快照覆盖用户新更正。None 表示无版本条件（兼容旧调用）。
+    """
+    # 写入闸门（与 upsert_memory 同款）：更新路径也必须过，否则绕过入口即可落密钥。
+    if sanitized_findings is None:
+        description, description_findings = sanitize(description)
+        body, body_findings = sanitize(body)
+        redaction_findings = description_findings + body_findings
+    else:
+        redaction_findings = list(sanitized_findings)
+    details = {**(details or {}), "redactions": findings_to_json(redaction_findings)}
     conn = connect()
     now = _now()
     priority = _valid_priority(priority)
@@ -903,6 +1068,20 @@ def replace_memory_result(
     content_hash = _simple_hash(body)
 
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM memories WHERE slug = ?", (slug,)).fetchone()
+        if not row:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error="memory not found")
+        old = dict(row)
+        if expected_snapshot is not None:
+            conflict = _snapshot_conflict(old, expected_snapshot)
+            if conflict:
+                conn.rollback()
+                return MemoryMutationResult(
+                    False, audit_action, slug, error=f"conflict: {conflict}",
+                    details={"expected_snapshot_mismatch": conflict},
+                )
         backup_path = _save_version(old["id"], reason=reason or "edit", commit=False)
         if not backup_path:
             conn.rollback()
