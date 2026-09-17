@@ -34,6 +34,7 @@ const cwd = process.env.SMOKE_CWD ?? "E:/desktop/111";
 
 const registered = [];
 const sections = [];
+const commandDefs = [];
 const handlers = {};
 // settings 服务 mock：与 dsh-settings 的 register 契约同形（schema 归一化 + get/watch）
 const makeSettingsService = (userByNs = {}) => ({
@@ -68,6 +69,7 @@ const makeCtx = (handlersMap = handlers, userByNs = {}) => {
     },
     tools: { register: (def) => { registered.push(def); return () => {}; } },
     systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
+    commands: { register: (def) => { commandDefs.push(def); return () => {}; } },
     on: (event, handler) => { (handlersMap[event] ??= []).push(handler); return () => {}; },
     inject: (services, cb) => {
       if (services.includes("settings")) cb({ settings: settingsService });
@@ -76,6 +78,23 @@ const makeCtx = (handlersMap = handlers, userByNs = {}) => {
   };
 };
 const ctx = makeCtx();
+
+/** 模拟设置页写入 user 层并触发 watcher（mock 的 watch 只在 register 时收集回调）。 */
+const pushSettingsUser = (ctxObj, ns, patch) => {
+  const entry = ctxObj.settingsService.registered[ns];
+  if (!entry) throw new Error("settings ns not registered: " + ns);
+  entry.user = { ...entry.user, ...patch };
+  entry.resolved = entry.schema({ ...entry.base, ...entry.user });
+  for (const cb of entry.watchers) cb();
+};
+
+// 记录插件对内核子进程 env 的操作（验证「改设置 → 重设 env → 断连重连」真的发生）
+const envCalls = [];
+let closeCalls = 0;
+const origSetEnv = MemoryBackend.prototype.setEnv;
+MemoryBackend.prototype.setEnv = function (env) { envCalls.push({ ...env }); return origSetEnv.call(this, env); };
+const origClose = MemoryBackend.prototype.close;
+MemoryBackend.prototype.close = async function () { closeCalls += 1; return origClose.call(this); };
 
 console.log("=== 1. apply ===");
 const dispose = await apply(ctx, { python, cwd, env: { MEMORY_AGENT_DB_PATH: dbPath } });
@@ -86,7 +105,8 @@ const settingsOk = !!settingsEntry
   && settingsEntry.resolved.hitTopK === 3
   && settingsEntry.resolved.reflectTurns === 7
   && settingsEntry.resolved.startupConsolidate === true
-  && settingsEntry.resolved.standingLayers === "profile,rules";
+  && settingsEntry.resolved.standingLayers === "profile,rules"
+  && settingsEntry.resolved.llmModel === "";
 console.log("settings 注册断言:", settingsOk ? "PASS" : "FAIL", JSON.stringify(settingsEntry?.resolved));
 
 console.log("\n=== 2. 注册结果 ===");
@@ -136,10 +156,115 @@ const rulesText = rulesSection ? (typeof rulesSection.text === "function" ? rule
 const rulesOk = rulesText.includes("准则") && rulesText.includes("因子堆叠");
 console.log("rules 段文本:", JSON.stringify(rulesText.slice(0, 160)));
 console.log("rules 注入断言:", rulesOk ? "PASS" : "FAIL");
+
+console.log("\n=== 4.6 /iwiw-prompt 回显注入段 ===");
+const promptCmd = commandDefs.find((d) => d.name === "iwiw-prompt");
+const promptOut = promptCmd?.handler({ rawInput: "", agent: null, attachments: [], signal: { aborted: false } });
+const promptText = promptOut?.text ?? "";
+// 断言回显的是**实况**内容（上面刚写的 profile/rules 正文），不是静态模板
+const promptOk = !!promptCmd
+  && promptOut?.kind === "success"
+  && promptText.includes("### iwiw-memory:core (order=-50)")
+  && promptText.includes("### iwiw-memory:rules (order=-45)")
+  && promptText.includes("### iwiw-memory:tools (order=110)")
+  && promptText.includes("花生")
+  && promptText.includes("因子堆叠");
+console.log("已注册命令:", commandDefs.map((d) => "/" + d.name).join(", "));
+console.log("/iwiw-prompt 断言:", promptOk ? "PASS" : "FAIL");
 // 判别调试：MCP 数据 vs 缓存链路
 const recheck = await byName.memory_list.execute({ priority: "active" });
 console.log("[debug] 复检 MCP list:", JSON.stringify(recheck).slice(0, 200));
 console.log("[debug] 此刻 coreText:", JSON.stringify(coreText()).slice(0, 200));
+
+console.log("\n=== 4.7 常驻注入剥离检索字段（关键词行）===");
+// 两种实测形态各写一条：独立成行 / 内联在末行尾部（如 iwiw-notification-system）
+await byName.memory_remember.execute({
+  slug: "smoke-strip-rules",
+  description: "剥离断言用准则",
+  body: "准则正文甲。\n\n关键词: 甲, 剥离, 断言",
+  level: "rules",
+});
+await byName.memory_remember.execute({
+  slug: "smoke-strip-profile",
+  description: "剥离断言用画像",
+  body: "画像正文乙。关键词: 乙, 内联, 断言",
+  level: "profile",
+});
+await new Promise((res) => setTimeout(res, 800));
+const coreNow = coreText();
+const rulesNow = sections.find((s) => s.name === "iwiw-memory:rules");
+const rulesNowText = rulesNow ? (typeof rulesNow.text === "function" ? rulesNow.text() : rulesNow.text) : "";
+// 注入视图：正文都在，但都不含关键词行
+const stripInjectOk = coreNow.includes("画像正文乙") && !coreNow.includes("关键词")
+  && rulesNowText.includes("准则正文甲") && !rulesNowText.includes("关键词");
+// 存储视图：库里正文没被动过，memory_read 仍取回关键词行（FTS 检索锚点保住）
+const readBack = await byName.memory_read.execute({ slug: "smoke-strip-rules" });
+const stripStoreOk = JSON.stringify(readBack).includes("关键词");
+const stripOk = stripInjectOk && stripStoreOk;
+console.log("注入段:", JSON.stringify({ coreHasKw: coreNow.includes("关键词"), rulesHasKw: rulesNowText.includes("关键词"), coreLen: coreNow.length, rulesLen: rulesNowText.length }));
+console.log("剥离断言（注入无关键词 / 库内有）:", stripOk ? "PASS" : "FAIL", JSON.stringify({ stripInjectOk, stripStoreOk }));
+
+console.log("\n=== 4.8 内核模型：DSH 内置目录 + 运行时切换 ===");
+// 候选清单不在插件里：渲染端调 ctx.remote.session.modelCatalog()（DSH 内置目录）拿。
+// 这里对真实产物 lib/model-catalog.js 断言形状归一：过滤路由别名、跨 provider 去重、
+// 异常形状退化成空候选（空候选 → 设置页退化自由文本，不是崩掉）。
+const { catalogModelOptions } = await import("../lib/model-catalog.js");
+const okResp = { ok: true, value: { groups: [
+  { id: "workbuddy-global", name: "Workbuddy", models: [
+    { id: "ark-code-latest" },                    // 路由别名：不是具体模型，应被过滤
+    { id: "deepseek-v4.1-flash" },
+    { id: "glm-5-3-flash" },
+  ] },
+  { id: "relay", name: "Relay", models: [
+    { id: "glm-5-3-flash" },                      // 与上一组重复：只保留一次
+    { id: "kimi-k3" },
+  ] },
+] } };
+const opts = catalogModelOptions(okResp);
+const labels = opts.map((o) => o.label);
+const catalogOk = opts.length === 3
+  && labels[0] === "workbuddy-global/deepseek-v4.1-flash"   // 展示带来源前缀
+  && opts[0].id === "deepseek-v4.1-flash"                  // 落库只存纯 id
+  && opts[0].provider === "workbuddy-global"
+  && !labels.some((l) => l.includes("ark-code-latest"))
+  && labels.includes("relay/kimi-k3");
+const degradeOk = catalogModelOptions({ ok: false, error: "boom" }).length === 0
+  && catalogModelOptions(null).length === 0
+  && catalogModelOptions({ ok: true, value: { groups: "nope" } }).length === 0
+  && catalogModelOptions({ ok: true, value: { groups: [{ models: [{ id: 42 }, { id: "" }] }] } }).length === 0;
+console.log("目录候选:", JSON.stringify(labels), "| 异常形状退化:", degradeOk);
+console.log("候选目录断言（同源 DSH 目录 / 来源前缀 / 过滤 auto / 去重）:", catalogOk ? "PASS" : "FAIL");
+console.log("目录异常退化断言（空候选而非崩）:", degradeOk ? "PASS" : "FAIL");
+const optsOk = catalogOk && degradeOk;
+
+// 运行时切换：写 user 层 → watcher → setEnv + close（不需重启 DSH）
+const before = envCalls.length;
+const closeBefore = closeCalls;
+pushSettingsUser(ctx, "dsh-iwiw-memory", { llmModel: "glm-5-3-flash" });
+await new Promise((res) => setTimeout(res, 300));
+const lastEnv = envCalls[envCalls.length - 1];
+const switchOk = envCalls.length > before
+  && lastEnv?.MEMORY_AGENT_LLM_MODEL === "glm-5-3-flash"
+  && closeCalls > closeBefore;                 // 断了连接才会用新 env 重新 spawn
+console.log("切换:", JSON.stringify({ envCalls: envCalls.length - before, model: lastEnv?.MEMORY_AGENT_LLM_MODEL, closeCalls: closeCalls - closeBefore }));
+console.log("切换断言（重设 env + 断连重连）:", switchOk ? "PASS" : "FAIL");
+
+// 切换后后端必须仍可用（重连成功），且新 env 真的传给了子进程
+const after = await byName.memory_list.execute({ priority: "active", limit: 5 });
+const usableOk = Array.isArray(after?.items);
+console.log("切换后内核仍可用:", usableOk ? "PASS" : "FAIL", JSON.stringify(after).slice(0, 120));
+
+// 清空 = 跟随 .env：不应写入 MEMORY_AGENT_LLM_MODEL（否则会盖掉 .env 的值）
+const before2 = envCalls.length;
+pushSettingsUser(ctx, "dsh-iwiw-memory", { llmModel: "" });
+await new Promise((res) => setTimeout(res, 300));
+const lastEnv2 = envCalls[envCalls.length - 1];
+const clearOk = envCalls.length > before2 && lastEnv2 !== undefined
+  && lastEnv2.MEMORY_AGENT_LLM_MODEL === undefined;
+console.log("清空跟随 .env:", JSON.stringify({ envCalls: envCalls.length - before2, hasKey: lastEnv2 ? "MEMORY_AGENT_LLM_MODEL" in lastEnv2 : null }));
+console.log("清空断言（不覆盖 .env）:", clearOk ? "PASS" : "FAIL");
+
+const modelOk = optsOk && switchOk && usableOk && clearOk;
 
 console.log("\n=== 5. pre-step 每消息命中注入 ===");
 const preStep = (handlers["agent/pre-step"] ?? [])[0];
@@ -696,6 +821,6 @@ console.log("client 冒烟:", clientOk ? "PASS" : "FAIL");
 console.log("\n=== 8. dispose ===");
 await dispose();
 fs.rmSync(tmp, { recursive: true, force: true });
-const allOk = settingsOk && a2ok && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && startupOk && clientOk;
+const allOk = settingsOk && a2ok && rulesOk && promptOk && stripOk && modelOk && stepOk && reinjStepOk && excludeOk && searchArgsOk && reflectOk && startupOk && clientOk;
 console.log(allOk ? "SMOKE ALL PASS" : "SMOKE FAILED");
 process.exit(allOk ? 0 : 1);

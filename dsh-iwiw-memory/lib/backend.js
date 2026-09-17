@@ -16,9 +16,13 @@ export class MemoryBackend {
     command;
     args;
     cwd;
-    env;
     client = null;
     transport = null;
+    env;
+    /** 连接建立中的 Promise：并发调用不能各 spawn 一个子进程。 */
+    connecting = null;
+    /** 连接代次：close() 自增，用来识别「调用期间被重连过」。 */
+    epoch = 0;
     constructor(command, args, cwd, 
     /** 覆盖子进程环境变量（如 MEMORY_AGENT_DB_PATH 隔离库）。
      *  注意：MCP SDK 默认不继承完整父进程 env（白名单机制），
@@ -27,28 +31,53 @@ export class MemoryBackend {
         this.command = command;
         this.args = args;
         this.cwd = cwd;
-        this.env = env;
+        this.env = { ...(env ?? {}) };
+    }
+    /**
+     * 替换子进程环境变量。**不自动重连**——已连接的 client 仍用旧环境，
+     * 调用方需在改完后 close()，让下一次 callTool 用新环境重新 spawn。
+     * 这样「设置页改模型」不需要重启 DSH。
+     */
+    setEnv(env) {
+        this.env = { ...env };
     }
     async ensureConnected() {
         if (this.client)
             return;
-        this.transport = new StdioClientTransport({
-            command: this.command,
-            args: this.args,
-            cwd: this.cwd,
-            env: { ...process.env, ...(this.env ?? {}) },
-        });
-        this.client = new Client({ name: "dsh-iwiw-memory", version: "0.1.0" });
-        await this.client.connect(this.transport);
+        if (this.connecting)
+            return this.connecting;
+        const epoch = this.epoch;
+        this.connecting = (async () => {
+            const transport = new StdioClientTransport({
+                command: this.command,
+                args: this.args,
+                cwd: this.cwd,
+                env: { ...process.env, ...(this.env ?? {}) },
+            });
+            const client = new Client({ name: "dsh-iwiw-memory", version: "0.1.0" });
+            await client.connect(transport);
+            // 连接期间被 close（如设置页改了模型）：这条连接已过期，丢弃重来。
+            if (epoch !== this.epoch) {
+                await transport.close().catch(() => { });
+                throw new Error("connection closed during connect");
+            }
+            this.transport = transport;
+            this.client = client;
+        })().finally(() => { this.connecting = null; });
+        return this.connecting;
     }
     async callTool(name, args, options) {
+        const epoch = this.epoch;
         try {
             return await this._call(name, args, options);
         }
         catch (e) {
-            // 只有确认的传输断开才重连重试：业务错误/超时/取消重试会重复收费或
-            // 把用户取消当成失败重跑。子进程崩溃后 client 仍非 null，不重置会永久失败。
-            if (!isTransportFailure(e))
+            // 重试条件有两类，都必须限定在「确实没跑成」：
+            //  1) 确认的传输断开（子进程崩溃后 client 仍非 null，不重置会永久失败）；
+            //  2) 调用期间被 close() 重连过（设置页改模型会主动断连）——此时旧连接
+            //     的失败不代表业务失败，重连一次用新 env 重试。
+            // 业务错误/超时/取消一律不重试：会重复收费或把用户取消当成失败重跑。
+            if (epoch === this.epoch && !isTransportFailure(e))
                 throw e;
             await this.close().catch(() => { });
             return await this._call(name, args, options);
@@ -65,16 +94,24 @@ export class MemoryBackend {
                 onprogress: options.onprogress,
             }
             : undefined;
-        const result = await this.client.callTool({ name, arguments: args }, undefined, requestOptions);
+        // 连接可能刚被 close() 掉（模型切换）：拿本地引用并显式判空，
+        // 抛出的文案要能被 isTransportFailure 认出来，否则会当成业务错误冒泡。
+        const client = this.client;
+        if (!client)
+            throw new Error("connection closed");
+        const result = await client.callTool({ name, arguments: args }, undefined, requestOptions);
         // content 可能是 text 块或带 format 的块；宽容提取文本
         const blocks = (result.content ?? []);
         const text = blocks.filter((b) => typeof b.text === "string").map((b) => b.text).join("\n");
         return text;
     }
     async close() {
-        if (this.transport)
-            await this.transport.close();
+        // 先递增代次再拆连接：在飞的调用据此识别「我被重连了」，改走重试而不是报错。
+        this.epoch += 1;
+        const transport = this.transport;
         this.client = null;
         this.transport = null;
+        if (transport)
+            await transport.close();
     }
 }

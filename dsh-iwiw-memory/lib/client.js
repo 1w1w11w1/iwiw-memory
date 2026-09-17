@@ -43,6 +43,31 @@ module.exports = __toCommonJS(client_exports);
 
 // src/settings-page.ts
 var React = __toESM(require("react"), 1);
+
+// src/model-catalog.ts
+var ROUTE_ALIASES = /* @__PURE__ */ new Set(["ark-code-latest"]);
+function catalogModelOptions(response) {
+  const value = response?.ok ? response.value : null;
+  const groups = value?.groups;
+  if (!Array.isArray(groups)) return [];
+  const options = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const group of groups) {
+    const provider = group?.id;
+    const providerId = typeof provider === "string" ? provider : "";
+    const models = group?.models;
+    if (!Array.isArray(models)) continue;
+    for (const model of models) {
+      const id = model?.id;
+      if (typeof id !== "string" || id === "" || ROUTE_ALIASES.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      options.push({ id, provider: providerId, label: providerId ? `${providerId}/${id}` : id });
+    }
+  }
+  return options;
+}
+
+// src/settings-page.ts
 var SETTINGS_NS = "dsh-iwiw-memory";
 var CSS_ID = "iwiw-memory-settings-css";
 var CSS = `
@@ -57,6 +82,7 @@ var CSS = `
 .iwiw_set_hint{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.5}
 .iwiw_set_ctrl{flex:none;padding-top:2px}
 .iwiw_set_input{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:190px}
+.iwiw_set_select{background:var(--dsw-alias-bg-base,transparent);border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:300px}
 .iwiw_set_check{cursor:pointer}
 .iwiw_set_badge{border-radius:999px;font-size:11px;line-height:16px;padding:0 8px;flex:none}
 .iwiw_set_badge_override{background:color-mix(in srgb,#f59e0b 18%,transparent);color:#f59e0b}
@@ -69,6 +95,18 @@ var CSS = `
 `;
 var el = React.createElement;
 var FIELDS = [
+  {
+    title: "\u5185\u6838\u6A21\u578B",
+    fields: [
+      {
+        key: "llmModel",
+        label: "\u8BB0\u5FC6\u5185\u6838\u4F7F\u7528\u7684\u6A21\u578B",
+        type: "select",
+        emptyLabel: "\u8DDF\u968F .env\uFF08\u4E0D\u8986\u76D6\uFF09",
+        hint: "\u5185\u6838\u505A\u5DE9\u56FA/\u7EF4\u62A4\u5224\u65AD\u65F6\u8C03\u7684\u6A21\u578B\u3002\u5019\u9009\u76F4\u63A5\u53D6\u81EA DSH \u5185\u7F6E\u6A21\u578B\u76EE\u5F55\uFF08\u4E0E DSH \u81EA\u5DF1\u7684\u6A21\u578B\u9009\u62E9\u5668\u540C\u6E90\uFF09\uFF0C\u63D2\u4EF6\u4E0D\u53E6\u5B58\u6E05\u5355\u3002\u53EF\u7528\u6027\u4E0D\u505A\u9884\u5224\u2014\u2014\u9009\u4E86\u4E0D\u53EF\u7528\u7684\u6A21\u578B\uFF0C\u5185\u6838\u8C03\u7528\u65F6\u4F1A\u62A5\u9519\u5E76\u663E\u793A\u5728\u4F1A\u8BDD\u91CC\u3002\u6539\u5B8C\u7ACB\u5373\u751F\u6548\uFF1A\u63D2\u4EF6\u91CD\u8BBE\u5185\u6838\u5B50\u8FDB\u7A0B\u73AF\u5883\u5E76\u91CD\u8FDE\uFF0C\u4E0D\u9700\u91CD\u542F DSH"
+      }
+    ]
+  },
   {
     title: "\u6CE8\u5165\u4E0E\u547D\u4E2D",
     fields: [
@@ -114,6 +152,20 @@ function MemorySettingsSection(props) {
   const snap = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const [savedAt, setSavedAt] = React.useState(0);
   const [error, setError] = React.useState(null);
+  const [catalogModels, setCatalogModels] = React.useState([]);
+  React.useEffect(() => {
+    let alive = true;
+    const remote = props.remote;
+    if (!remote?.session?.modelCatalog) return void 0;
+    void Promise.resolve(remote.session.modelCatalog()).then((res) => {
+      if (!alive) return;
+      setCatalogModels(catalogModelOptions(res));
+    }).catch(() => {
+    });
+    return () => {
+      alive = false;
+    };
+  }, [props.remote]);
   const [drafts, setDrafts] = React.useState({});
   const flashSaved = () => {
     setSavedAt(Date.now());
@@ -218,6 +270,49 @@ function MemorySettingsSection(props) {
           });
         }
       });
+    } else if (spec.type === "select") {
+      const options = catalogModels;
+      if (options.length === 0) {
+        const text = typeof draft === "string" ? draft : mirrorText;
+        control = el("input", {
+          className: "iwiw_set_input",
+          type: "text",
+          value: text,
+          placeholder: "\u6A21\u578B id\uFF08\u5982 deepseek-v4-flash-ga-260731\uFF09",
+          disabled: !snap.writable,
+          onChange: (e) => setDrafts((prev) => ({ ...prev, [spec.key]: e.target.value })),
+          onBlur: (e) => {
+            const next = e.target.value.trim();
+            if (next === mirrorText) {
+              clearDraft(spec);
+              return;
+            }
+            void apply2(spec, next).then((ok) => {
+              if (ok) clearDraft(spec);
+            });
+          }
+        });
+      } else {
+        const text = typeof draft === "string" ? draft : mirrorText;
+        const all = text !== "" && !options.some((o) => o.id === text) ? [{ id: text, provider: "", label: text }, ...options] : options;
+        control = el(
+          "select",
+          {
+            className: "iwiw_set_select",
+            value: text,
+            disabled: !snap.writable,
+            onChange: (e) => {
+              const next = e.target.value;
+              setDrafts((prev) => ({ ...prev, [spec.key]: next }));
+              void apply2(spec, next).then((ok) => {
+                if (ok) clearDraft(spec);
+              });
+            }
+          },
+          el("option", { key: "__empty__", value: "" }, spec.emptyLabel ?? "\uFF08\u4E0D\u8986\u76D6\uFF09"),
+          ...all.map((o) => el("option", { key: o.id, value: o.id, title: o.provider || void 0 }, o.label))
+        );
+      }
     } else {
       const text = typeof draft === "string" ? draft : mirrorText;
       control = el("input", {
@@ -267,7 +362,7 @@ function MemorySettingsSection(props) {
     el(
       "p",
       { className: "iwiw_set_subtitle" },
-      "\u672C\u5730\u957F\u671F\u8BB0\u5FC6\u63D2\u4EF6\u7684\u8FD0\u884C\u53C2\u6570\u3002\u6539\u52A8\u4FDD\u5B58\u5728 DSH \u8BBE\u7F6E\u91CC\uFF08\u5B57\u6BB5\u7EA7\uFF0C\u53EF\u5355\u9879\u6062\u590D\u9ED8\u8BA4\uFF09\uFF1BhitTopK / reflectTurns / standingLayers \u70ED\u751F\u6548\uFF0CcoreMaxChars \u5728\u4E0B\u6B21 core \u6BB5\u5237\u65B0\u65F6\u751F\u6548\uFF0C\u542F\u52A8\u8865\u8D26\u5728\u4E0B\u6B21\u542F\u52A8\u751F\u6548\u3002"
+      "\u672C\u5730\u957F\u671F\u8BB0\u5FC6\u63D2\u4EF6\u7684\u8FD0\u884C\u53C2\u6570\u3002\u6539\u52A8\u4FDD\u5B58\u5728 DSH \u8BBE\u7F6E\u91CC\uFF08\u5B57\u6BB5\u7EA7\uFF0C\u53EF\u5355\u9879\u6062\u590D\u9ED8\u8BA4\uFF09\uFF1BhitTopK / reflectTurns / standingLayers / llmModel \u70ED\u751F\u6548\uFF0CcoreMaxChars \u5728\u4E0B\u6B21 core \u6BB5\u5237\u65B0\u65F6\u751F\u6548\uFF0C\u542F\u52A8\u8865\u8D26\u5728\u4E0B\u6B21\u542F\u52A8\u751F\u6548\u3002"
     ),
     !snap.writable ? el("span", { className: "iwiw_set_muted" }, "\u5F53\u524D\u8FDE\u63A5\u4E3A\u53EA\u8BFB\uFF08\u8BBE\u7F6E\u5199\u5165\u4EC5\u9650\u672C\u673A\u56DE\u73AF\u8FDE\u63A5\uFF09\u3002") : null,
     savedAt > 0 ? el("span", { className: "iwiw_set_saved" }, "\u5DF2\u4FDD\u5B58 \u2713") : null,
@@ -283,6 +378,7 @@ function MemorySettingsSection(props) {
   );
 }
 function applySettingsPage(ctx) {
+  const remote = ctx.remote;
   if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) === null) {
     const tag = document.createElement("style");
     tag.dataset.plugin = "iwiw-memory-settings";
@@ -299,7 +395,7 @@ function applySettingsPage(ctx) {
         id: SETTINGS_NS,
         order: 35,
         label: () => "iwiw \u8BB0\u5FC6",
-        inject: () => ({ scope })
+        inject: () => ({ scope, remote })
       },
       MemorySettingsSection
     )
@@ -307,7 +403,7 @@ function applySettingsPage(ctx) {
 }
 
 // src/client.ts
-var inject = ["slots", "settingsScope"];
+var inject = ["slots", "settingsScope", "remote", "remote.session"];
 function apply(ctx) {
   try {
     applySettingsPage(ctx);

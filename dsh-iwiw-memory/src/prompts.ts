@@ -2,22 +2,66 @@ import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 
 /** core 记忆（must-load）段名；正文由 apply 时拉取，避免启动抢 Python 资源。 */
 export const MEMORY_SECTION_NAME = "iwiw-memory:core";
+/** rules 准则段名。 */
+export const RULES_SECTION_NAME = "iwiw-memory:rules";
 
-/** core 启动段：always-load 长期事实（身份、健康、关系、重大决策）。 */
-export function coreSectionText(coreText: string): { name: string; order: number; text: string } {
-  return {
-    name: MEMORY_SECTION_NAME,
-    order: -50,
-    text: [
-      "## IwIw 长期记忆（必读）",
-      "",
-      "以下是关于用户的长期事实，由 dsh-iwiw-memory 自动注入。",
-      "请自然地把这些事实作为你的背景知识使用。",
-      "**不要在回复中显式提及这是从记忆里检索出来的**，也不要重复罗列。",
-      "",
-      coreText.trim(),
-    ].join("\n"),
-  };
+/**
+ * 剥离只对**检索**有意义的字段（注入视图专用，不动库里的正文）。
+ *
+ * `关键词: …` 行是 FTS 同义词扩展的锚点，只在按话题召回时起作用。
+ * 常驻层是全量无条件注入、永不经过 FTS 的，这行纯属空转——实测占常驻注入 17.6%。
+ * 剥离只发生在拼进 prompt 之前；memory_read / memory_search 取回的仍是完整正文。
+ *
+ * 规则（确定性，无 LLM）：
+ *   - 独立成行的 `关键词: …` 整行删除；
+ *   - `关键词: …` 粘在最后一个非空行尾部时，从该处截断（实测全库 1 例）。
+ * 正文中间顺带提到「关键词」的句子不受影响。
+ */
+export function stripRetrievalFields(text: string): string {
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (/^[ \t]*关键词[ \t]*[:：]/.test(line)) continue;
+    const inline = /关键词[ \t]*[:：]/.exec(line);
+    if (inline && lines.slice(i + 1).every((l) => l.trim() === "")) {
+      kept.push(line.slice(0, inline.index));
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n").trim();
+}
+
+/**
+ * iwiw 注入的全部 system prompt 段 —— 唯一构造源。
+ * 注册（index.ts）与 /iwiw-prompt 回显（capture.ts）共用同一份，两者不会漂移。
+ * 取值惰性：每次调用读当下的 core/rules 缓存。
+ */
+export function iwiwSections(get: { core: () => string; rules: () => string }): Array<{
+  name: string;
+  order: number;
+  text: () => string;
+}> {
+  return [
+    { name: MEMORY_SECTION_NAME, order: -50, text: () => get.core() || "（core 记忆加载中…）" },
+    {
+      name: RULES_SECTION_NAME,
+      order: -45,
+      text: () => {
+        const rules = get.rules();
+        if (!rules) return "";
+        return [
+          "## 准则（用户要求持续遵守）",
+          "",
+          "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
+          "",
+          rules,
+        ].join("\n");
+      },
+    },
+    { name: TOOL_GUIDE_SECTION_NAME, order: 110, text: () => toolGuideSection.text },
+  ];
 }
 
 /** 工具使用提示（静态）：告诉模型有哪些 memory_* 工具以及何时该用。 */

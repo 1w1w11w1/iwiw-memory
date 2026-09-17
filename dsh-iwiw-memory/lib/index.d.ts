@@ -36,6 +36,7 @@ export declare const SETTINGS_SCHEMA: Schema<Schemastery.ObjectS<{
     reflectTurns: Schema<number, number>;
     startupConsolidate: Schema<boolean, boolean>;
     standingLayers: Schema<string, string>;
+    llmModel: Schema<string, string>;
     consolidateIdleMinutes: Schema<number, number>;
 }>, Schemastery.ObjectT<{
     hitTopK: Schema<number, number>;
@@ -43,6 +44,7 @@ export declare const SETTINGS_SCHEMA: Schema<Schemastery.ObjectS<{
     reflectTurns: Schema<number, number>;
     startupConsolidate: Schema<boolean, boolean>;
     standingLayers: Schema<string, string>;
+    llmModel: Schema<string, string>;
     consolidateIdleMinutes: Schema<number, number>;
 }>>;
 export declare const apply: (ctx: Context, config?: PluginConfig) => Promise<() => Promise<void>>;

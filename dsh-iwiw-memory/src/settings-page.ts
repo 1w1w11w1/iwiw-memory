@@ -14,6 +14,7 @@
  */
 
 import * as React from 'react'
+import { catalogModelOptions, type ModelOption } from './model-catalog'
 
 const SETTINGS_NS = 'dsh-iwiw-memory'
 const CSS_ID = 'iwiw-memory-settings-css'
@@ -30,6 +31,7 @@ const CSS = `
 .iwiw_set_hint{color:var(--dsw-alias-label-caption);font-size:12px;line-height:1.5}
 .iwiw_set_ctrl{flex:none;padding-top:2px}
 .iwiw_set_input{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:190px}
+.iwiw_set_select{background:var(--dsw-alias-bg-base,transparent);border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-size:13px;padding:4px 8px;width:300px}
 .iwiw_set_check{cursor:pointer}
 .iwiw_set_badge{border-radius:999px;font-size:11px;line-height:16px;padding:0 8px;flex:none}
 .iwiw_set_badge_override{background:color-mix(in srgb,#f59e0b 18%,transparent);color:#f59e0b}
@@ -47,9 +49,11 @@ const el = React.createElement
 interface FieldSpec {
   key: string
   label: string
-  type: 'bool' | 'num' | 'str'
+  type: 'bool' | 'num' | 'str' | 'select'
   hint?: string
   placeholder?: string
+  /** 空值选项文案（空串=不覆盖，交给 .env / 环境变量）。 */
+  emptyLabel?: string
 }
 
 interface GroupSpec {
@@ -58,6 +62,18 @@ interface GroupSpec {
 }
 
 const FIELDS: GroupSpec[] = [
+  {
+    title: '内核模型',
+    fields: [
+      {
+        key: 'llmModel',
+        label: '记忆内核使用的模型',
+        type: 'select',
+        emptyLabel: '跟随 .env（不覆盖）',
+        hint: '内核做巩固/维护判断时调的模型。候选直接取自 DSH 内置模型目录（与 DSH 自己的模型选择器同源），插件不另存清单。可用性不做预判——选了不可用的模型，内核调用时会报错并显示在会话里。改完立即生效：插件重设内核子进程环境并重连，不需重启 DSH',
+      },
+    ],
+  },
   {
     title: '注入与命中',
     fields: [
@@ -106,7 +122,7 @@ function jsonEqual(a: unknown, b: unknown): boolean {
 
 // ── 页面 ────────────────────────────────────────────────────────────────────
 
-function MemorySettingsSection(props: { scope: any }): any {
+function MemorySettingsSection(props: { scope: any; remote?: any }): any {
   const scope = props.scope
   const subscribe = React.useCallback((cb: () => void) => scope.subscribe(cb), [scope])
   const getSnapshot = React.useCallback(() => scope.getSnapshot(), [scope])
@@ -121,6 +137,20 @@ function MemorySettingsSection(props: { scope: any }): any {
 
   const [savedAt, setSavedAt] = React.useState(0)
   const [error, setError] = React.useState<string | null>(null)
+  // DSH 内置模型目录：候选来源。拉不到就留空数组（字段退化成自由文本输入）。
+  const [catalogModels, setCatalogModels] = React.useState<ModelOption[]>([])
+  React.useEffect(() => {
+    let alive = true
+    const remote = props.remote
+    if (!remote?.session?.modelCatalog) return undefined
+    void Promise.resolve(remote.session.modelCatalog())
+      .then((res: unknown) => {
+        if (!alive) return
+        setCatalogModels(catalogModelOptions(res))
+      })
+      .catch(() => { /* 目录不可用：保持空候选，自由文本兜底 */ })
+    return () => { alive = false }
+  }, [props.remote])
   // 本地草稿（受控输入先写本地态再异步落库，避免往返延迟里被 React 回滚）。
   const [drafts, setDrafts] = React.useState<Record<string, string | boolean>>({})
 
@@ -235,6 +265,56 @@ function MemorySettingsSection(props: { scope: any }): any {
           })
         },
       })
+    } else if (spec.type === 'select') {
+      // 候选来自 DSH 内置模型目录（ctx.remote.session.modelCatalog()）——
+      // 与 DSH 自己的模型选择器同源，插件不维护第二份清单。
+      // 目录拉不到（旧宿主 / 线路不可用）时退化成自由文本输入，用户仍能手填。
+      const options = catalogModels
+      if (options.length === 0) {
+        const text = typeof draft === 'string' ? draft : mirrorText
+        control = el('input', {
+          className: 'iwiw_set_input',
+          type: 'text',
+          value: text,
+          placeholder: '模型 id（如 deepseek-v4-flash-ga-260731）',
+          disabled: !snap.writable,
+          onChange: (e: any) => setDrafts((prev) => ({ ...prev, [spec.key]: e.target.value })),
+          onBlur: (e: any) => {
+            const next = e.target.value.trim()
+            if (next === mirrorText) {
+              clearDraft(spec)
+              return
+            }
+            void apply(spec, next).then((ok) => {
+              if (ok) clearDraft(spec)
+            })
+          },
+        })
+      } else {
+        const text = typeof draft === 'string' ? draft : mirrorText
+        // option 的 value 是纯模型 id（内核参数），显示的是 provider/id（人看的来源）。
+        // 当前值不在候选里（手填过 / 上游删了该模型）：补一个选项，否则 select 会显示成第一项。
+        const all = text !== '' && !options.some((o) => o.id === text)
+          ? [{ id: text, provider: '', label: text }, ...options]
+          : options
+        control = el(
+          'select',
+          {
+            className: 'iwiw_set_select',
+            value: text,
+            disabled: !snap.writable,
+            onChange: (e: any) => {
+              const next = e.target.value
+              setDrafts((prev) => ({ ...prev, [spec.key]: next }))
+              void apply(spec, next).then((ok) => {
+                if (ok) clearDraft(spec)
+              })
+            },
+          },
+          el('option', { key: '__empty__', value: '' }, spec.emptyLabel ?? '（不覆盖）'),
+          ...all.map((o) => el('option', { key: o.id, value: o.id, title: o.provider || undefined }, o.label)),
+        )
+      }
     } else {
       const text = typeof draft === 'string' ? draft : mirrorText
       control = el('input', {
@@ -282,7 +362,7 @@ function MemorySettingsSection(props: { scope: any }): any {
     el(
       'p',
       { className: 'iwiw_set_subtitle' },
-      '本地长期记忆插件的运行参数。改动保存在 DSH 设置里（字段级，可单项恢复默认）；hitTopK / reflectTurns / standingLayers 热生效，coreMaxChars 在下次 core 段刷新时生效，启动补账在下次启动生效。',
+      '本地长期记忆插件的运行参数。改动保存在 DSH 设置里（字段级，可单项恢复默认）；hitTopK / reflectTurns / standingLayers / llmModel 热生效，coreMaxChars 在下次 core 段刷新时生效，启动补账在下次启动生效。',
     ),
     !snap.writable ? el('span', { className: 'iwiw_set_muted' }, '当前连接为只读（设置写入仅限本机回环连接）。') : null,
     savedAt > 0 ? el('span', { className: 'iwiw_set_saved' }, '已保存 ✓') : null,
@@ -301,6 +381,9 @@ function MemorySettingsSection(props: { scope: any }): any {
 // ── 挂载 ────────────────────────────────────────────────────────────────────
 
 export function applySettingsPage(ctx: any): void {
+  // remote.session：DSH 内置模型目录（modelCatalog）的入口，与内置模型选择器同源。
+  // 服务缺失只导致候选为空（字段退化自由文本），不影响页面其余部分。
+  const remote = ctx.remote
   if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) === null) {
     const tag = document.createElement('style')
     tag.dataset.plugin = 'iwiw-memory-settings'
@@ -319,7 +402,7 @@ export function applySettingsPage(ctx: any): void {
         id: SETTINGS_NS,
         order: 35,
         label: () => 'iwiw 记忆',
-        inject: (): unknown => ({ scope }),
+        inject: (): unknown => ({ scope, remote }),
       },
       MemorySettingsSection,
     ),

@@ -4,7 +4,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
 import { MemoryBackend } from "./backend.js";
 import { MemoryTools, toTextBlocks } from "./tools.js";
-import { toolGuideSection, MEMORY_SECTION_NAME } from "./prompts.js";
+import { iwiwSections, stripRetrievalFields } from "./prompts.js";
 import { registerCaptureCommands } from "./capture.js";
 import { runStartup } from "./startup.js";
 /** dsh-iwiw-memory：IwIw 记忆内核的 DSH 插件 —— 跨会话记忆（模型自主工具化写入）。 */
@@ -120,6 +120,9 @@ export const SETTINGS_SCHEMA = Schema.object({
     // 启动补账：替代旧的空闲轮询（与聊天活跃度无关）
     startupConsolidate: Schema.boolean().default(true).description("启动时自动补账"),
     standingLayers: Schema.string().default("profile,rules").description("常驻记忆类型，逗号分隔"),
+    // 内核 LLM 模型 id（空 = 用 .env / 环境变量里的值）。
+    // 改动不重启 DSH：applySettings 重设后端子进程 env 并断开连接，下次调用用新环境重新 spawn。
+    llmModel: Schema.string().default("").description("内核 LLM 模型 id（空=跟随 .env）"),
     // 已弃用：保留数值 schema 只为接收旧配置，不给默认值、不在设置页展示
     consolidateIdleMinutes: Schema.number().description("已弃用，仅兼容旧关闭设置"),
 });
@@ -141,6 +144,7 @@ export const apply = async (ctx, config = {}) => {
         reflectTurns: config.reflectTurns ?? 7,
         startupConsolidate: config.startupConsolidate ?? config.consolidateIdleMinutes !== 0,
         hitTopK: undefined,
+        llmModel: "",
     };
     overrides.hitTopK = config.hitTopK ?? 3;
     // 旧配置迁移：consolidateIdleMinutes=0 曾表示「明确关闭巩固」。
@@ -150,6 +154,8 @@ export const apply = async (ctx, config = {}) => {
         ? "旧的 consolidateIdleMinutes=0 已映射为 startupConsolidate=false（启动补账关闭）。"
         : "";
     const standingLayers = () => overrides.standingLayers.filter((t) => VALID_MEM_TYPES.has(t));
+    /** settings watch 触发时的模型切换钩子；backend 构造后才赋值（声明顺序）。 */
+    let onModelSettingChanged;
     const reflectTurns = () => overrides.reflectTurns;
     const hitTopK = () => overrides.hitTopK;
     try {
@@ -185,14 +191,39 @@ export const apply = async (ctx, config = {}) => {
         scope.watch(() => {
             applySettings(scope.get());
             ctx.logger.info(`[dsh-iwiw-memory] settings updated: ${JSON.stringify(overrides)}`);
+            // 模型变更需要重设子进程 env + 重连，由下面赋值进去的钩子执行
+            onModelSettingChanged?.();
         });
         ctx.logger.info("[dsh-iwiw-memory] settings section installed");
     }
     catch (e) {
         ctx.logger.warn("[dsh-iwiw-memory] settings registration failed (patch config in effect)", e);
     }
-    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, config.env);
+    // 子进程 env：部署 env + 当前模型选择（空串=不覆盖，让 .env 生效）
+    const backendEnv = () => {
+        const env = { ...(config.env ?? {}) };
+        const chosen = String(overrides.llmModel ?? "").trim();
+        if (chosen)
+            env.MEMORY_AGENT_LLM_MODEL = chosen;
+        return env;
+    };
+    const backend = new MemoryBackend(python, ["-m", "memory_agent.mcp_server"], cwd, backendEnv());
     const tools = new MemoryTools(backend);
+    // 模型变更：重设 env 并断开连接（不重启 DSH）。断开会杀掉子进程，
+    // 在飞的工具调用会失败一次，所以放在 watch 里异步做，不阻塞设置写入。
+    let lastModel = String(overrides.llmModel ?? "").trim();
+    const applyModelChange = async () => {
+        const next = String(overrides.llmModel ?? "").trim();
+        if (next === lastModel)
+            return;
+        lastModel = next;
+        backend.setEnv(backendEnv());
+        await backend.close().catch(() => { });
+        ctx.logger.info(`[dsh-iwiw-memory] kernel llm model → ${next || "(follow .env)"}; backend will respawn`);
+        // 常驻段正文不随模型变，但让用户立刻看到生效状态：刷新一次 core 缓存。
+        void refreshCore().catch(() => { });
+    };
+    onModelSettingChanged = () => { void applyModelChange(); };
     // 1) 启动时预热后端（避免首次工具调用才连接）。
     try {
         await backend.callTool("list_memories", { limit: 1 });
@@ -209,8 +240,6 @@ export const apply = async (ctx, config = {}) => {
         ctx.tools.register(defs.memory_read),
         ctx.tools.register(defs.memory_list),
     ];
-    // 3) 静态工具使用提示。
-    disposers.push(ctx.systemPrompt.section(toolGuideSection));
     // 4) 动态 core 段：standingLayers 各层（rules 除外）list + 逐条 read，字符预算内拼装。
     const fetchCoreText = async () => {
         try {
@@ -225,12 +254,15 @@ export const apply = async (ctx, config = {}) => {
                     if (budget <= 0)
                         break;
                     const mem = (await tools.read({ slug: it.slug }));
-                    let body = mem?.content ?? "";
+                    // 注入视图剥离检索字段（关键词行）：常驻层不经 FTS，那行纯空转。
+                    // 必须在预算裁剪之前剥，否则剥离省下的额度会被浪费。
+                    let body = stripRetrievalFields(mem?.content ?? "");
                     if (body.length > budget)
                         body = body.slice(0, budget) + "...";
                     budget -= body.length;
                     lines.push(`- **${it.slug}** — ${it.description}`);
-                    lines.push(`  ${body}`);
+                    if (body)
+                        lines.push(`  ${body}`);
                 }
             }
             return lines.length > 0 ? lines.join("\n") : "（暂无必读长期记忆）";
@@ -258,8 +290,10 @@ export const apply = async (ctx, config = {}) => {
             const lines = [];
             for (const it of items) {
                 const mem = (await tools.read({ slug: it.slug }));
-                if (mem?.content)
-                    lines.push(`- ${mem.content}`);
+                // 同 fetchCoreText：准则段同样全量注入，剥离检索字段
+                const body = stripRetrievalFields(mem?.content ?? "");
+                if (body)
+                    lines.push(`- ${body}`);
             }
             return lines.length > 0 ? lines.join("\n") : "";
         }
@@ -292,27 +326,12 @@ export const apply = async (ctx, config = {}) => {
         return refreshInFlight;
     };
     refreshCore().catch(() => { });
-    disposers.push(ctx.systemPrompt.section({
-        name: MEMORY_SECTION_NAME,
-        order: -50,
-        text: () => cachedCore || "（core 记忆加载中…）",
-    }));
-    // rules 准则段：用户要求持续遵守的准则每轮生效
-    disposers.push(ctx.systemPrompt.section({
-        name: "iwiw-memory:rules",
-        order: -45,
-        text: () => {
-            if (!cachedRules)
-                return "";
-            return [
-                "## 准则（用户要求持续遵守）",
-                "",
-                "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
-                "",
-                cachedRules,
-            ].join("\n");
-        },
-    }));
+    // 3) system prompt 段（core / rules / 工具提示）——唯一构造源在 prompts.ts，
+    //    /iwiw-prompt 回显同一份，注入内容与回显不会漂移。
+    const sectionText = { core: () => cachedCore, rules: () => cachedRules };
+    for (const section of iwiwSections(sectionText)) {
+        disposers.push(ctx.systemPrompt.section(section));
+    }
     // 4.5) 跨项目「想法带回」管道（/memo + /recall）——纯开发者工具，可整块剥离：
     //     删除本段两行 + src/capture.ts + package.json 的 peerDependency 即可，
     //     不影响上面的记忆工具与注入链路。
@@ -321,8 +340,8 @@ export const apply = async (ctx, config = {}) => {
         // 否则回退 ~/.dsh。桌面端插件进程里 DSH_HOME 常缺省，直接读 env 会得到 profiles\web（盘符相对路径）。
         const dshHome = (process.env.DSH_HOME ?? "").trim() || join(homedir(), ".dsh");
         const profileDir = config.profileDir ?? join(dshHome, "profiles", "web");
-        disposers.push(...registerCaptureCommands(ctx, { python, profileDir }));
-        ctx.logger.info("[dsh-iwiw-memory] capture commands registered (/memo, /recall)");
+        disposers.push(...registerCaptureCommands(ctx, { python, profileDir, promptText: sectionText }));
+        ctx.logger.info("[dsh-iwiw-memory] capture commands registered (/memo, /recall, /iwiw-prompt)");
     }
     catch (e) {
         ctx.logger.warn("[dsh-iwiw-memory] capture commands registration failed", e);
@@ -527,7 +546,7 @@ export const apply = async (ctx, config = {}) => {
             };
         });
     }
-    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 2 prompt sections + pre-step hook (reflect/hit) + startup reconcile");
+    ctx.logger.info("[dsh-iwiw-memory] applied: 4 tools + 3 prompt sections + pre-step hook (reflect/hit) + startup reconcile");
     return async () => {
         disposing = true;
         activeStartupController?.abort();

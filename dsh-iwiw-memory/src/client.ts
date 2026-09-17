@@ -10,7 +10,7 @@
 
 import { applySettingsPage } from './settings-page'
 
-export const inject = ['slots', 'settingsScope']
+export const inject = ['slots', 'settingsScope', 'remote', 'remote.session']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function apply(ctx: any): () => void {
