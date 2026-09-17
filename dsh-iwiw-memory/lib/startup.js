@@ -32,7 +32,7 @@ export const INITIAL_STATE = {
 /** storage domain 描述符。scopeKey 是 Python 返回的数据库标识，
  *  避免同一个 storage 根下两个不同目标库互相覆盖水位。 */
 export const makeDomainSpec = (scopeKey) => ({
-    name: `dsh-iwiw-memory-startup-${scopeKey}`,
+    name: `dsh_iwiw_memory_startup_${scopeKey}`,
     version: 1,
     global: { schema: StateSchema, initial: INITIAL_STATE },
     tables: {},
