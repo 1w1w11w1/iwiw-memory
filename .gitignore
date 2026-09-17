@@ -21,3 +21,13 @@ node_modules/
 
 # 内部讨论稿，不入库
 记忆系统-推进讨论-提示词.md
+
+# 会话调试包（含整段会话日志，可能有密钥/隐私），仅本地使用
+debug-inbox/
+
+# 本地开发文档（dev-docs 自述「本地维护，不入库」）与会话交接提示词
+dev-docs/
+docs/handoff-prompt-*.md
+
+# agent 团队会话归档（本地产物）
+.agent-teams/

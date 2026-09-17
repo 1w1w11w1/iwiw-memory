@@ -1,13 +1,13 @@
 # iwiw-memory（iwiw 记忆）
 
-一个带长期记忆系统的 chat：核心是 SQLite 分级事实记忆内核（core/normal/archive 三级 + 版本/审计/回滚），自带 CLI 对话工作台用于日常使用与机制验证，并通过 MCP 对外提供完整工具面；对话能力经多端接入（CLI / DSH 插件，QQ-bot 规划中）复用同一内核。
+一个带长期记忆系统的 chat：核心是 SQLite 标签记忆内核（mem_type 五层 profile/fact/lesson/rules/project × 生命周期 active/archived，全程版本/审计/回滚），自带 CLI 对话工作台用于日常使用与机制验证，并通过 MCP 对外提供完整工具面；对话能力经多端接入（CLI / DSH 插件，QQ-bot 规划中）复用同一内核。
 
 > 项目早期为个人智能体原型（含自研 harness 与 Web 界面），现已转型为独立的记忆系统核心，移除 harness、会话层与界面层。
 
 ## 文档
 
 - [架构总览](docs/architecture.md) — 分层、模块职责、不变量
-- [数据流](docs/data-flow.md) — 提取 / 检索 / 写入 / 维护 / 启动五条链路
+- [数据流](docs/data-flow.md) — 检索 / 写入 / 维护 / 启动四条链路
 - [CLI 使用指南](docs/chat-guide.md) — 命令参考与典型流程
 - [多端接入演进](docs/dsh-plugin-evolution.md) — 路线图：DSH 插件已落地，QQ-bot 规划中
 
@@ -16,6 +16,9 @@
 - `memory_agent/`：记忆系统核心（自包含，零外部项目依赖）
   - `db.py`：SQLite 存储、mutation 入口（版本/审计/回滚）、FTS 索引同步
   - `retrieval.py`：确定性检索（FTS 词面 + 会话状态联想 + 时间衰减 + 优先级加权）
+  - `model_tools.py`：模型记忆工具定义与执行（chat 与 MCP 同源）
+  - `session_state.py`：会话状态检查点（DSC：话题/决策/任务 → 关联记忆）
+  - `maintenance.py`：记忆维护审查 → 生成待确认动作
   - `llm.py`：LLM 调用封装（Anthropic/OpenAI 兼容，支持多轮与工具调用）
   - `query_builder.py`：查询扩展
   - `chat.py`：CLI 对话工作台（`python -m memory_agent.chat`）
@@ -50,15 +53,26 @@
 | DSH 插件（`dsh-iwiw-memory/`） | ✅ 可用 | 让任意 DSH agent 获得跨会话记忆，安装与配置见[插件 README](dsh-iwiw-memory/README.md) |
 | QQ-bot | 🚧 规划中 | 多端复用方案见[演进文档](docs/dsh-plugin-evolution.md) |
 
-## 记忆分级
+## 记忆标签
 
-| 值 | 语义 | 加载策略 |
+记忆由两个正交的轴描述：**类型轴**（mem_type，记忆的内在属性）与**生命周期轴**（priority）。
+
+| mem_type | 语义 | 默认加载 |
 |---|---|---|
-| `core` | 身份、健康、关系、重大决策、核心偏好 | 必须载入（对话前注入） |
-| `normal` | 日常信息、阶段计划、一般偏好 | 按需载入（话题触发检索） |
-| `archive` | 过时/冗余记忆（归档状态，可回滚） | 不参与常规检索与维护候选 |
+| `profile` | 身份画像（身份、健康、关系、长期偏好） | 常驻注入 |
+| `fact` | 事实（日常信息、阶段计划） | 按需检索 |
+| `lesson` | 经验教训（被纠正后的结论） | 按需检索 |
+| `rules` | 准则（设计原则、行为准则） | 常驻注入 |
+| `project` | 项目（目标、结构、决策、进度） | 按需检索 |
 
-> 旧版本的四级（L0–L3）已收敛为三值：`important` 并入 `core`（都是必须载入），`archive` 从"重要性档位"重新定位为"生命周期状态"（维护流程的产物）。
+| priority | 语义 |
+|---|---|
+| `active` | 参与常规检索与维护候选 |
+| `archived` | 归档状态，不参与常规检索（保留版本，可回滚） |
+
+> **常驻层是配置出来的，不是写死在类型里的**：`STANDING_LAYERS`（默认 `profile,rules`；dev 模式仅 `rules`）决定哪些层每轮全量注入，其余层按话题检索召回。插件侧由 `PluginConfig.standingLayers` 同源控制。
+>
+> 旧版本的三值分级（`core`/`normal`/`archive`）已废除："重要程度"不再是分级依据，常驻性改由上述模式配置承担。
 
 ## 记忆系统不变量
 
@@ -68,13 +82,13 @@
 4. 删除不能导致历史版本丢失（`memory_versions` 独立保留，可回滚恢复）。
 5. 内容变更后必须刷新 FTS 索引（`db.py` 的 FTS 触发器保证）。
 6. 更新采用全文替换语义（非追加），避免正文无限膨胀；变更前内容进版本表。
-7. 检索必须进入真实对话上下文链路（chat 每轮注入 + core 启动注入）。
+7. 检索必须进入真实对话上下文链路（chat 每轮注入 + 常驻层启动注入）。
 
 ## CLI 工作台命令
 
 | 命令 | 说明 |
 |---|---|
-| 普通输入 | 对话（启动注入 core 记忆，每轮话题检索注入相关记忆；模型可自主调用记忆工具写入） |
+| 普通输入 | 对话（启动注入常驻层记忆，每轮话题检索注入相关记忆；模型可自主调用记忆工具写入） |
 | `/mem list [priority]` | 列出记忆 |
 | `/mem search <q>` | 搜索记忆 |
 | `/mem read <slug>` | 读取记忆正文 |
@@ -87,7 +101,7 @@
 
 ## MCP 工具面（DSH 接入桥）
 
-`mcp_server.py` 提供 14 个工具：search_memories / list_memories / read_memory / memory_stats / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / maintenance_review。
+`mcp_server.py` 提供 17 个工具：memory_remember / search_memories / list_memories / read_memory / memory_stats / touch_memories / memory_update / memory_archive / memory_delete / memory_merge / memory_history / memory_rollback / pending_actions / pending_approve / pending_reject / maintenance_review / run_consolidate。
 
 记忆写入由模型在对话中自主调用记忆工具完成（CLI chat 注册 memory_remember / memory_search / memory_read / memory_list 四个 function calling 工具），不再使用独立提取管线。
 
