@@ -46,7 +46,7 @@ export function iwiwSections(get) {
                 if (!rules)
                     return "";
                 return [
-                    "## 准则（用户要求持续遵守）",
+                    "## 准则",
                     "",
                     "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
                     "",
@@ -71,9 +71,9 @@ export const toolGuideSection = {
         "- memory_read(slug)：读取一条记忆的完整正文。",
         "- memory_list(priority?, mem_type?, limit=20)：列出记忆条目。",
         "",
-        "level 取值：profile=用户身份画像/健康/偏好；fact=一般事实；lesson=教训与经验；rules=用户要求持续遵守的准则；project=项目脉络与决策。",
+        "level 取值：profile=用户身份画像/健康/偏好；fact=一般事实；lesson=教训与经验；rules=准则；project=项目脉络与决策。",
         "什么时候调用 memory_search：用户话题涉及个人事实、长期计划、健康、关系、偏好或历史决策时优先调。",
-        "什么时候调用 memory_remember：出现身份画像（profile）、一般事实（fact）、教训（lesson）、用户要求持续遵守的准则（rules）、项目脉络（project），或用户明确要求记住/更正时。",
+        "什么时候调用 memory_remember：出现身份画像（profile）、一般事实（fact）、教训（lesson）、准则（rules）、项目脉络（project），或用户明确要求记住/更正时。",
         "调用原则：用户的最新明示更正优先（如「其实我不喜欢 X」应理解为覆盖而非并列）；一次性、临时话题不要写。",
         "敏感信息：不要写入凭据类内容（API key、token、密码、私钥、连接串口令）——需要记录「配置在哪」就写占位符（如 ARK_API_KEY=<见 .env>），不要抄真值；公网 IP/域名只记用途与归属，本机与内网地址（127.0.0.1、192.168.x.x）可保留。写入前内核会做一次确定性脱敏，命中项会被替换并在工具返回里告知。",
     ].join("\n"),

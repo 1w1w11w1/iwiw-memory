@@ -25,6 +25,7 @@ export declare class MemoryTools {
         level?: string;
         slug?: string;
         priority?: string;
+        project?: string;
     }): Promise<JsonValue>;
     search(params: {
         query: string;
@@ -32,6 +33,7 @@ export declare class MemoryTools {
         session_id?: string;
         context?: string[];
         exclude_mem_types?: string[];
+        project?: string;
     }): Promise<JsonValue>;
     /** 命中自增（使用强化）：记忆被实际注入时调用，供维护排序。 */
     touch(slugs: string[]): Promise<JsonValue>;

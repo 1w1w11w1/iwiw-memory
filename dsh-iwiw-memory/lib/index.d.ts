@@ -27,6 +27,10 @@ interface PluginConfig {
     /** 当前 DSH profile 目录（/memo 解析 DSH 内部导出包用）。
      *  缺省时用 DSH_HOME/profiles/web——web profile 是本插件的挂载点。 */
     profileDir?: string;
+    /** 项目标识口径：默认取会话 cwd 的末段目录名（见 projectOf）。
+     *  同一份记忆库被多个工作区共用时，project 型记忆按它隔离；
+     *  想手工固定口径（如统一写 "dsh"）就在这里覆盖。 */
+    projectTag?: string;
 }
 /** settings schema（schemastery 对象）：设置通道要求 schema 可 JSON 序列化——
  *  host describe 时序列化信封，渲染端 rehydrate+validate（纯函数会静默产出空镜像）。 */

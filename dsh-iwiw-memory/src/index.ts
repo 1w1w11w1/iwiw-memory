@@ -37,6 +37,10 @@ interface PluginConfig {
   /** 当前 DSH profile 目录（/memo 解析 DSH 内部导出包用）。
    *  缺省时用 DSH_HOME/profiles/web——web profile 是本插件的挂载点。 */
   profileDir?: string;
+  /** 项目标识口径：默认取会话 cwd 的末段目录名（见 projectOf）。
+   *  同一份记忆库被多个工作区共用时，project 型记忆按它隔离；
+   *  想手工固定口径（如统一写 "dsh"）就在这里覆盖。 */
+  projectTag?: string;
 }
 
 const VALID_MEM_TYPES = new Set(["profile", "fact", "lesson", "rules", "project"]);
@@ -50,7 +54,25 @@ function recordedSuffix(recordedDate: unknown): string {
   return ` · 记录于 ${stamp.slice(0, 16).replace("T", " ")}`;
 }
 
-function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
+/**
+ * 当前会话的项目标识 —— project 型记忆的隔离键。
+ *
+ * 为什么是 cwd 末段目录名：与用户心智一致（"我在哪个仓库里"），且不依赖
+ * 任何额外注册表。同一目录改名/移动会改变标识，这是可接受的：标识只用于
+ * 过滤"这条 project 记忆跟当前仓库有关吗"，不参与任何持久引用。
+ * projectTag 配置可整体覆盖（同一库被多工作区共用、或想让某个仓库的记忆
+ * 对多个目录都可见时用）。
+ */
+function projectOf(cwd: unknown, override?: string): string | null {
+  const tag = (override ?? "").trim();
+  if (tag) return tag;
+  const p = typeof cwd === "string" ? cwd.trim() : "";
+  if (!p) return null;
+  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? null;
+}
+
+function makeDefinition(tools: MemoryTools, onRemember?: () => void, projectTag?: string) {
   return {
     memory_remember: defineTool({
       name: "memory_remember",
@@ -61,7 +83,7 @@ function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
       parameters: {
         description: { type: "string", required: true, description: "一句话描述" },
         body: { type: "string", required: true, description: "完整正文（整体替换旧内容，不是追加）" },
-        level: { type: "string", description: "记忆类型：profile=用户身份画像/健康/偏好；fact=一般事实（默认）；lesson=教训与经验；rules=用户要求持续遵守的准则；project=项目脉络与决策" },
+        level: { type: "string", description: "记忆类型：profile=用户身份画像/健康/偏好；fact=一般事实（默认）；lesson=教训与经验；rules=准则；project=项目脉络与决策" },
         slug: { type: "string", description: "可选。更新已有记忆时填其 slug；新建建议用简短英文连字符命名，不填则自动生成" },
         priority: { type: "string", description: "active|archived，默认 active（在役）；archived=归档退役，一般不手动用" },
       },
@@ -84,9 +106,12 @@ function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
           return toTextBlocks(value);
         },
       },
-      async execute(args) {
+      async execute(args, exec) {
         const a = args as { description: string; body: string; level?: string; slug?: string; priority?: string };
-        const out = { result: await tools.remember(a) };
+        // exec.agent 在 PTC 嵌套派发里也会被传播（dsh-tools 的 run_code binding 显式转发），
+        // 所以写入路径能和 pre-step 注入路径拿到同一个项目标识。
+        const project = projectOf((exec as any)?.agent?.session?.header?.cwd, projectTag);
+        const out = { result: await tools.remember({ ...a, project: project ?? undefined }) };
         onRemember?.();
         return out;
       },
@@ -102,9 +127,10 @@ function makeDefinition(tools: MemoryTools, onRemember?: () => void) {
         schema: { type: "object", additionalProperties: false, properties: { results: { type: "json" } } },
         render: (_args, value) => toTextBlocks(value),
       },
-      async execute(args) {
+      async execute(args, exec) {
         const a = args as { query: string; top_k?: number };
-        return { results: await tools.search({ query: a.query, top_k: a.top_k ?? 5 }) };
+        const project = projectOf((exec as any)?.agent?.session?.header?.cwd, projectTag);
+        return { results: await tools.search({ query: a.query, top_k: a.top_k ?? 5, project: project ?? undefined }) };
       },
     }),
     memory_read: defineTool({
@@ -268,7 +294,7 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
 
   // 2) 注册 4 个 memory_* 工具（与 CLI chat 同源）；remember 成功后刷新 core 段缓存（A2）+ reflect 计数归零。
   let stepSinceWrite = 0;
-  const defs = makeDefinition(tools, () => { stepSinceWrite = 0; refreshCore().catch(() => {}); });
+  const defs = makeDefinition(tools, () => { stepSinceWrite = 0; refreshCore().catch(() => {}); }, config.projectTag);
   const disposers = [
     ctx.tools.register(defs.memory_remember),
     ctx.tools.register(defs.memory_search),
@@ -490,6 +516,8 @@ export const apply = async (ctx: Context, config: PluginConfig = {}) => {
         const raw = await tools.search({
           query: text, top_k: hitTopK(), session_id: sid,
           context, exclude_mem_types: standingLayers(),
+          // project 型记忆按当前项目隔离（内核侧只过滤 project 类型，见 project_visible）
+          project: projectOf(agent?.session?.header?.cwd, config.projectTag) ?? undefined,
         });
         const hits = (Array.isArray(raw) ? raw : ((raw as any)?.hits ?? [])) as Array<{
           slug: string; description: string; priority: string; content: string;

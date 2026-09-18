@@ -1,9 +1,17 @@
-/** consolidate 后台调用的资源上限：单次请求 60s（每批发进度保活），整体 15 分钟。
+/** consolidate 后台调用的资源上限：单次请求 200s，整体 30 分钟。
+ *
+ *  数值依据（实测，非估算）：
+ *  - 单批 LLM 耗时与批大小无关：5/10/20 条分别 23.7 / 130.4 / 44.4 秒（方差 5.5 倍），
+ *    是服务端波动。内核侧每批超时默认 180s，客户端须大于它，
+ *    否则内核还没判超时、客户端先放弃，错误归因落到错误的层。
+ *  - progress 只在每批完成后上报，首批完成前没有重置机会，所以单次上限必须
+ *    覆盖最坏单批（130.4s），不能只覆盖均值。
+ *  - 整体上限按最坏情况算：129 条候选 / 每批 20 ≈ 7 批 × 180s ≈ 21 分钟，取 30 分钟。
  *  超过此规模需要另加批次游标，不靠无限加大 timeout。 */
 const CONSOLIDATE_CALL = {
-    timeoutMs: 60_000,
+    timeoutMs: 200_000,
     resetTimeoutOnProgress: true,
-    maxTotalTimeoutMs: 15 * 60_000,
+    maxTotalTimeoutMs: 30 * 60_000,
     onprogress: () => { },
 };
 /** 严格判定 consolidate 结果：MCP 返回字符串、{error:...}、complete=false
@@ -41,6 +49,9 @@ export class MemoryTools {
             args.slug = params.slug;
         if (params.priority)
             args.priority = params.priority;
+        // 写入即打项目标识：project 型记忆的检索隔离完全依赖它（见 model_tools 的 metadata 写入）
+        if (params.project)
+            args.project = params.project;
         return this.parse(await this.backend.callTool("memory_remember", args));
     }
     async search(params) {
@@ -51,6 +62,8 @@ export class MemoryTools {
             args.context = params.context;
         if (params.exclude_mem_types?.length)
             args.exclude_mem_types = params.exclude_mem_types;
+        if (params.project)
+            args.project = params.project;
         return this.parse(await this.backend.callTool("search_memories", args));
     }
     /** 命中自增（使用强化）：记忆被实际注入时调用，供维护排序。 */
