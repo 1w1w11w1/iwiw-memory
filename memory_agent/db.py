@@ -1127,6 +1127,96 @@ def replace_memory_result(
         return MemoryMutationResult(False, audit_action, slug, error=str(exc))
 
 
+def rename_memory_result(
+    slug: str,
+    new_slug: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    reason: str = "rename",
+    audit_action: str = "rename",
+) -> MemoryMutationResult:
+    """改 slug（身份改名），并返回审计结果。
+
+    为什么必须走统一入口：slug 是记忆的对外身份，改名若绕过本入口，
+    版本快照与审计会指向旧 slug，回滚与追责链断裂。
+
+    语义边界（与 replace_memory_result 的区别）：
+    - 只改身份：slug，以及可选的 metadata（同属"这条记忆的对外标记"）；
+      **不动 content / description**——正文变更一律走 replace。
+    - metadata=None 表示保持原值；传 dict 表示整体替换（调用方算好新值，
+      例如迁移遗留键重命名为当前前缀）。
+    - 旧 slug 快照写入 memory_versions（saved_at=改名时刻），保留改名前的可回滚身份。
+    - 目标 slug 已存在 → conflict，不覆盖。
+    - FTS 由 memories_au 触发器同步（UPDATE 触发 delete+insert），无需手工重建索引。
+
+    注意：memory_audit.target_slug 不随改名前移——审计是历史事实，
+    旧 slug 的审计行保留旧值，改名的因果由本条 rename 审计承载。
+    """
+    slug = (slug or "").strip().lower()
+    # new_slug 省略 = 只改 metadata（同一批迁移里"元数据改名"与"slug 改名"的调用形态统一）
+    new_slug = (new_slug or "").strip().lower().replace(" ", "-")[:50] or slug
+    if new_slug == slug and metadata is None:
+        return MemoryMutationResult(False, audit_action, slug, error="nothing to change: slug unchanged and metadata not given")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM memories WHERE slug = ?", (slug,)).fetchone()
+        if not row:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error="memory not found")
+        if new_slug != slug and conn.execute("SELECT 1 FROM memories WHERE slug = ?", (new_slug,)).fetchone():
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error=f"conflict: {new_slug} already exists")
+        old = dict(row)
+        backup_path = _save_version(old["id"], reason=reason, commit=False)
+        if not backup_path:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, error="version snapshot failed")
+        if metadata is None:
+            cur = conn.execute(
+                "UPDATE memories SET slug = ?, updated_at = ? WHERE slug = ?",
+                (new_slug, _now(), slug),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE memories SET slug = ?, metadata = ?, updated_at = ? WHERE slug = ?",
+                (new_slug, json.dumps(metadata, ensure_ascii=False), _now(), slug),
+            )
+        changed_rows = cur.rowcount
+        if changed_rows <= 0:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="no rows changed")
+        audit_details = {
+            "changed_rows": changed_rows, "from_slug": slug, "to_slug": new_slug,
+            "reason": reason, "metadata_replaced": metadata is not None,
+        }
+        audit_id = _record_audit(
+            action=audit_action,
+            target_slug=new_slug,
+            reason=reason,
+            backup_path=backup_path,
+            details=audit_details,
+            commit=False,
+        )
+        if not audit_id:
+            conn.rollback()
+            return MemoryMutationResult(False, audit_action, slug, changed_rows=changed_rows, backup_path=backup_path, error="audit write failed")
+        conn.commit()
+        return MemoryMutationResult(
+            True,
+            audit_action,
+            new_slug,
+            changed_rows=changed_rows,
+            version_id=backup_path,
+            audit_id=audit_id,
+            backup_path=backup_path,
+            details=audit_details,
+        )
+    except Exception as exc:
+        conn.rollback()
+        return MemoryMutationResult(False, audit_action, slug, error=str(exc))
+
+
 def archive_memory_result(slug: str, *, reason: str = "archive", audit_action: str = "archive") -> MemoryMutationResult:
     """设置 priority = 'archived'，并返回审计结果。"""
     old = get_memory(slug)

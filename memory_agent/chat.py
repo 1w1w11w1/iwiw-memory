@@ -100,7 +100,9 @@ async def _execute_memory_tool(tc: dict[str, Any]) -> tuple[dict[str, str], str]
             args = {}
     except json.JSONDecodeError:
         args = {}
-    out = execute_memory_tool(fn.get("name", ""), args)
+    # CLI 工作台没有"当前项目"概念（工作目录就是记忆库所在仓库），
+    # 显式传 None：project 型记忆在 chat 里不做项目隔离。
+    out = execute_memory_tool(fn.get("name", ""), args, project=None)
     msg = {
         "role": "tool",
         "tool_call_id": tc.get("id", ""),
@@ -160,7 +162,7 @@ def _always_load_text() -> str:
         sections.append("\n".join(["## 长期记忆（常驻）", *memory_lines]))
     if rule_lines:
         sections.append("\n".join([
-            "## 准则（用户要求持续遵守）",
+            "## 准则",
             "以下准则来自记忆库 rules 层，请在本会话中严格遵守：",
             *rule_lines,
         ]))

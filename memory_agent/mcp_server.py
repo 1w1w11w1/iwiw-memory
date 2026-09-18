@@ -107,6 +107,7 @@ async def list_tools() -> list[Tool]:
                 "level": {"type": "string", "description": "profile|fact|lesson|rules|project，默认 fact；profile 与 rules 类将全量注入每轮"},
                 "slug": {"type": "string", "description": "可选。更新已有记忆时填其 slug；新建可自动生成"},
                 "priority": {"type": "string", "description": "active|archived，默认 active"},
+                "project": {"type": "string", "description": "当前项目标识：level=project 时写入此标签，供检索按项目隔离"},
             },
             ["description", "body"],
         ),
@@ -119,6 +120,7 @@ async def list_tools() -> list[Tool]:
                 "session_id": {"type": "string", "description": "会话 id：启用回指联想（会话状态按 id 隔离积累）"},
                 "context": {"type": "array", "items": {"type": "string"}, "description": "最近几轮对话文本，提升联想召回"},
                 "exclude_mem_types": {"type": "array", "items": {"type": "string"}, "description": "按类型排除（如常驻层 profile/rules 已在 system 注入，命中注入时排除防重复）"},
+                "project": {"type": "string", "description": "当前项目标识：project 型记忆按此隔离（标签为『全局』或空的不受限制）"},
             },
             ["query"],
         ),
@@ -230,6 +232,7 @@ async def list_tools() -> list[Tool]:
                 "limit": {"type": "integer", "description": "旧模式=候选上限；窗口模式=每批大小，默认 20"},
                 "since_ms": {"type": "integer", "description": "窗口下界（epoch 毫秒，含）"},
                 "until_ms": {"type": "integer", "description": "窗口上界（epoch 毫秒，含）"},
+                "timeout": {"type": "number", "description": "每批 LLM 调用的超时秒数，默认 180（实测单批 23.7~130.4s）"},
             },
         ),
     ]
@@ -241,7 +244,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2, default=str))]
 
     if name == "memory_remember":
-        out = execute_memory_tool("memory_remember", arguments)
+        project = str(arguments.get("project") or "").strip()[:64] or None
+        out = execute_memory_tool("memory_remember", arguments, project=project)
         return ok(out["result"])
 
     if name == "search_memories":
@@ -264,10 +268,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             topic_words = filter_topic_words(entry["topic_freq"], limit=30)
             session_state.update(query, grams)
 
+        project = str(arguments.get("project") or "").strip()[:64] or None
         fetch_k = top_k * 2 if exclude_types else top_k
         results = search_memories(
             query, context_messages=ctx, top_k=fetch_k,
-            topic_words=topic_words, session_state=session_state,
+            topic_words=topic_words, session_state=session_state, project=project,
         )
         if exclude_types:
             results = [r for r in results if r.get("mem_type") not in exclude_types][:top_k]
@@ -291,6 +296,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "slug": m["slug"], "description": m.get("description", ""),
                 "priority": m.get("priority", "active"), "mem_type": m.get("mem_type", "profile"),
                 "updated_at": m.get("updated_at", ""),
+                # metadata 随列表返回：调用方（插件/维护脚本）要读项目标签，
+                # 否则只能为每条记忆再发一次 read，成本 O(n)。
+                "metadata": m.get("metadata"),
             }
             for m in mems
         ])
@@ -377,7 +385,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             if not (since_hours == since_hours and abs(since_hours) != float("inf")):
                 raise ValueError("since_hours must be a finite number")
             since_hours = max(0.0, min(since_hours, 24.0 * 3650))
-        except ValueError as exc:
+            # 每批 LLM 调用的超时。实测耗时与批大小无关（5/10/20 条分别 23.7/130.4/44.4s，
+            # 方差 5.5 倍）——是服务端波动，不是 catalog 体积。旧默认 40s 让波动必然伪装成故障。
+            # 默认取实测波动上限 130.4s 加余量。
+            raw_timeout = arguments.get("timeout")
+            timeout = 180.0 if raw_timeout is None or raw_timeout == "" else float(raw_timeout)
+            if not (timeout == timeout and abs(timeout) != float("inf")):
+                raise ValueError("timeout must be a finite number")
+            timeout = max(5.0, min(timeout, 600.0))
+        except (TypeError, ValueError) as exc:
             return ok({"complete": False, "errors": [str(exc)], "error": str(exc),
                        "reviewed": 0, "auto_fixed": [], "pending": [], "suggestions": []})
 
@@ -398,6 +414,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return ok(await run_consolidate(
             since_hours=since_hours,
             limit=limit,
+            timeout=timeout,
             since_ms=since_ms,
             until_ms=until_ms,
             on_progress=on_progress,

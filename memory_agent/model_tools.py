@@ -18,7 +18,7 @@ REMEMBER_GUIDE = (
     "把值得长期保存的稳定信息写入记忆，按内容类型选 level："
     "profile=用户身份画像（健康、偏好、关系、长期计划，默认模式将全量注入每轮）；"
     "fact=客观事实（默认）；lesson=教训与经验；"
-    "rules=用户要求 AI 持续遵守的准则（全量注入每轮）；"
+    "rules=准则（全量注入每轮）；"
     "project=项目脉络与决策。"
     "写入即全文替换：带 slug 为更新该条，不带 slug 为新建"
     "（新建前先用 memory_search 查重，已存在近似条目则带其 slug 更新）。"
@@ -49,7 +49,7 @@ MEMORY_TOOLS = [
                 "properties": {
                     "description": {"type": "string", "description": "一句话描述（如：用户对芒果过敏）"},
                     "body": {"type": "string", "description": "完整正文（整体替换旧内容，不是追加）"},
-                    "level": {"type": "string", "enum": ["profile", "fact", "lesson", "rules", "project"], "description": "记忆类型：profile=用户身份画像/健康/偏好（默认模式下将全量注入每轮，身份健康类默认选这个）；fact=一般事实（默认）；lesson=教训与经验；rules=用户要求持续遵守的准则（将全量注入每轮）；project=项目脉络与决策"},
+                    "level": {"type": "string", "enum": ["profile", "fact", "lesson", "rules", "project"], "description": "记忆类型：profile=用户身份画像/健康/偏好（默认模式下将全量注入每轮，身份健康类默认选这个）；fact=一般事实（默认）；lesson=教训与经验；rules=准则（将全量注入每轮）；project=项目脉络与决策"},
                     "slug": {"type": "string", "description": "可选。更新已有记忆时填其 slug；新建建议用简短英文连字符命名（如 user-mango-allergy），不填则自动生成"},
                     "priority": {"type": "string", "enum": ["active", "archived"], "description": "可选，默认 active（在役）；archived=归档退役（一般不手动用）"},
                 },
@@ -107,11 +107,16 @@ def _auto_slug(description: str) -> str:
     return "mem-" + hashlib.md5(description.strip().encode("utf-8")).hexdigest()[:8]
 
 
-def execute_memory_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def execute_memory_tool(
+    name: str, args: dict[str, Any], project: str | None = None,
+) -> dict[str, Any]:
     """执行一个模型记忆工具调用。
 
     返回 {"result": 工具结果（JSON 可序列化）, "echo": 人类可读摘要}。
     执行失败不抛出：工具错误以 {"ok": False, "error": ...} 回传给模型自行处理。
+
+    project：当前项目标识。project 型记忆写入时落到 metadata.iwiw_project，
+    检索时按它隔离——调用方（DSH 插件/MCP）负责提供。
     """
     name = (name or "").strip()
     args = args if isinstance(args, dict) else {}
@@ -130,9 +135,12 @@ def execute_memory_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 related = [{"slug": h["slug"], "description": h.get("description", "")} for h in hits]
             # 先检测原文（给模型的提示基于用户原始输入），落库仍由 db 层统一脱敏兜底
             redacted_kinds = describe(scan(description) + scan(body))
+            # project 型记忆写入即打项目标识：这是检索隔离的唯一依据。
+            # 不打标 → 该条对所有项目可见（隔离失效），所以打标放在写入路径而非调用方。
+            metadata = {"iwiw_project": project} if (level == "project" and project) else None
             row = upsert_memory(
                 slug=slug, description=description, content=body,
-                mem_type=level, priority=priority,
+                mem_type=level, priority=priority, metadata=metadata,
             )
             result = {"ok": True, "slug": row["slug"], "level": row.get("mem_type", level), "related": related}
             if redacted_kinds:
@@ -142,7 +150,7 @@ def execute_memory_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 echo += f"（已脱敏：{redacted_kinds}）"
         elif name == "memory_search":
             query = (args.get("query") or "").strip()
-            hits = search_memories(query, top_k=max(1, min(int(args.get("top_k", 5)), 10)))
+            hits = search_memories(query, top_k=max(1, min(int(args.get("top_k", 5)), 10)), project=project)
             result = {
                 "ok": True,
                 "hits": [

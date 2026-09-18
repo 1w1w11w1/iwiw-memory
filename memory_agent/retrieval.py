@@ -15,8 +15,31 @@ import math
 from datetime import datetime
 from typing import Any
 
+import json
+
 from .db import search_fts, get_memory
 from .query_builder import build_queries
+
+# ── 项目隔离 ──
+# project 型记忆描述的是"某个仓库的脉络"，跨项目召回是噪音（实测：AUTO-MAS 会话里
+# 「测试边界判据」命中 auto-mas-* 与 iwiw 的 standing-injection 两类互不相关的记忆）。
+# 口径：只隔离 mem_type=project；fact/lesson 天然跨项目，不参与过滤。
+#   标签为空 → 未知（历史数据），保守放行，回填后自然收紧；
+#   标签为"全局" → 显式跨项目，放行。
+GLOBAL_PROJECT_TAG = "全局"
+
+
+def project_visible(mem: dict[str, Any], project: str | None) -> bool:
+    """当前项目是否可见这条记忆（project 型按项目隔离，其余类型不受影响）。"""
+    if not project or mem.get("mem_type") != "project":
+        return True
+    raw = mem.get("metadata")
+    try:
+        tag = (json.loads(raw) if isinstance(raw, str) and raw else (raw or {})).get("iwiw_project") or ""
+    except (ValueError, TypeError):
+        tag = ""
+    tag = str(tag).strip()
+    return not tag or tag == GLOBAL_PROJECT_TAG or tag == project
 
 # ── 权重（真源是 config，这里做默认值兜底）──
 DEFAULT_WEIGHTS = {
@@ -52,6 +75,7 @@ def search_memories(
     exclude_slugs: set[str] | None = None,
     topic_words: list[str] | None = None,
     session_state: Any | None = None,
+    project: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     确定性检索入口。
@@ -65,6 +89,7 @@ def search_memories(
         exclude_slugs: 排除的记忆 slug（常驻/窗口内已注入）
         topic_words: 会话主题词（用于联想 query 扩展）
         session_state: SessionState 实例（回指联想候选）
+        project: 当前项目标识；project 型记忆按此隔离（见 project_visible）
 
     Returns:
         每条含 slug/description/priority/source/score 等字段
@@ -108,6 +133,8 @@ def search_memories(
         mem = get_memory(slug)
         if not mem:
             continue
+        if not project_visible(mem, project):
+            continue
         td = _time_decay(mem.get("updated_at"))
         time_factor = 1.0 - w["time"] + w["time"] * td
         final_score = base * time_factor
@@ -120,6 +147,7 @@ def search_memories(
             "recorded_date": mem.get("recorded_date", ""),
             "score": round(final_score, 4),
             "source": "deterministic",
+            "metadata": mem.get("metadata"),
         }))
 
     scored.sort(key=lambda x: x[0], reverse=True)

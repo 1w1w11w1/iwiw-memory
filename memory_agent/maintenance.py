@@ -149,7 +149,9 @@ def _window_bounds(
 async def run_consolidate(
     since_hours: float = 24.0,
     limit: int = 20,
-    timeout: float = 40.0,
+    # 每批 LLM 超时。实测单批耗时与批大小无关（23.7~130.4s，方差 5.5 倍），
+    # 是服务端波动；40s 的旧默认会让正常波动伪装成故障。
+    timeout: float = 180.0,
     *,
     since_ms: int | None = None,
     until_ms: int | None = None,
@@ -231,8 +233,13 @@ async def run_consolidate(
                 timeout=timeout,
             )
         except Exception as exc:
-            logger.warning("consolidate batch %s failed: %s", batch_no, exc)
-            fail(f"batch {batch_no}: llm failed: {exc}")
+            # httpx.ReadTimeout 的 str() 是空字符串，且异常对象本身恒为真值——
+            # 写成 {exc} 会把真实原因丢成 "llm failed: "，故障无法归因。
+            # 因此消息里固定带上：异常类型 + 生效的 timeout 值（两者都是排查必需）。
+            detail = str(exc).strip() or "(空消息)"
+            logger.warning("consolidate batch %s failed (%s, timeout=%gs): %s",
+                           batch_no, type(exc).__name__, timeout, detail)
+            fail(f"batch {batch_no}: llm failed ({type(exc).__name__}, timeout={timeout:g}s): {detail}")
             return result
 
         match = re.search(r"\[[\s\S]*?\]", text)
